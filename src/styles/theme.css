@@ -1,0 +1,102 @@
+/* Scan only src/ for class names: docs/ and the rest of the repo must not add utilities. */
+@import "tailwindcss" source("../");
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+/* Light only (architecture 10.3): `dark:` follows a `.dark` class the app never sets, never the
+   OS prefers-color-scheme, so a `dark:` class from a newly added component can never apply.
+   Fonts: Tailwind's system font stack; external fonts are blocked by the CSP. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  /* 회사 색상 토큰 (monolis 공용 preset + fni 확장에서 이식) */
+  --color-mainBlue: #5550ff;
+  --color-blue50: #f6f6ff;
+  --color-blue100: #eeedff;
+  --color-blue900: #4440cc;
+  --color-danger: #f65959;
+  --color-dangerDark: #dd5050;
+  --color-danger100: #feeeee;
+  --color-warning: #ff9b3f;
+  --color-warning100: #fff5ec;
+  --color-green: #1eba66;
+  --color-green50: #f4fcf7;
+  --color-mint: #5ec9e0;
+  --color-black: #24232e;
+  --color-white: #ffffff;
+  --color-blueGray: #f9fafb;
+  --color-cool200: #e3e9ef;
+  --color-cool500: #a1aab2;
+  --color-cool600: #838c94;
+  --color-cool700: #69727a;
+
+  --animate-pulse-faster: pulse-faster 1s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  @keyframes pulse-faster {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+  }
+}
+
+/* shadcn semantic variables → company tokens (architecture 10.3 table). */
+:root {
+  --background: #f9fafb; /* blueGray */
+  --foreground: #24232e; /* black */
+  --card: #ffffff;
+  --card-foreground: #24232e;
+  --popover: #ffffff;
+  --popover-foreground: #24232e;
+  --primary: #5550ff; /* mainBlue */
+  --primary-foreground: #ffffff;
+  --secondary: #f6f6ff; /* blue50 */
+  --secondary-foreground: #24232e;
+  --muted: #f9fafb; /* blueGray */
+  --muted-foreground: #69727a; /* cool700 */
+  --accent: #f6f6ff; /* blue50 */
+  --accent-foreground: #24232e;
+  --destructive: #dd5050; /* dangerDark: borders and icons only, never text */
+  --border: #e3e9ef; /* cool200 */
+  --input: #838c94; /* cool600: control boundaries, 3.4:1 on white (WCAG 1.4.11) */
+  --ring: #5550ff;
+  --radius: 0.625rem;
+}
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}
