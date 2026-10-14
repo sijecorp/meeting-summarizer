@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { Banner } from "@/components/common";
+import { useEffect, useRef, useState } from "react";
+import { Settings as SettingsIcon } from "lucide-react";
+import { Banner, StatusBadge } from "@/components/common";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -10,30 +11,62 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
 import {
   confirmQuit,
-  getSettings,
+  listMeetings,
   onQuitRequested,
+  onRecordingLevel,
   onRecordingStopped,
   requestQuit,
+  SCHEMA_VERSION,
+  type MeetingItem,
   type Status,
 } from "@/lib/ipc";
 import Home from "@/screens/Home";
-import Onboarding from "@/screens/Onboarding";
 import Processing from "@/screens/Processing";
 import Recording from "@/screens/Recording";
 import Review from "@/screens/Review";
-import Settings from "@/screens/Settings";
+import Settings, { type SettingsTab } from "@/screens/Settings";
 
-// Six screens, no router: one piece of state (architecture 3, 10.1).
+// Five screens, no router: one piece of state (architecture 3, 10.1). Always opens on Home.
 type Screen =
-  | { name: "loading" | "onboarding" | "home" | "recording" | "settings" }
+  | { name: "home" | "recording" }
+  | { name: "settings"; tab?: SettingsTab }
   | { name: "processing" | "review"; id: string };
 
 const REVIEWABLE: Status[] = ["review", "sent", "archived"];
+// The header chip's "처리 중 N · 대기 M".
+const RUNNING: Status[] = ["transcribing", "summarizing"];
+const WAITING: Status[] = ["recorded", "transcribed", "paused"];
+
+/** Listens to levels itself and keeps whole seconds, so only the chip re-renders, once a second. */
+function RecordingChip({ onClick }: { onClick: () => void }) {
+  const [s, setSeconds] = useState(0);
+  useEffect(() => {
+    // An equal value lets React skip the other 24 level events of each second.
+    const unlisten = onRecordingLevel((l) => setSeconds(Math.floor(l.elapsed_ms / 1000)));
+    return () => {
+      unlisten.then((stop) => stop(), () => {});
+    };
+  }, []);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (
+    // h-6: a 24px target around the 20px badge (WCAG 2.5.8).
+    <button
+      className="flex h-6 items-center rounded-4xl outline-none hover:opacity-80 focus-visible:ring-3 focus-visible:ring-ring"
+      onClick={onClick}
+    >
+      <StatusBadge recording>{`녹음 중 ${pad(Math.floor(s / 60))}:${pad(s % 60)}`}</StatusBadge>
+    </button>
+  );
+}
 
 export default function App() {
-  const [screen, setScreen] = useState<Screen>({ name: "loading" });
+  const [screen, setScreen] = useState<Screen>({ name: "home" });
+  // Shared by the header chip and Home, so both show the same list.
+  const [meetings, setMeetings] = useState<MeetingItem[] | null>(null);
+  const [listError, setListError] = useState("");
   const [quitAsked, setQuitAsked] = useState(false);
   const [quitError, setQuitError] = useState("");
   // Why a recording ended by itself (disk, 4 hours, sleep). OS notifications come in M5.
@@ -41,16 +74,22 @@ export default function App() {
   const home = () => setScreen({ name: "home" });
   const quitFailed = (e: unknown) => setQuitError(`종료하지 못했습니다: ${e}`);
 
-  useEffect(() => {
-    getSettings()
-      .then(({ settings }) =>
-        setScreen({
-          name: settings.llm_connections.length && settings.webhooks.length ? "home" : "onboarding",
-        }),
-      )
-      // The settings screen shows the load error.
-      .catch(() => setScreen({ name: "settings" }));
-  }, []);
+  // Only the latest request may set the list: an older one can resolve after a newer one.
+  const latest = useRef(0);
+  const refresh = () => {
+    const request = ++latest.current;
+    listMeetings().then(
+      (list) => {
+        if (request !== latest.current) return;
+        setMeetings(list);
+        setListError("");
+      },
+      (e) => request === latest.current && setListError(`회의 목록을 읽지 못했습니다: ${e}`),
+    );
+  };
+  // ponytail: refreshed on screen changes and recording stops only; M3's progress events
+  // keep the processing counts current.
+  useEffect(refresh, [screen]);
 
   useEffect(() => {
     const unlisten = onQuitRequested(() => setQuitAsked(true));
@@ -65,6 +104,7 @@ export default function App() {
   useEffect(() => {
     const unlisten = onRecordingStopped(({ id, message }) => {
       if (message) setNotice(message);
+      refresh();
       setScreen((s) => (s.name === "recording" ? { name: "processing", id } : s));
     });
     unlisten.catch((e) => setQuitError(`녹음 종료 알림을 준비하지 못했습니다: ${e}`));
@@ -86,23 +126,68 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
+  // A meeting from a newer app version is read-only and never runs here (like `busy_ids`).
+  const current = meetings?.filter((m) => m.schema_version <= SCHEMA_VERSION) ?? [];
+  const recording = current.some((m) => m.status === "recording" && !m.interrupted);
+  const running = current.filter((m) => RUNNING.includes(m.status)).length;
+  const waiting = current.filter((m) => WAITING.includes(m.status)).length;
+  const banners = [quitError, listError].filter(Boolean);
+
   return (
     <div className="min-h-screen">
-      {quitError && (
-        <div className="p-4">
-          <Banner kind="error">{quitError}</Banner>
+      <header className="sticky top-0 z-10 flex h-14 items-center justify-between gap-4 border-b bg-card px-6">
+        <div className="flex min-w-0 items-center gap-3">
+          <button
+            className="rounded-md text-base font-bold outline-none focus-visible:ring-3 focus-visible:ring-ring"
+            onClick={home}
+          >
+            회의 요약
+          </button>
+          {recording ? (
+            <RecordingChip onClick={() => setScreen({ name: "recording" })} />
+          ) : (
+            running + waiting > 0 && (
+              <StatusBadge>
+                {[running && `처리 중 ${running}`, waiting && `대기 ${waiting}`]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </StatusBadge>
+            )
+          )}
+        </div>
+        <Button
+          variant="ghost"
+          size="icon-lg"
+          className="hover:bg-accent"
+          aria-label="설정"
+          onClick={() => setScreen({ name: "settings" })}
+        >
+          <SettingsIcon aria-hidden className="size-5" />
+        </Button>
+      </header>
+
+      {(banners.length > 0 || notice) && (
+        <div
+          className={`mx-auto space-y-3 px-6 pt-6 ${screen.name === "settings" ? "max-w-5xl" : "max-w-3xl"}`}
+        >
+          {banners.map((b) => (
+            <Banner key={b} kind="error">
+              {b}
+            </Banner>
+          ))}
+          {notice && (
+            <Banner kind="warning" onDismiss={() => setNotice("")}>
+              {notice}
+            </Banner>
+          )}
         </div>
       )}
-      {notice && (
-        <div className="p-4">
-          <Banner kind="warning" onDismiss={() => setNotice("")}>
-            {notice}
-          </Banner>
-        </div>
-      )}
-      {screen.name === "onboarding" && <Onboarding onDone={(next) => setScreen({ name: next })} />}
+
       {screen.name === "home" && (
         <Home
+          meetings={meetings}
+          recording={recording}
+          onChanged={refresh}
           onOpen={(m) =>
             setScreen(
               m.status === "recording"
@@ -111,7 +196,7 @@ export default function App() {
             )
           }
           onRecord={() => setScreen({ name: "recording" })}
-          onSettings={() => setScreen({ name: "settings" })}
+          onSetup={(tab) => setScreen({ name: "settings", tab })}
         />
       )}
       {screen.name === "recording" && (
@@ -119,7 +204,7 @@ export default function App() {
       )}
       {screen.name === "processing" && <Processing key={screen.id} id={screen.id} onHome={home} />}
       {screen.name === "review" && <Review key={screen.id} id={screen.id} onHome={home} />}
-      {screen.name === "settings" && <Settings onHome={home} />}
+      {screen.name === "settings" && <Settings tab={screen.tab} onHome={home} />}
 
       <AlertDialog open={quitAsked} onOpenChange={setQuitAsked}>
         <AlertDialogContent>

@@ -105,6 +105,11 @@ export const hasSecret = (kind: SecretKind, name: string) =>
 export const deleteSecret = (kind: SecretKind, name: string) =>
   invoke<void>("delete_secret", { kind, name });
 
+/** `id` is cpal's `DeviceId` string, the form `input_device` and `output_device` pin. */
+export type AudioDevice = { id: string; name: string };
+export type AudioDevices = { inputs: AudioDevice[]; outputs: AudioDevice[] };
+export const listAudioDevices = () => invoke<AudioDevices>("list_audio_devices");
+
 export const listMeetings = () => invoke<MeetingItem[]>("list_meetings");
 export const getMeeting = (id: string) => invoke<MeetingDetail>("get_meeting", { id });
 export const deleteMeeting = (id: string) => invoke<void>("delete_meeting", { id });
@@ -117,11 +122,14 @@ export const resumeMeeting = (id: string) => invoke<Meta>("resume_meeting", { id
 export type Warning = { kind: string; message: string };
 /** The recording in progress and the warnings still standing. */
 export type RecordingState = { id: string; warnings: Warning[] };
-/** Every 100 ms. `mic` and `system` are RMS, 0..1. */
+/** Every 40 ms. `mic` and `system` are RMS, 0..1. */
 export type Level = {
   elapsed_ms: number;
   mic: number;
   system: number;
+  /** The last 64 ms in 24 log-spaced bands, 80 Hz–8 kHz: -80..-20 dBFS as 0..100. */
+  mic_bands: number[];
+  system_bands: number[];
   /** A device has been opening for over a second: likely the first-run permission prompt. */
   waiting_permission: boolean;
 };

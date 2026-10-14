@@ -27,6 +27,10 @@ pub const SPEC: hound::WavSpec = hound::WavSpec {
 const BYTES_PER_SEC: u64 = 64_000;
 /// Below this, warn before recording how many minutes fit (REC-11).
 const START_WARNING_BYTES: u64 = 1_500_000_000;
+/// Starts the UID, and so the cpal device id, of our private aggregate device (macos_tap.rs).
+const TAP_UID_PREFIX: &str = "com.sije.meeting-summarizer.tap.";
+
+pub use capture::{AudioDevices, devices};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Track {
@@ -34,12 +38,15 @@ pub enum Track {
     System,
 }
 
-/// `recording://level`, every 100 ms. RMS per track, 0..1.
+/// `recording://level`, every 40 ms. RMS per track, 0..1, and the spectrum of the last 64 ms
+/// per track (`writer::Spectrum`).
 #[derive(Serialize, Clone, Debug)]
 pub struct Level {
     pub elapsed_ms: u64,
     pub mic: f32,
     pub system: f32,
+    pub mic_bands: [u8; writer::BANDS],
+    pub system_bands: [u8; writer::BANDS],
     /// A stream has been opening for over a second: likely the first-run permission prompt (4.4).
     pub waiting_permission: bool,
 }

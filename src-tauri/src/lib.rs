@@ -122,6 +122,7 @@ pub fn run() {
             commands::start_recording,
             commands::stop_recording,
             commands::recording_state,
+            commands::list_audio_devices,
             commands::confirm_quit,
             commands::request_quit,
         ])

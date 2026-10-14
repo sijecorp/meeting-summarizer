@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { CircleAlert, Trash2, TriangleAlert, X } from "lucide-react";
+import { ArrowLeft, CircleAlert, Trash2, TriangleAlert, X } from "lucide-react";
 import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -12,16 +12,52 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { deleteMeeting } from "@/lib/ipc";
 
-export function Header({ title, children }: { title: string; children?: ReactNode }) {
+/** Every screen's body under the app header: one width, one title style, the back link. */
+export function Page({
+  title,
+  action,
+  onHome,
+  wide,
+  children,
+}: {
+  title: string;
+  /** Shown at the right of the title, e.g. Home's 녹음 시작. */
+  action?: ReactNode;
+  onHome?: () => void;
+  wide?: boolean;
+  children: ReactNode;
+}) {
   return (
-    <header className="flex items-center justify-between border-b bg-card px-6 py-4">
-      <h1 className="text-lg font-bold">{title}</h1>
+    <main className={`mx-auto w-full space-y-6 px-6 py-8 ${wide ? "max-w-5xl" : "max-w-3xl"}`}>
+      <div className="space-y-1">
+        {onHome && (
+          <Button variant="link" className="px-0" onClick={onHome}>
+            <ArrowLeft aria-hidden />
+            홈으로
+          </Button>
+        )}
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <h1 className="text-2xl font-bold">{title}</h1>
+          {action}
+        </div>
+      </div>
       {children}
-    </header>
+    </main>
+  );
+}
+
+/** One look for a status in the meeting list, on the processing screen and in the app header. */
+export function StatusBadge({ recording, children }: { recording?: boolean; children: ReactNode }) {
+  return (
+    <Badge variant="secondary">
+      {recording && <span className="size-2 rounded-full bg-danger motion-safe:animate-pulse-faster" aria-hidden />}
+      {children}
+    </Badge>
   );
 }
 

@@ -73,14 +73,14 @@ src-tauri/src/
   summarize.rs       OpenAI 호환 클라이언트, 프롬프트, 구간 요약
   slack.rs           페이로드 생성, 글자 수 계산, 전송
   store.rs           폴더 구조, meta.json, 상태 전이, 앱 시작 시 복구
-  queue.rs           FIFO 처리 워커, 일시정지·중단
+  queue.rs           처리 대기열(최대 2개 동시 전사, 나머지는 FIFO), 일시정지·중단
   resources/
     hallucinations.ko.txt   환각 문구 목록 (한 줄에 하나)
 src/
   main.tsx, App.tsx  화면 전환 (라우터 라이브러리 없이 상태 하나로)
-  screens/           Onboarding, Home, Recording, Processing, Review, Settings
+  screens/           Home, Recording, Processing, Review, Settings
   components/ui/     shadcn이 생성한 컴포넌트(button, input, textarea, card, alert, alert-dialog, select, switch, badge, tooltip)
-  components/        앱 전용 컴포넌트(common.tsx: Header, Banner, Field, DeleteButton 등. 이후 LevelMeter, ChannelSelect)
+  components/        앱 전용 컴포넌트(common.tsx: Page, StatusBadge, Banner, Field, DeleteButton 등. 이후 ChannelSelect. 녹음 화면의 Spectrum은 Recording.tsx에 둔다)
   lib/ipc.ts         invoke·이벤트 타입 래퍼
   lib/utils.ts       shadcn `cn()` (`export { cn } from "cn"`, CLI 4.21 기본)
   test-setup.ts      Vitest jsdom 보완 코드(Radix용)
@@ -88,7 +88,7 @@ src/
 components.json     shadcn 설정 (style, base radix, alias @/)
 ```
 
-화면은 6개뿐이라 라우터 라이브러리를 쓰지 않는다. `App.tsx`가 현재 화면과 선택된 회의 id를 상태로 들고 있다.
+화면은 5개뿐이라 라우터 라이브러리를 쓰지 않는다. `App.tsx`가 현재 화면과 선택된 회의 id를 상태로 들고 있다.
 
 ## 4. 녹음
 
@@ -98,12 +98,13 @@ components.json     shadcn 설정 (style, base radix, alias @/)
 캡처 스레드 (스트림 열기, 1초 폴링)
   cpal 콜백 (마이크)        ── 링 버퍼 ──┐
   cpal 콜백 (시스템 오디오) ── 링 버퍼 ──┴▶ 기록 스레드 (20ms마다) ──▶ mic.wav / system.wav
-                                               └─▶ 레벨 이벤트 (100ms마다 React로)
+                                               └─▶ 레벨 이벤트 (40ms마다 React로: RMS + 스펙트럼)
 ```
 
 - 오디오 콜백은 장치 샘플(인터리브 f32)을 트랙별 `rtrb` 링 버퍼(2초 분량)에 넣기만 한다. 콜백 안에서 할당, 락, 파일 I/O를 하지 않는다. 버퍼가 차면(기록 스레드가 멈춘 경우) 나머지를 버리고, 빈 구간은 4.2의 무음 채우기가 메운다.
 - 스트림을 다시 열면 새 링 버퍼를 만들고, 받는 쪽을 채널로 기록 스레드에 넘긴다. 기록 스레드는 이전 버퍼에 남은 샘플을 먼저 쓴 뒤 바꾼다.
 - 기록 스레드가 트랙마다 다음을 한다: 채널 다운믹스(모노) → 16kHz 리샘플 → 시간축 정렬 → 16-bit PCM으로 `hound`에 기록. 리샘플러의 시작 지연만큼 앞부분을 잘라 소리가 늦게 밀리지 않게 한다.
+- **레벨 이벤트** (REC-09): 기록 루프가 20ms마다 돌므로 그 배수인 40ms마다 보낸다(초당 25번). 트랙마다 RMS와 스펙트럼을 담는다. 스펙트럼은 기록한 16kHz 모노 샘플(무음 채우기 포함)의 최근 1,024개(64ms)에 Hann 창을 씌워 실수 FFT(`realfft`, rubato가 이미 쓰는 버전)를 하고, 80Hz~8kHz를 로그 간격 24개 대역으로 나눠 대역마다 가장 큰 빈을 dBFS로 바꾼다. -80~-20dBFS를 0~100으로 맞춘다. FFT 계획과 버퍼는 녹음을 시작할 때 한 번 만들어 두고 다시 쓴다. 무음으로 채운 구간(권한을 기다리는 동안 포함)은 모든 대역이 0이다. 15분 무음 판정(REC-05)은 40ms 레벨 창이 아니라 1초 평균으로 한다. 짧은 딸깍 소리 하나로 15분을 처음부터 다시 세지 않게 하려는 것이다.
 - `hound::WavWriter::flush()`를 5초마다 불러 헤더의 길이 필드를 갱신하고, 같은 파일의 두 번째 핸들로 `sync_data()`를 불러 디스크에 내린다(REC-02, NFR-05). 그래서 전원 차단에도 손실은 최대 5초다. sync 실패는 쓰기 오류와 같이 처리한다(4.6).
 - 녹음 종료는 언제나 기록 스레드가 마무리한다. 두 WAV를 finalize하고, `meta.json`에 길이·`gaps`와 `recorded`를 쓰고, `recording://stopped`를 보낸다. 사용자 종료, 4시간, 절전, 디스크 부족, 쓰기 오류가 모두 같은 길이다.
 - 절전 방지(`keepawake`, REC-06)는 기록 스레드가 녹음 동안 쥐고 있다. Windows `SetThreadExecutionState`가 스레드 단위라서다.
@@ -148,7 +149,7 @@ components.json     shadcn 설정 (style, base radix, alias @/)
 - **첫 실행 권한 팝업은 스트림 생성을 멈춘다** (S1 도구에서 확인): 마이크 권한을 아직 묻지 않은 상태에서 cpal `build_input_stream`을 부르면, 사용자가 팝업에 답할 때까지 macOS HAL 안에서 호출이 돌아오지 않는다. 그래서 스트림은 캡처 스레드에서만 열고, UI와 IPC 스레드에서 열지 않는다. `start_recording`은 스트림을 기다리지 않고 바로 돌아온다. 장치 열기(macOS tap 생성부터 스트림 시작까지)가 1초를 넘으면 레벨 이벤트의 `waiting_permission`이 켜지고 화면에 "권한 허용을 기다리는 중"을 보여 준다. 그동안 두 트랙은 무음으로 채워져 시간축이 유지된다. "권한이 없으면 0 버퍼"는 사용자가 이미 거부한 뒤의 동작으로 보이며, S1에서 확인한다.
 
 - 마이크: 마이크 장치에서 처음 받은 3초 분량의 샘플이 모두 정확히 0이면 `recording://warning { kind: "mic_permission" }`을 보낸다. 무음 채우기로 넣은 0은 세지 않는다.
-- 시스템 오디오: 녹음 중에는 검사하지 않는다. 온보딩과 설정의 "시스템 오디오 테스트"가 1kHz 사인파를 1초 재생하고, 같은 시간 루프백 RMS가 -40 dBFS를 넘으면 통과로 본다.
+- 시스템 오디오: 녹음 중에는 검사하지 않는다. 설정 오디오 탭의 "시스템 오디오 테스트"(M6)가 1kHz 사인파를 1초 재생하고, 같은 시간 루프백 RMS가 -40 dBFS를 넘으면 통과로 본다.
 - macOS에서는 권한이 없으면 오류 없이 0 버퍼만 온다. 그래서 위 방식으로만 판정한다.
 
 ### 4.5 합산과 게이팅 (TRN-02)
@@ -220,9 +221,10 @@ queue.rs ──spawn── 앱 실행 파일 --transcribe-worker {id} {chunk} {g
    └──── 종료 코드 ─────┘ 0 = 정상, 그 외 = 실패/크래시
 ```
 
+- **동시 실행** (TRN-01, 사용자 결정 2026-10-14): 워커 프로세스는 회의 2개까지 동시에 돈다. 나머지 회의는 대기열에서 들어온 순서(FIFO)대로 기다리고, 화면에 대기 순서를 보여 준다. 워커마다 모델을 따로 올리므로 메모리 사용이 두 배다. 8GB 기기에서 문제가 되는지 파일럿에서 본다.
 - 워커는 구간 하나를 처리하고 끝난다. 모델 로딩(수 초)은 구간마다 반복되지만, 구간이 10분 분량이라 비중이 작다.
 - 결과는 부모(`queue.rs`)가 받아 `transcript.partial.jsonl`에 쓴다. 워커는 회의 폴더의 오디오를 읽기만 한다.
-- **중단**: 녹음이 시작되면 부모가 워커 프로세스를 kill한다. 그 구간의 결과는 버리고, 녹음이 끝나면 그 구간부터 다시 처리한다. abort 콜백에 기대지 않는다.
+- **중단**: 녹음이 시작되면 부모가 실행 중인 워커 프로세스를 모두 kill한다. 그 구간의 결과는 버리고, 녹음이 끝나면 회의마다 그 구간부터 다시 처리한다. abort 콜백에 기대지 않는다.
 - 워커의 stderr는 회의 폴더의 `worker.log`에 남긴다(크래시 원인 확인용).
 - **종료 코드 계약**: `0` 정상, `2` 입력·파일 오류(오디오 없음, 인자 오류), `3` 모델 로드 실패(파일 손상·경로 오류), 그 외 코드나 시그널 종료는 **크래시**. 5.4의 GPU 실패 판정은 크래시만 센다. `2`·`3`은 GPU와 무관하므로 바로 `transcribe_failed`로 바꾸고 원인을 보여준다(`3`이면 "모델 다시 받기"를 제안한다).
 
@@ -412,8 +414,8 @@ recording ─▶ recorded ─▶ transcribing ─▶ transcribed ─▶ summariz
 
 ### 8.4 처리 대기열과 시작 시 복구 (queue.rs, store.rs, lib.rs)
 
-- 워커 스레드 하나가 대기열에서 회의를 꺼내 처리한다. 상태에 따라 전사 → 요약 순서로 진행한다.
-- 녹음이 시작되면 진행 중인 전사 워커를 kill하고(5.3), 로컬 LLM 요약이면 요청도 취소한다. 녹음이 끝나면 같은 회의의 같은 구간부터 다시 진행한다.
+- 대기열에서 회의를 들어온 순서대로 꺼내 2개까지 동시에 처리한다(5.3). 상태에 따라 전사 → 요약 순서로 진행한다.
+- 녹음이 시작되면 실행 중인 전사 워커를 모두 kill하고(5.3), 로컬 LLM 요약이면 요청도 취소한다. 녹음이 끝나면 같은 회의의 같은 구간부터 다시 진행한다.
 - **단일 실행** (APP-06, eng review D14): `tauri-plugin-single-instance`를 빌더에 가장 먼저 등록한다. 두 번째 실행은 즉시 끝나고, 실행 중인 인스턴스가 메인 창을 보여 주고 앞으로 가져온다. 그래서 아래 복구는 항상 회의 폴더를 소유한 인스턴스 하나에서만 돈다.
 - 앱 시작 시 `store.rs`의 복구 함수가 모든 `meta.json`을 읽어 다음을 한다.
   - `recording` → 디스크의 상태는 그대로 두고, 메모리에서 "중단된 녹음"으로 표시한다. 녹음자가 "처리 계속"을 고르면 `recorded`로 바꿔 대기열에 넣는다. 종료 확인(8.5)의 "진행 중인 작업"에는 세지 않는다. 실행 중에 녹음을 끝냈는데 `recorded`를 쓰지 못한 회의(디스크가 가득 참 등)도 "중단된 녹음"이 된다. 공간을 비운 뒤 "처리 계속"이 다시 쓴다.
@@ -466,14 +468,19 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 
 - 서비스 이름: `com.sije.meeting-summarizer`
 - 비밀값 존재 확인(`has_secret`)은 값을 복호화하지 않는다. macOS에서는 `keyring-core`의 속성 전용 검색을 써서 키체인 접근 팝업을 피한다(`keyring-core`는 `keyring`과 같은 버전을 유지해야 한다).
-- 키체인에 주인 없는 항목이 남지 않게 한다. 설정 화면에서 연결·웹훅을 지우면 확인을 받고, 그 키체인 항목은 "저장"이 성공한 뒤에만 지운다. 아직 저장되지 않은 연결·웹훅은 키 입력란이 비활성화되며 "설정을 저장한 뒤 입력하세요"를 보여 준다.
+- 키체인에 주인 없는 항목이 남지 않게 한다. 키체인은 "저장"으로만 바뀌고, `settings.json` 저장(`save_settings`)이 성공한 뒤에 다음 순서로 바뀐다. 저장이 실패하면 키체인은 그대로다.
+  1. 지운 연결·웹훅의 항목을 지운다. 지울 때는 확인을 받는다.
+  2. 입력한 키를 넣는다. 같은 저장에서 새로 추가한 연결·웹훅도 이미 `settings.json`에 들어 있으므로 바로 넣는다.
+- 키 쓰기나 지우기가 실패하면 "설정은 저장했지만 키체인에 키를 저장하지 못했습니다"(지우기는 "…지우지 못했습니다")를 보여 준다. 실패가 여럿이면 한 메시지에 모은다. 입력한 키는 화면에 남아 다음 저장 때 다시 넣고, 지우지 못한 키는 기억해 두었다가 다음 저장 때 다시 지운다. 그동안 그 이름은 다시 추가할 수 없다. 이 기억은 설정 화면에만 있어서, 지우기가 실패한 채 앱을 다시 시작하면 그 키는 키체인에 남는다.
+- 저장하는 동안에는 설정 화면의 입력과 저장 버튼을 막아 두 저장이 겹치지 않게 한다.
+- 저장한 연결·웹훅을 지운 뒤 같은 이름을 저장 전에 다시 추가할 수 없다("저장한 뒤 다시 추가하세요"). 옛 키가 1번에서 지워지지 않고 새 항목에 남기 때문이다.
 - 계정 이름: `llm:{연결 이름}`, `slack:{웹훅 이름}`
 - 값: API 키, 웹훅 URL
 
 ### 9.3 연결 설정 입력 (ONB-04)
 
-- 녹음자가 온보딩과 설정 화면에서 직접 입력한다: LLM 연결(`name`, `base_url`, `model`, API 키)과 Slack 웹훅(이름, URL).
-- API 키와 웹훅 URL은 입력 즉시 키체인에 저장하고, 나머지는 `settings.json`에 저장한다.
+- 녹음자가 설정 화면의 요약(LLM) 탭과 Slack 탭에서 직접 입력한다: LLM 연결(`name`, `base_url`, `model`, API 키)과 Slack 웹훅(이름, URL).
+- 설정 화면의 "저장" 버튼 하나가 모든 탭을 저장한다. API 키와 웹훅 URL은 키체인에, 나머지는 `settings.json`에 들어간다(순서는 9.2). 입력한 키는 저장 전까지 화면 상태에만 있고, 저장한 키는 프론트엔드로 돌아오지 않는다. 입력란은 "키체인에 저장됨"만 보여 주며, 새 값을 입력하고 저장하면 바뀐다. 저장하지 않고 설정 화면을 떠나면 입력한 값(키 포함)은 버려진다.
 - 설정 파일 가져오기는 v1에서 뺐다(eng review D3). 평문 비밀값 파일을 만들지 않기 위해서다. 키와 URL을 녹음자에게 어떻게 전달할지는 설계 문서 Open Question 3이다.
 
 ## 10. 프론트엔드
@@ -482,18 +489,24 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 
 | 화면 | 들어오는 경로 |
 |---|---|
-| 온보딩 | 모델이나 연결 설정이 없을 때 |
-| 홈 | 앱을 그냥 열 때, 다른 화면에서 돌아올 때 |
-| 녹음 중 | 녹음 시작 |
+| 홈 | 앱을 열 때(설정이 비어 있어도 항상), 헤더의 앱 이름, 다른 화면의 "← 홈으로" |
+| 녹음 중 | 녹음 시작, 헤더의 녹음 칩, 녹음 중일 때 홈의 "녹음 화면으로"와 목록의 녹음 중 회의 |
 | 처리 중 | 녹음 종료 직후, 홈에서 처리 중인 회의 선택 |
 | 검토·전송 | 처리 완료 알림 클릭(해당 회의), 홈에서 회의 선택 |
-| 설정 | 홈의 설정 버튼 |
+| 설정 | 헤더의 설정 버튼, 홈 설정 카드의 항목 버튼(그 항목의 탭이 열린다) |
+
+온보딩 화면은 없다(사용자 결정 2026-10-14, ONB 절).
+
+- **앱 헤더** (APP-07): 모든 화면 위에 붙는 높이 56px 헤더 하나. 왼쪽은 앱 이름과 상태 칩, 오른쪽은 설정 버튼이다. 칩은 `App.tsx`가 들고 있는 `list_meetings` 결과로 센다. 홈 목록도 같은 상태를 써서 둘이 어긋나지 않는다. 목록은 화면이 바뀔 때와 `recording://stopped` 때 다시 읽는다. 녹음 시간은 `recording://level`의 `elapsed_ms`다. M3에서 `meeting://progress`로 처리 진행률을 더한다.
+- **본문**: 화면별 동작은 본문에 둔다. 홈이 아닌 화면은 본문 맨 위에 "← 홈으로"를 둔다. 본문 폭은 `max-w-3xl`, 설정만 `max-w-5xl`이다.
+- **설정 카드**: 홈 맨 위에서 빠진 항목을 한 줄씩 보여 준다(LLM 연결 없음 → 요약(LLM) 탭, Slack 웹훅 없음 → Slack 탭, 설정 파일을 읽을 수 없음 → 일반 탭(오류와 "기본값으로 다시 시작"), M3부터 모델 → 전사 탭). 녹음은 막지 않는다.
+- **설정 탭**: 왼쪽 탭 목록(좁은 창에서는 내용 위)과 오른쪽 내용. 탭은 일반, 오디오, 전사, 요약(LLM), Slack이다(ONB-07). 저장 버튼 하나가 모든 탭을 저장한다. 안 보이는 탭도 마운트된 채 숨겨 두므로 탭을 바꿔도 입력이 사라지지 않는다. 비밀값 규칙은 9.2~9.3 그대로다.
 
 ### 10.2 IPC
 
 | 명령 (React → Rust) | 이벤트 (Rust → React) |
 |---|---|
-| `start_recording` → `{ id, warnings }` (장치는 캡처 스레드에서 열므로 바로 돌아온다), `stop_recording` → id (두 WAV를 닫고 `recorded`가 된 뒤 돌아온다), `recording_state` → 진행 중인 녹음과 남아 있는 경고 | `recording://level` `{ elapsed_ms, mic, system, waiting_permission }` (100ms마다, 트랙별 RMS 0~1) |
+| `start_recording` → `{ id, warnings }` (장치는 캡처 스레드에서 열므로 바로 돌아온다), `stop_recording` → id (두 WAV를 닫고 `recorded`가 된 뒤 돌아온다), `recording_state` → 진행 중인 녹음과 남아 있는 경고 | `recording://level` `{ elapsed_ms, mic, system, mic_bands, system_bands, waiting_permission }` (40ms마다. `mic`·`system`은 트랙별 RMS 0~1, `*_bands`는 트랙별 스펙트럼 24개 대역 0~100, 4.1) |
 | `list_meetings` (항목마다 `interrupted`: 중단된 녹음), `get_meeting`, `delete_meeting` (녹음 중이면 먼저 녹음을 끝낸다) | `recording://warning` `{ kind, message }` (`disk`, `mic_permission`, `mic_device`, `system_device`, `silence`, `length`, `sleep`. 같은 `kind`는 앞의 경고를 바꾼다) |
 | `resume_meeting(id)`: 중단된 녹음의 "처리 계속", `transcribe_failed` 재시도(M3) | `recording://stopped` `{ id, message }` (녹음 종료. 스스로 끝난 경우 `message`에 이유) |
 | `set_summarize_local(id, bool)` | `meeting://status` (상태 변경) |
@@ -504,6 +517,7 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 | `confirm_quit` (종료 확인 후 진행 중 작업을 `paused`로 기록하고 종료), `request_quit` (Windows Ctrl+Q 경로) | |
 | `reset_settings` (`settings.json`이 손상됐을 때만: 원본을 `settings.json.bak-<시각>`으로 옮기고 기본값으로 시작) | |
 | `download_models`, `import_model(path)`, `test_system_audio`, `send_test_message` | |
+| `list_audio_devices` → `{ inputs, outputs }`, 항목은 `{ id, name }`. `id`는 cpal `DeviceId` 문자열(`host:id`)이라 `input_device`·`output_device`에 그대로 저장하면 캡처 스레드가 같은 장치를 연다. 장치 호출이 멈출 수 있어 blocking 스레드에서 열거하고, 우리 private aggregate 장치(macOS 시스템 오디오 탭)는 뺀다 | |
 
 ### 10.3 색상 토큰
 
@@ -581,12 +595,12 @@ shadcn 컴포넌트는 `--primary` 같은 의미 변수를 쓴다. `theme.css`�
 | 비활성 글자 | `cool500` | 비활성 요소라 대비 기준 예외 |
 | 주요 버튼 | 배경 `mainBlue`, 글자 `white` (5.3:1), 눌림 `blue900` | |
 | 선택 상태 | 배경 `blue50` / `blue100` | |
-| 녹음 중 표시 | `danger` 점 + `animate-pulse-faster` | 점에만 색을 쓴다 |
+| 녹음 중 표시 | `danger` 점 + `animate-pulse-faster` | 점에만 색을 쓴다. 녹음 화면의 큰 점은 `motion-safe:animate-pulse`로 느리게 깜박인다 |
 | 녹음 종료 버튼 | 배경 `danger`, 글자 `white` (3.2:1) | 큰 글자 기준(3:1)만 충족하므로 **굵게 14pt(18.66px) 이상** |
 | 에러 배너 | 배경 `danger100`, 테두리·아이콘 `dangerDark`, 글자 `black` | `dangerDark` 글자는 3.9:1이라 쓰지 않는다 |
 | 경고 배너, "미정" | 배경 `warning100`, 테두리·아이콘 `warning`, 글자 `black` | `warning` 글자는 2.1:1이라 쓰지 않는다 |
 | 전송 완료 | 아이콘 `green`, 배경 `green50`, 글자 `black` | `green` 글자는 2.5:1이라 쓰지 않는다 |
-| 레벨 미터 | 마이크 `mainBlue`, 시스템 오디오 `mint` | |
+| 스펙트럼 | 마이크 `mainBlue`, 시스템 오디오 `mint` | 막대는 장식(`aria-hidden`). 음량은 화면 읽기 프로그램용 `meter`로 따로 둔다 |
 | 경계선 / 앱 배경 | `cool200` / `blueGray` | |
 
 기존 템플릿의 `src/App.css`는 지우고 이 파일로 바꾼다.
@@ -644,7 +658,7 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 | `summarize.rs` | 토큰 추정과 구간 나누기, 실패 분류 (6.4), 30자 미만 → LLM 요청 없음 (D8) |
 | `model.rs` | 해시 불일치 시 `.part` 삭제 |
 | 검토 화면 (Vitest) | `<img src=x onerror=...>`가 든 요약이 텍스트로 표시됨 (D6), 빈 녹음 안내와 전송 버튼 비활성화 (D8), "미정" 강조 |
-| 녹음 화면 (Vitest) | 레벨 이벤트로 경과 시간·레벨 미터 표시, 경고 배너 닫기와 같은 종류가 다시 오면 다시 표시 |
+| 녹음 화면 (Vitest) | 레벨 이벤트로 경과 시간·스펙트럼 막대 높이·음량 표시, 경고 배너 닫기와 같은 종류가 다시 오면 다시 표시 |
 
 ### 12.2 수동 점검 (릴리스마다)
 

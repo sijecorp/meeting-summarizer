@@ -53,7 +53,8 @@ impl SystemTap {
         }
 
         let uid = format!(
-            "com.sije.meeting-summarizer.tap.{}.{}",
+            "{}{}.{}",
+            super::TAP_UID_PREFIX,
             std::process::id(),
             INSTANCE.fetch_add(1, Ordering::Relaxed)
         );

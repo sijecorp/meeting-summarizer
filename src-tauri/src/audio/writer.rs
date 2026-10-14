@@ -6,6 +6,8 @@ use super::clock::{self, Aligner, Reading, Sleep, SleepWatch};
 use super::{Emit, Event, Level, Shared, Stopped, Track, Warning, free_space};
 use crate::store::{Gap, Store};
 use hound::WavWriter;
+use realfft::num_complex::Complex;
+use realfft::{RealFftPlanner, RealToComplex};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
 use std::fs::File;
@@ -18,15 +20,98 @@ use std::time::Duration;
 
 const TICK: Duration = Duration::from_millis(20);
 const FLUSH_EVERY_MS: u64 = 5_000;
-const LEVEL_EVERY_MS: u64 = 100;
+/// A multiple of `TICK`, so level events come evenly, 25 a second.
+const LEVEL_EVERY_MS: u64 = 40;
 const DISK_EVERY_MS: u64 = 60_000;
 const MAX_LENGTH_MS: u64 = 4 * 3_600_000;
 const LENGTH_WARNING_MS: u64 = MAX_LENGTH_MS - 10 * 60_000;
 const SILENCE_PROMPT_MS: u64 = 15 * 60_000;
 /// -50 dBFS (REC-05).
 const SILENT_RMS: f32 = 0.003_162_3;
+/// REC-05 judges silence a second at a time: over one 40 ms level window a single click would
+/// count as sound and restart the 15 minutes.
+const SILENCE_WINDOW_MS: u64 = 1_000;
 /// Below this the recording stops safely (REC-11).
 const STOP_FREE_BYTES: u64 = 200_000_000;
+/// The spectrum: the last 1,024 samples (64 ms at 16 kHz) in 24 log-spaced bands, 80 Hz–8 kHz.
+const FFT_LEN: usize = 1_024;
+pub const BANDS: usize = 24;
+const LOW_HZ: f32 = 80.0;
+const HIGH_HZ: f32 = 8_000.0;
+/// -80..-20 dBFS is drawn as 0..100.
+const FLOOR_DB: f32 = -80.0;
+const CEIL_DB: f32 = -20.0;
+
+/// The live spectrum on the recording screen (REC-09). Planned once; a tick allocates nothing.
+pub struct Spectrum {
+    fft: Arc<dyn RealToComplex<f32>>,
+    window: Vec<f32>,
+    input: Vec<f32>,
+    output: Vec<Complex<f32>>,
+    scratch: Vec<Complex<f32>>,
+    /// FFT bins `edges[i]..edges[i + 1]` make band `i`.
+    edges: [usize; BANDS + 1],
+    /// Makes a full-scale sine 0 dBFS: 2 / the window's sum.
+    norm: f32,
+}
+
+impl Spectrum {
+    pub fn new() -> Self {
+        let fft = RealFftPlanner::<f32>::new().plan_fft_forward(FFT_LEN);
+        let window: Vec<f32> = (0..FFT_LEN)
+            .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / FFT_LEN as f32).cos())
+            .collect();
+        let bin_hz = clock::RATE as f32 / FFT_LEN as f32;
+        let mut edges = [0; BANDS + 1];
+        for i in 0..=BANDS {
+            let hz = LOW_HZ * (HIGH_HZ / LOW_HZ).powf(i as f32 / BANDS as f32);
+            // The narrowest band, 80–97 Hz, is just over one 15.6 Hz bin. The `max` only keeps
+            // rounding from ever leaving a band empty.
+            let bin = (hz / bin_hz).round() as usize;
+            edges[i] = if i == 0 {
+                bin
+            } else {
+                bin.max(edges[i - 1] + 1)
+            };
+        }
+        Self {
+            input: fft.make_input_vec(),
+            output: fft.make_output_vec(),
+            scratch: fft.make_scratch_vec(),
+            norm: 2.0 / window.iter().sum::<f32>(),
+            window,
+            edges,
+            fft,
+        }
+    }
+
+    /// 0..100 per band from the peak bin. Exactly `FFT_LEN` samples, oldest first, in two parts
+    /// as a ring buffer holds them. Silence is all zeros.
+    pub fn bands(&mut self, older: &[f32], newer: &[f32]) -> [u8; BANDS] {
+        debug_assert_eq!(older.len() + newer.len(), FFT_LEN);
+        let samples = older.iter().chain(newer);
+        for ((x, s), w) in self.input.iter_mut().zip(samples).zip(&self.window) {
+            *x = s * w;
+        }
+        let mut bands = [0; BANDS];
+        let done =
+            self.fft
+                .process_with_scratch(&mut self.input, &mut self.output, &mut self.scratch);
+        if done.is_err() {
+            return bands;
+        }
+        for (band, edge) in bands.iter_mut().zip(self.edges.windows(2)) {
+            let peak = self.output[edge[0]..edge[1]]
+                .iter()
+                .map(|c| c.norm())
+                .fold(0.0, f32::max);
+            // log10(0) is -inf, which clamps to 0.
+            let db = 20.0 * (peak * self.norm).log10();
+            *band = ((db - FLOOR_DB) / (CEIL_DB - FLOOR_DB) * 100.0).clamp(0.0, 100.0) as u8;
+        }
+        bands
+    }
+}
 
 /// A capture stream as the writer sees it: interleaved samples at the device's rate.
 pub struct Source {
@@ -105,6 +190,9 @@ struct TrackOut<W: Write + Seek> {
     fresh: Vec<f32>,
     sum_sq: f64,
     count: u64,
+    /// The last `FFT_LEN` samples written, filled silence included; `next` is the oldest.
+    recent: Vec<f32>,
+    next: usize,
     /// Device samples of the first 3 s of microphone audio still to check (REC-08).
     zero_left: Option<u64>,
     zero_check_started: bool,
@@ -120,6 +208,8 @@ impl<W: Write + Seek> TrackOut<W> {
             fresh: Vec::new(),
             sum_sq: 0.0,
             count: 0,
+            recent: vec![0.0; FFT_LEN],
+            next: 0,
             zero_left: None,
             zero_check_started: !check_zeros,
         }
@@ -128,8 +218,15 @@ impl<W: Write + Seek> TrackOut<W> {
     fn write(&mut self, sample: f32) -> hound::Result<()> {
         self.sum_sq += f64::from(sample * sample);
         self.count += 1;
-        self.wav
-            .write_sample((sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16)
+        let sample = sample.clamp(-1.0, 1.0);
+        self.recent[self.next] = sample;
+        self.next = (self.next + 1) % FFT_LEN;
+        self.wav.write_sample((sample * f32::from(i16::MAX)) as i16)
+    }
+
+    /// `recent` as (older, newer).
+    fn recent(&self) -> (&[f32], &[f32]) {
+        (&self.recent[self.next..], &self.recent[..self.next])
     }
 
     /// Takes what the device delivered, aligns it to the clock and writes it.
@@ -210,11 +307,15 @@ pub struct Writer<W: Write + Seek> {
     emit: Emit,
     start: Reading,
     sleep: SleepWatch,
+    spectrum: Spectrum,
     gaps: Vec<Gap>,
     elapsed_ms: u64,
     next_flush_ms: u64,
     next_level_ms: u64,
     next_disk_ms: u64,
+    /// RMS² × ms per track (mic, system) and the ms they cover, toward `SILENCE_WINDOW_MS`.
+    quiet_power: [f64; 2],
+    quiet_ms: u64,
     silent_ms: u64,
     length_warned: bool,
 }
@@ -241,11 +342,14 @@ impl<W: Write + Seek> Writer<W> {
             emit,
             start,
             sleep: SleepWatch::new(start),
+            spectrum: Spectrum::new(),
             gaps: Vec::new(),
             elapsed_ms: 0,
             next_flush_ms: FLUSH_EVERY_MS,
             next_level_ms: LEVEL_EVERY_MS,
             next_disk_ms: DISK_EVERY_MS,
+            quiet_power: [0.0; 2],
+            quiet_ms: 0,
             silent_ms: 0,
             length_warned: false,
         }
@@ -342,24 +446,36 @@ impl<W: Write + Seek> Writer<W> {
             let since = elapsed + LEVEL_EVERY_MS - self.next_level_ms;
             self.next_level_ms = elapsed + LEVEL_EVERY_MS;
             let (mic, system) = (self.mic.take_rms(), self.system.take_rms());
-            let before = self.silent_ms;
-            self.silent_ms = if mic < SILENT_RMS && system < SILENT_RMS {
-                before + since
-            } else {
-                0
-            };
-            if before < SILENCE_PROMPT_MS && self.silent_ms >= SILENCE_PROMPT_MS {
-                self.warn(
-                    "silence",
-                    "15분 동안 소리가 없습니다. 녹음을 계속할까요? 회의가 끝났다면 녹음을 종료하세요"
-                        .into(),
-                );
+            for (power, rms) in self.quiet_power.iter_mut().zip([mic, system]) {
+                *power += f64::from(rms * rms) * since as f64;
+            }
+            self.quiet_ms += since;
+            if self.quiet_ms >= SILENCE_WINDOW_MS {
+                let ms = self.quiet_ms as f64;
+                let quiet = self
+                    .quiet_power
+                    .iter()
+                    .all(|p| ((p / ms).sqrt() as f32) < SILENT_RMS);
+                let before = self.silent_ms;
+                self.silent_ms = if quiet { before + self.quiet_ms } else { 0 };
+                (self.quiet_power, self.quiet_ms) = ([0.0; 2], 0);
+                if before < SILENCE_PROMPT_MS && self.silent_ms >= SILENCE_PROMPT_MS {
+                    self.warn(
+                        "silence",
+                        "15분 동안 소리가 없습니다. 녹음을 계속할까요? 회의가 끝났다면 녹음을 종료하세요"
+                            .into(),
+                    );
+                }
             }
             let opening = self.shared.opening_since_ms.load(Ordering::SeqCst);
+            let (mic_older, mic_newer) = self.mic.recent();
+            let (system_older, system_newer) = self.system.recent();
             (self.emit)(Event::Level(Level {
                 elapsed_ms: elapsed,
                 mic,
                 system,
+                mic_bands: self.spectrum.bands(mic_older, mic_newer),
+                system_bands: self.spectrum.bands(system_older, system_newer),
                 waiting_permission: opening != 0 && now.awake_ms.saturating_sub(opening) > 1_000,
             }));
         }
@@ -742,5 +858,122 @@ mod tests {
         mic_source(&tx, &samples);
         w.tick(at(3_000));
         assert!(!warned(&events, "mic_permission"));
+    }
+
+    fn sine(hz: f32, amplitude: f32, len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| (std::f32::consts::TAU * hz * i as f32 / 16_000.0).sin() * amplitude)
+            .collect()
+    }
+
+    #[test]
+    fn a_1khz_sine_peaks_in_the_band_holding_1khz() {
+        let mut spectrum = Spectrum::new();
+        let bands = spectrum.bands(&sine(1_000.0, 0.1, FFT_LEN), &[]);
+        let bin = (1_000.0 / (16_000.0 / FFT_LEN as f32)) as usize;
+        let holding = spectrum
+            .edges
+            .windows(2)
+            .position(|e| (e[0]..e[1]).contains(&bin));
+        let peak = (0..BANDS).max_by_key(|&i| bands[i]);
+        assert_eq!(peak, holding, "{bands:?}");
+        // -20 dBFS, the top of the scale (99 if rounding lands a hair below).
+        assert!(bands[peak.unwrap()] >= 99, "{bands:?}");
+    }
+
+    #[test]
+    fn silence_is_all_zeros_and_full_scale_stays_within_100() {
+        let mut spectrum = Spectrum::new();
+        let silence = [0.0; FFT_LEN];
+        // Split like a ring buffer that wrapped.
+        assert_eq!(spectrum.bands(&silence[..300], &silence[300..]), [0; BANDS]);
+        let square: Vec<f32> = (0..FFT_LEN)
+            .map(|i| if i / 8 % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        for bands in [
+            spectrum.bands(&sine(440.0, 1.0, FFT_LEN), &[]),
+            spectrum.bands(&square, &[]),
+        ] {
+            assert!(bands.iter().all(|&b| b <= 100), "{bands:?}");
+        }
+    }
+
+    /// The level event carries each track's spectrum; a track filled with silence is all zeros.
+    #[test]
+    fn level_events_carry_the_spectrum_of_each_track() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path().join("meetings")).unwrap();
+        let (mut w, _dir, tx, events) = writer(&store, [usize::MAX; 2]);
+        mic_source(&tx, &sine(1_000.0, 0.1, 32_000));
+        w.tick(at(1_000));
+
+        let events = events.lock().unwrap();
+        let Some(Event::Level(level)) = events.iter().find(|e| matches!(e, Event::Level(_))) else {
+            panic!("no level event");
+        };
+        assert_eq!(level.system_bands, [0; BANDS]);
+        let peak = (0..BANDS).max_by_key(|&i| level.mic_bands[i]).unwrap();
+        assert!(level.mic_bands[peak] > 50, "{:?}", level.mic_bands);
+        let hz = |bin: usize| bin as f32 * 16_000.0 / FFT_LEN as f32;
+        let edges = Spectrum::new().edges;
+        assert!((hz(edges[peak])..hz(edges[peak + 1])).contains(&1_000.0));
+    }
+
+    /// REC-05: both tracks silent for 15 minutes → one prompt. A click does not restart the
+    /// count, a tone does.
+    #[test]
+    fn fifteen_silent_minutes_prompt_once_and_only_sound_restarts_the_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path().join("meetings")).unwrap();
+        let (mut w, _, tx, events) = writer(&store, [usize::MAX; 2]);
+        let prompts = |events: &Events| {
+            let events = events.lock().unwrap();
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Warning(w) if w.kind == "silence"))
+                .count()
+        };
+
+        // No device: both tracks are filled with silence, a second per tick.
+        for s in 1..=899 {
+            w.tick(at(s * 1_000));
+        }
+        assert_eq!(prompts(&events), 0);
+        w.tick(at(900_000));
+        assert_eq!(prompts(&events), 1);
+        for s in 901..=910 {
+            w.tick(at(s * 1_000));
+        }
+        assert_eq!(prompts(&events), 1, "once per stretch of silence");
+
+        // A microphone appears; from now on each second's samples arrive before its tick.
+        let (mut mic, samples) = rtrb::RingBuffer::new(32_000);
+        tx.send(Source {
+            track: Track::Mic,
+            samples,
+            rate: 16_000,
+            channels: 1,
+        })
+        .unwrap();
+        w.tick(at(911_000));
+        // Like the real loop: 20 ms ticks, a level window every 40 ms.
+        let mut second = |w: &mut Writer<_>, s: u64, samples: &[f32]| {
+            for (k, slice) in (1..).zip(samples.chunks(320)) {
+                for &x in slice {
+                    mic.push(x).unwrap();
+                }
+                w.tick(at((s - 1) * 1_000 + k * 20));
+            }
+        };
+
+        // A 5 ms click at -30 dBFS: -39 dBFS over a 40 ms window, -53 dBFS over the second.
+        let mut click = vec![0.0; 16_000];
+        click[8_000..8_080].fill(0.031_6);
+        let before = w.silent_ms;
+        second(&mut w, 912, &click);
+        assert_eq!(w.silent_ms, before + 1_000);
+
+        second(&mut w, 913, &sine(1_000.0, 0.1, 16_000));
+        assert_eq!(w.silent_ms, 0);
     }
 }

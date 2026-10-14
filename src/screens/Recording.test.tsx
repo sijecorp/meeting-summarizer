@@ -13,17 +13,31 @@ const state: RecordingState = {
   warnings: [{ kind: "disk", message: "남은 공간으로 최대 약 90분 녹음할 수 있습니다" }],
 };
 
-test("shows elapsed time and levels from level events", async () => {
+test("shows elapsed time, spectrums and levels from level events", async () => {
   mockIPC((cmd) => (cmd === "recording_state" ? state : undefined), { shouldMockEvents: true });
   render(<Recording onHome={() => {}} onStopped={() => {}} />);
   expect(await screen.findByText("00:00:00")).toBeTruthy();
 
-  const level: Level = { elapsed_ms: 3_723_000, mic: 0.1, system: 0, waiting_permission: true };
+  const micBands = Array.from({ length: 24 }, (_, i) => i * 4);
+  const level: Level = {
+    elapsed_ms: 3_723_000,
+    mic: 0.1,
+    system: 0,
+    mic_bands: micBands,
+    system_bands: Array(24).fill(0),
+    waiting_permission: true,
+  };
   await act(() => emit("recording://level", level));
 
   expect(screen.getByText("01:02:03")).toBeTruthy();
+  // The bars are decoration next to each meter; the meter is what screen readers get.
+  const bars = (name: string) =>
+    Array.from(screen.getByRole("meter", { name }).previousElementSibling!.children) as HTMLElement[];
+  expect(bars("내 마이크").map((b) => b.style.height)).toEqual(micBands.map((b) => `${b}%`));
+  expect(bars("시스템 오디오").every((b) => b.style.height === "0%")).toBe(true);
+  expect(bars("내 마이크")[0].parentElement!.getAttribute("aria-hidden")).toBe("true");
   // 0.1 RMS = -20 dBFS → 40 of 60 dB.
-  expect(screen.getByRole("meter", { name: "마이크" }).getAttribute("aria-valuenow")).toBe("67");
+  expect(screen.getByRole("meter", { name: "내 마이크" }).getAttribute("aria-valuenow")).toBe("67");
   expect(screen.getByRole("meter", { name: "시스템 오디오" }).getAttribute("aria-valuenow")).toBe("0");
   expect(screen.getByText(/권한 허용을 기다리는 중/)).toBeTruthy();
 });

@@ -1,6 +1,6 @@
 // `async` keeps file and keychain I/O off the main (UI) thread.
 use crate::QUIT_CONFIRMED;
-use crate::audio::{Recorder, RecordingState};
+use crate::audio::{self, AudioDevices, Recorder, RecordingState};
 use crate::settings::{self, LoadedSettings, SecretKind, Settings, SettingsStore};
 use crate::store::{Meta, Status, Store};
 use serde::Serialize;
@@ -101,6 +101,15 @@ pub fn start_recording(
 ) -> Result<RecordingState, String> {
     let settings = settings.load().map(|l| l.settings).unwrap_or_default();
     recorder.start(&app, &store, settings.input_device, settings.output_device)
+}
+
+/// For the settings' audio tab. Device calls can block inside the OS audio API, so this runs on
+/// a blocking thread rather than an async worker.
+#[tauri::command]
+pub async fn list_audio_devices() -> Result<AudioDevices, String> {
+    tauri::async_runtime::spawn_blocking(audio::devices)
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Waits until both WAV files are closed and the meeting is `recorded`.

@@ -5,9 +5,10 @@
 //! blocks `build_input_stream` inside the HAL until the recorder answers it.
 
 use super::writer::Source;
-use super::{Emit, Event, Shared, Track, Warning, clock};
+use super::{Emit, Event, Shared, TAP_UID_PREFIX, Track, Warning, clock};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, DeviceId, FromSample, Host, SampleFormat, SizedSample, StreamConfig};
+use serde::Serialize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -62,6 +63,53 @@ struct Input {
     last_opened: Option<DeviceId>,
     retry: Retry,
     last_message: String,
+}
+
+/// A device for the settings' audio tab. `id` is the `DeviceId` string that `Input::refresh`
+/// parses back when the device is pinned.
+#[derive(Serialize)]
+pub struct AudioDevice {
+    id: String,
+    name: String,
+}
+
+#[derive(Serialize)]
+pub struct AudioDevices {
+    inputs: Vec<AudioDevice>,
+    outputs: Vec<AudioDevice>,
+}
+
+/// Can block inside the OS audio API: call it on a blocking thread, never the IPC thread.
+pub fn devices() -> Result<AudioDevices, String> {
+    let host = cpal::default_host();
+    let inputs = host.input_devices().map_err(|e| e.to_string())?;
+    // Only Windows pins an output device (see `run`). An output error must not hide the mics.
+    let outputs = if cfg!(target_os = "macos") {
+        Vec::new()
+    } else {
+        host.output_devices().map(listed).unwrap_or_default()
+    };
+    Ok(AudioDevices {
+        inputs: listed(inputs),
+        outputs,
+    })
+}
+
+fn listed(devices: impl Iterator<Item = Device>) -> Vec<AudioDevice> {
+    devices
+        .filter_map(|device| {
+            let id = device.id().ok().filter(|id| !is_own_tap(id))?;
+            Some(AudioDevice {
+                id: id.to_string(),
+                name: device.description().ok()?.name().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Our private aggregate device (macos_tap.rs) shows up as an input while recording.
+fn is_own_tap(id: &DeviceId) -> bool {
+    id.id().starts_with(TAP_UID_PREFIX)
 }
 
 pub fn run(
@@ -331,5 +379,19 @@ mod tests {
         assert!(!retry.waiting(&id("b"), t0 + POLL));
         retry.failed(id("b"), t0);
         assert!(!retry.waiting(&id("b"), t0 + POLL), "its count starts over");
+    }
+
+    #[test]
+    fn device_list_leaves_out_our_own_tap_and_ids_round_trip() {
+        let host = cpal::default_host().id();
+        let tap = DeviceId::new(host, format!("{TAP_UID_PREFIX}123.0"));
+        let mic = DeviceId::new(host, "BuiltInMicrophoneDevice");
+        assert!(is_own_tap(&tap));
+        assert!(!is_own_tap(&mic));
+        // What the audio tab stores is what `Input::refresh` parses, even with ':' in the UID.
+        let usb = DeviceId::new(host, "AppleUSBAudioEngine:Vendor:Product:1234:1");
+        for id in [mic, usb] {
+            assert_eq!(id.to_string().parse::<DeviceId>().ok(), Some(id));
+        }
     }
 }
