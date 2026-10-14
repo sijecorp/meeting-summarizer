@@ -417,6 +417,11 @@ impl Store {
         self.interrupted.lock().unwrap().contains(id)
     }
 
+    /// A recording whose end could not be written: treated like one found at startup.
+    pub fn mark_interrupted(&self, id: &str) {
+        self.interrupted.lock().unwrap().insert(id.to_string());
+    }
+
     /// "처리 계속" for an interrupted recording (STO-03). The WAV files keep what their last
     /// 5 s flush wrote. Until the queue lands (M3) this only writes `recorded`.
     pub fn continue_interrupted(&self, id: &str) -> Result<Meta, String> {

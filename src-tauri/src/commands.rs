@@ -2,7 +2,7 @@
 use crate::QUIT_CONFIRMED;
 use crate::audio::{Recorder, RecordingState};
 use crate::settings::{self, LoadedSettings, SecretKind, Settings, SettingsStore};
-use crate::store::{Meta, Store};
+use crate::store::{Meta, Status, Store};
 use serde::Serialize;
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, State};
@@ -53,7 +53,8 @@ pub fn list_meetings(store: State<'_, Store>) -> Result<Vec<MeetingItem>, String
         .list()
         .into_iter()
         .map(|meta| MeetingItem {
-            interrupted: store.is_interrupted(&meta.id),
+            // A meeting deleted mid-recording may still be in the set.
+            interrupted: meta.status == Status::Recording && store.is_interrupted(&meta.id),
             meta,
         })
         .collect())

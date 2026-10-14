@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import {
   listMeetings,
+  onRecordingStopped,
   resumeMeeting,
   startRecording,
   STATUS_LABEL,
@@ -42,6 +43,12 @@ export default function Home({
       .catch((e) => setError(String(e)));
   useEffect(() => {
     load();
+    // A recording that ends while home is shown is no longer "녹음 중".
+    const unlisten = onRecordingStopped(load);
+    unlisten.catch((e) => setError(String(e)));
+    return () => {
+      unlisten.then((stop) => stop(), () => {});
+    };
   }, []);
 
   const start = () => {

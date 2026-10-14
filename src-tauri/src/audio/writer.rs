@@ -8,6 +8,7 @@ use crate::store::{Gap, Store};
 use hound::WavWriter;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
+use std::fs::File;
 use std::io::{Seek, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -96,6 +97,8 @@ impl Pipe {
 
 struct TrackOut<W: Write + Seek> {
     wav: WavWriter<W>,
+    /// Another handle to the WAV file, to get flushed data onto the disk.
+    sync: File,
     align: Aligner,
     source: Option<(Source, Pipe)>,
     /// 16 kHz samples produced this tick.
@@ -108,9 +111,10 @@ struct TrackOut<W: Write + Seek> {
 }
 
 impl<W: Write + Seek> TrackOut<W> {
-    fn new(wav: WavWriter<W>, check_zeros: bool) -> Self {
+    fn new((wav, sync): (WavWriter<W>, File), check_zeros: bool) -> Self {
         Self {
             wav,
+            sync,
             align: Aligner::default(),
             source: None,
             fresh: Vec::new(),
@@ -220,8 +224,8 @@ impl<W: Write + Seek> Writer<W> {
     pub fn new(
         id: String,
         dir: PathBuf,
-        mic: WavWriter<W>,
-        system: WavWriter<W>,
+        mic: (WavWriter<W>, File),
+        system: (WavWriter<W>, File),
         sources: Receiver<Source>,
         shared: Arc<Shared>,
         emit: Emit,
@@ -321,9 +325,12 @@ impl<W: Write + Seek> Writer<W> {
             self.system.pull(elapsed)?;
             if elapsed >= self.next_flush_ms {
                 self.next_flush_ms = elapsed + FLUSH_EVERY_MS;
-                // Rewrites the WAV headers: a crash now loses at most 5 s (REC-02).
-                self.mic.wav.flush()?;
-                self.system.wav.flush()?;
+                // Rewrites the WAV headers and puts the data on the disk: a crash or a power
+                // cut now loses at most 5 s (REC-02, NFR-05). A failed sync is a write error.
+                for out in [&mut self.mic, &mut self.system] {
+                    out.wav.flush()?;
+                    out.sync.sync_data()?;
+                }
             }
             Ok::<_, hound::Error>(())
         })();
@@ -380,13 +387,17 @@ impl<W: Write + Seek> Writer<W> {
     /// Final flush, then `recorded` (architecture 4.6 safe stop). A WAV that cannot be finalized
     /// keeps the header of its last successful 5 s flush, so it stays readable.
     pub fn finish(self, store: &Store, stop: Stop) {
-        for (name, wav) in [("mic.wav", self.mic.wav), ("system.wav", self.system.wav)] {
-            if let Err(e) = wav.finalize() {
+        for (name, out) in [("mic.wav", self.mic), ("system.wav", self.system)] {
+            let closed = out.wav.finalize().map_err(|e| e.to_string());
+            if let Err(e) = closed.and_then(|()| out.sync.sync_data().map_err(|e| e.to_string())) {
                 eprintln!("{name} 마무리 실패 ({}): {e}", self.id);
             }
         }
         if let Err(e) = store.finish_recording(&self.id, self.elapsed_ms, self.gaps) {
             eprintln!("녹음 상태 저장 실패 ({}): {e}", self.id);
+            // Likely the same full disk. Offered like a crash leftover: "처리 계속" writes
+            // `recorded` once there is room again, or the recorder deletes it (STO-03).
+            store.mark_interrupted(&self.id);
         }
         (self.emit)(Event::Stopped(Stopped {
             id: self.id,
@@ -419,7 +430,6 @@ pub fn run<W: Write + Seek>(mut writer: Writer<W>, store: &Store) {
 mod tests {
     use super::*;
     use crate::store::Status;
-    use std::fs::File;
     use std::io::{self, BufWriter};
     use std::sync::Mutex;
     use std::sync::mpsc;
@@ -507,8 +517,9 @@ mod tests {
         let [mic, system] =
             [("mic.wav", budgets[0]), ("system.wav", budgets[1])].map(|(name, left)| {
                 let file = File::create(dir.join(name)).unwrap();
-                WavWriter::new(BufWriter::new(FailAfter { file, left }), super::super::SPEC)
-                    .unwrap()
+                let sync = file.try_clone().unwrap();
+                let sink = BufWriter::new(FailAfter { file, left });
+                (WavWriter::new(sink, super::super::SPEC).unwrap(), sync)
             });
         let (tx, rx) = mpsc::channel();
         let events = Events::default();
@@ -586,6 +597,106 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .contains("녹음 파일을 쓰지 못해")
+        );
+    }
+
+    fn stopped_message(events: &Events) -> String {
+        match events.lock().unwrap().last() {
+            Some(Event::Stopped(stopped)) => stopped.message.clone().unwrap_or_default(),
+            _ => panic!("no stopped event last"),
+        }
+    }
+
+    /// REC-06: past 5 minutes of sleep, the recording ends where the sleep began.
+    #[test]
+    fn long_sleep_ends_the_recording_at_the_sleep_point() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path().join("meetings")).unwrap();
+        let (mut w, dir, _tx, events) = writer(&store, [usize::MAX; 2]);
+        let id = w.id.clone();
+        for tick in 1..=100 {
+            assert_eq!(w.tick(at(tick * 20)), None);
+        }
+        let written = w.mic.align.written;
+
+        // 20 ms more of recording, but 6 minutes of wall time: the lid was closed.
+        let woke = Reading {
+            awake_ms: 1_000 + 2_020,
+            total_ms: 1_000 + 2_020 + 6 * 60_000,
+        };
+        assert_eq!(w.tick(woke), Some(Stop::Sleep));
+        assert_eq!(
+            w.mic.align.written, written,
+            "nothing after the sleep point"
+        );
+        w.finish(&store, Stop::Sleep);
+
+        let meta = store.get(&id).unwrap();
+        assert_eq!((meta.status, meta.duration_ms), (Status::Recorded, 2_000));
+        let mic = hound::WavReader::open(dir.join("mic.wav")).unwrap();
+        assert_eq!(u64::from(mic.len()), written);
+        assert!(stopped_message(&events).contains("절전"));
+    }
+
+    /// REC-04: a warning 10 minutes before 4 hours, then an automatic stop at 4 hours.
+    #[test]
+    fn four_hours_warns_ten_minutes_ahead_then_stops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path().join("meetings")).unwrap();
+        let (mut w, _, _tx, events) = writer(&store, [usize::MAX; 2]);
+        let id = w.id.clone();
+        // Jump ahead as if the hours were recorded, without writing 230 M samples in a test.
+        let skip_to = |w: &mut Writer<_>, ms: u64| {
+            w.mic.align.written = ms * 16;
+            w.system.align.written = ms * 16;
+            w.tick(at(ms))
+        };
+        let length_warnings = |events: &Events| {
+            let events = events.lock().unwrap();
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Warning(w) if w.kind == "length"))
+                .count()
+        };
+
+        assert_eq!(skip_to(&mut w, LENGTH_WARNING_MS - 20), None);
+        assert_eq!(length_warnings(&events), 0);
+        assert_eq!(w.tick(at(LENGTH_WARNING_MS)), None);
+        assert_eq!(skip_to(&mut w, MAX_LENGTH_MS - 20), None);
+        assert_eq!(length_warnings(&events), 1);
+        assert_eq!(w.tick(at(MAX_LENGTH_MS)), Some(Stop::MaxLength));
+        w.finish(&store, Stop::MaxLength);
+
+        let meta = store.get(&id).unwrap();
+        assert_eq!(
+            (meta.status, meta.duration_ms),
+            (Status::Recorded, MAX_LENGTH_MS)
+        );
+        assert!(stopped_message(&events).contains("4시간"));
+    }
+
+    /// When even `recorded` cannot be written (the disk is full), the meeting is offered as an
+    /// interrupted recording instead of claiming to record until the next start.
+    #[test]
+    fn a_recording_whose_end_cannot_be_saved_is_offered_as_interrupted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path().join("meetings")).unwrap();
+        let (mut w, dir, _tx, _events) = writer(&store, [usize::MAX; 2]);
+        let id = w.id.clone();
+        w.tick(at(1_000));
+        // meta.json can no longer be replaced: its temp file path is taken by a folder.
+        let blocker = dir.join("meta.json.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        w.finish(&store, Stop::DiskLow);
+
+        assert_eq!(store.get(&id).unwrap().status, Status::Recording);
+        assert!(store.is_interrupted(&id));
+        assert!(store.busy_ids().is_empty(), "quitting must not wait for it");
+
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(
+            store.continue_interrupted(&id).unwrap().status,
+            Status::Recorded
         );
     }
 

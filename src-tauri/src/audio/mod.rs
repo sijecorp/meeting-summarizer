@@ -2,13 +2,15 @@
 //! streams, a writer thread turns them into `mic.wav` and `system.wav`.
 
 mod capture;
-pub mod clock;
+mod clock;
 #[cfg(target_os = "macos")]
 mod macos_tap;
 mod writer;
 
 use crate::store::Store;
 use serde::Serialize;
+use std::fs::File;
+use std::io::BufWriter;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -26,8 +28,7 @@ const BYTES_PER_SEC: u64 = 64_000;
 /// Below this, warn before recording how many minutes fit (REC-11).
 const START_WARNING_BYTES: u64 = 1_500_000_000;
 
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Track {
     Mic,
     System,
@@ -123,6 +124,9 @@ struct Active {
 #[derive(Default)]
 pub struct Recorder {
     active: Mutex<Option<Active>>,
+    /// Held by `stop` until the writer has finished, so a second stop (quit, delete) racing the
+    /// first waits for `recorded` instead of writing over a recording still being closed.
+    finishing: Mutex<()>,
 }
 
 impl Recorder {
@@ -144,9 +148,14 @@ impl Recorder {
         }
         let id = store.create("")?.id;
         let dir = store.dir_for(&id)?;
+        // A second handle to each file lets the writer fsync after every 5 s flush.
         let open = |name: &str| {
-            hound::WavWriter::create(dir.join(name), SPEC)
-                .map_err(|e| format!("{name}을(를) 만들 수 없습니다: {e}"))
+            let created = || -> hound::Result<_> {
+                let file = File::create(dir.join(name))?;
+                let sync = file.try_clone()?;
+                Ok((hound::WavWriter::new(BufWriter::new(file), SPEC)?, sync))
+            };
+            created().map_err(|e| format!("{name}을(를) 만들 수 없습니다: {e}"))
         };
         let (mic, system) = match open("mic.wav").and_then(|mic| Ok((mic, open("system.wav")?))) {
             Ok(files) => files,
@@ -183,7 +192,7 @@ impl Recorder {
         );
 
         let handle = app.clone();
-        let writer = thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name("recording-writer".into())
             .spawn(move || {
                 // Windows ties this to the calling thread, which lives as long as the recording.
@@ -196,8 +205,16 @@ impl Recorder {
                     .create()
                     .inspect_err(|e| eprintln!("절전 방지 실패: {e}"));
                 writer::run(writer, &handle.state::<Store>());
-            })
-            .map_err(|e| format!("녹음을 시작할 수 없습니다: {e}"))?;
+            });
+        // A meeting that never started recording is not kept.
+        let writer = match spawned {
+            Ok(writer) => writer,
+            Err(e) => {
+                // The unspawned closure dropped the WAV writers, so the files are closed.
+                let _ = store.delete(&id);
+                return Err(format!("녹음을 시작할 수 없습니다: {e}"));
+            }
+        };
         let capture_shared = shared.clone();
         let capture = thread::Builder::new()
             .name("recording-capture".into())
@@ -205,9 +222,10 @@ impl Recorder {
                 capture::run(&capture_shared, sources, input_device, output_device, emit)
             });
         if let Err(e) = capture {
-            // The writer finishes the meeting as `recorded`.
+            // Let the writer close the files first, then remove the empty meeting.
             shared.stop.store(true, Ordering::SeqCst);
             let _ = writer.join();
+            let _ = store.delete(&id);
             return Err(format!("녹음을 시작할 수 없습니다: {e}"));
         }
 
@@ -228,6 +246,7 @@ impl Recorder {
     /// files are closed and the meeting is `recorded`. Returns the meeting id, also when the
     /// recording had already ended by itself.
     pub fn stop(&self, only: Option<&str>) -> Option<String> {
+        let _finishing = self.finishing.lock().unwrap();
         let active = self
             .active
             .lock()

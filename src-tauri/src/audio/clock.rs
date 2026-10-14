@@ -9,8 +9,8 @@ pub const TOLERANCE: u64 = 1_600;
 pub const DROP_EVERY_MS: u64 = 10_000;
 /// A longer sleep ends the recording at the sleep point (REC-06).
 pub const MAX_SLEEP_MS: u64 = 5 * 60_000;
-/// Reading two clocks one after the other is not perfectly simultaneous, and Windows
-/// `GetTickCount64` only ticks every ~16 ms. Below this, a difference is noise, not sleep.
+/// The two clocks are read one after the other, never at the same instant. Below this, a
+/// difference is noise, not sleep.
 const SLEEP_NOISE_MS: u64 = 1_000;
 
 /// Two OS clocks read together, in milliseconds.
@@ -32,22 +32,30 @@ pub fn now() -> Reading {
         unsafe { libc::clock_gettime(clock, &mut ts) };
         ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
     }
-    // CLOCK_UPTIME_RAW is mach_absolute_time, CLOCK_MONOTONIC is mach_continuous_time.
+    // UPTIME_RAW is mach_absolute_time; MONOTONIC_RAW is mach_continuous_time, the same unslewed
+    // count plus sleep (`man clock_gettime`). Not CLOCK_MONOTONIC: NTP slews it (~3 ppm here),
+    // which would slowly add up to fake sleep.
     Reading {
         awake_ms: ms(libc::CLOCK_UPTIME_RAW),
-        total_ms: ms(libc::CLOCK_MONOTONIC),
+        total_ms: ms(libc::CLOCK_MONOTONIC_RAW),
     }
 }
 
 #[cfg(windows)]
 pub fn now() -> Reading {
-    use windows_sys::Win32::System::SystemInformation::GetTickCount64;
-    use windows_sys::Win32::System::WindowsProgramming::QueryUnbiasedInterruptTime;
-    let mut unbiased = 0u64; // 100 ns units, sleep and hibernation excluded
-    unsafe { QueryUnbiasedInterruptTime(&mut unbiased) };
+    use windows_sys::Win32::System::WindowsProgramming::{
+        QueryInterruptTime, QueryUnbiasedInterruptTime,
+    };
+    // Both in 100 ns units from the same interrupt time; only the unbiased one skips sleep and
+    // hibernation. `QueryInterruptTime` needs Windows 10.
+    let (mut unbiased, mut total) = (0u64, 0u64);
+    unsafe {
+        QueryUnbiasedInterruptTime(&mut unbiased);
+        QueryInterruptTime(&mut total);
+    }
     Reading {
         awake_ms: unbiased / 10_000,
-        total_ms: unsafe { GetTickCount64() },
+        total_ms: total / 10_000,
     }
 }
 
@@ -192,24 +200,31 @@ mod tests {
         assert_eq!(a.keep(100), 100);
     }
 
-    /// REC-03: a device clock 0.1% off for 4 hours stays within 0.5 s of the reference.
+    /// REC-03, between the tracks: one device 0.1% fast, the other 0.1% slow, for 4 hours.
+    /// The slow track is filled once it is 100 ms behind; the fast one is trimmed at the next
+    /// 10 s check after it passes 100 ms ahead. So they are never further apart than both
+    /// tolerances plus 10 s of drift: 3,362 samples (210 ms), inside REC-03's 0.5 s.
     #[test]
-    fn four_hours_with_a_drifting_device_stay_aligned() {
-        for device_rate in [16_016.0, 15_984.0] {
-            let mut a = Aligner::default();
-            let mut produced = 0.0f64;
-            let mut worst = 0i64;
-            for tick in 1..=(4 * 3_600 * 50u64) {
-                let elapsed_ms = tick * 20;
-                let target = elapsed_ms as f64 / 1000.0 * device_rate;
-                let n = (target - produced).floor();
-                produced += n;
-                a.keep(n as u64);
-                a.check(elapsed_ms);
-                worst = worst.max((a.written as i64 - (elapsed_ms * 16) as i64).abs());
+    fn two_tracks_on_drifting_devices_stay_within_the_bound_for_4_hours() {
+        let rates = [16_016.0, 15_984.0];
+        let drift_per_check = 16 * DROP_EVERY_MS / 1000;
+        let bound = 2 * TOLERANCE + drift_per_check + 2;
+        let mut tracks = [Aligner::default(), Aligner::default()];
+        let mut produced = [0.0f64; 2];
+        let mut worst = 0;
+        for tick in 1..=(4 * 3_600 * 50u64) {
+            let elapsed_ms = tick * 20;
+            for (i, track) in tracks.iter_mut().enumerate() {
+                let n = (elapsed_ms as f64 / 1000.0 * rates[i] - produced[i]).floor();
+                produced[i] += n;
+                track.keep(n as u64);
+                track.check(elapsed_ms);
             }
-            assert!(worst <= 8_000, "{device_rate}: off by {worst} samples");
+            worst = worst.max(tracks[0].written.abs_diff(tracks[1].written));
         }
+        assert!(worst <= bound, "{worst} samples apart, bound {bound}");
+        // The bound is reached, so the test would notice a looser rule.
+        assert!(worst > 2 * TOLERANCE, "{worst}");
     }
 
     fn at(awake_ms: u64, total_ms: u64) -> Reading {

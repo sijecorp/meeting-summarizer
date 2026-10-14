@@ -55,7 +55,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 
 [target."cfg(windows)".dependencies]
 # Reference clocks and disk space (architecture 4.2, 4.6). Same version tauri already pulls in.
-windows-sys = { version = "0.61.2", features = ["Win32_System_WindowsProgramming", "Win32_System_SystemInformation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61.2", features = ["Win32_System_WindowsProgramming", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
