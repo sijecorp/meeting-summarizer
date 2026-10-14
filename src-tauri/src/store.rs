@@ -1,3 +1,4 @@
+use crate::transcribe::engine::Segment;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -290,6 +291,20 @@ impl Store {
             }
         }
         Ok(String::new())
+    }
+
+    /// `transcript.json` (architecture 5.2), for reading only. Written once by the queue.
+    pub fn transcript(&self, id: &str) -> Result<Vec<Segment>, String> {
+        #[derive(Deserialize)]
+        struct Transcript {
+            segments: Vec<Segment>,
+        }
+        let unreadable = |e: String| format!("transcript.json을 읽을 수 없습니다: {e}");
+        let bytes = fs::read(self.dir_for(id)?.join("transcript.json"))
+            .map_err(|e| unreadable(e.to_string()))?;
+        serde_json::from_slice::<Transcript>(&bytes)
+            .map(|t| t.segments)
+            .map_err(|e| unreadable(e.to_string()))
     }
 
     /// Newest first. Unreadable meetings are skipped.

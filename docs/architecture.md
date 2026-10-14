@@ -79,7 +79,7 @@ src-tauri/src/
 src/
   main.tsx, App.tsx  화면 전환 (라우터 라이브러리 없이 상태 하나로)
   screens/           Home, Recording, Processing, Review, Settings
-  components/ui/     shadcn이 생성한 컴포넌트(button, input, textarea, card, alert, alert-dialog, select, switch, badge, tooltip)
+  components/ui/     shadcn이 생성한 컴포넌트(button, input, textarea, card, alert, alert-dialog, select, switch, badge, tooltip, progress)
   components/        앱 전용 컴포넌트(common.tsx: Page, StatusBadge, Banner, Field, DeleteButton 등. 이후 ChannelSelect. 녹음 화면의 Spectrum은 Recording.tsx에 둔다)
   lib/ipc.ts         invoke·이벤트 타입 래퍼
   lib/utils.ts       shadcn `cn()` (`export { cn } from "cn"`, CLI 4.21 기본)
@@ -538,17 +538,28 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 
 온보딩 화면은 없다(사용자 결정 2026-10-14, ONB 절).
 
-- **앱 헤더** (APP-07): 모든 화면 위에 붙는 높이 56px 헤더 하나. 왼쪽은 앱 이름과 상태 칩, 오른쪽은 설정 버튼이다. 칩은 `App.tsx`가 들고 있는 `list_meetings` 결과로 센다. 홈 목록도 같은 상태를 써서 둘이 어긋나지 않는다. 목록은 화면이 바뀔 때와 `recording://stopped` 때 다시 읽는다. 녹음 시간은 `recording://level`의 `elapsed_ms`다. M3에서 `meeting://progress`로 처리 진행률을 더한다.
+- **앱 헤더** (APP-07): 모든 화면 위에 붙는 높이 56px 헤더 하나. 왼쪽은 앱 이름과 상태 칩, 오른쪽은 설정 버튼이다. 칩은 `App.tsx`가 들고 있는 `list_meetings` 결과와 회의별 마지막 `meeting://progress`로 센다. 홈 목록과 처리 중 화면도 같은 상태와 같은 판정(`common.tsx`의 `phase`)을 써서 셋이 어긋나지 않는다. 녹음 시간은 `recording://level`의 `elapsed_ms`다.
+  - 목록은 화면이 바뀔 때, `recording://stopped` 때, 진행률 이벤트의 `status`가 바뀔 때 다시 읽는다. 늦게 온 옛 응답은 버린다. 진행률은 이벤트를 먼저 듣고 그다음 `queue_state`로 채운다. 둘이 겹치면 이벤트가 이긴다. 폴링은 하지 않는다.
+  - 처리 칩: "처리 중 N · 대기 M"(0인 쪽은 뺀다). 처리 중은 `transcribing`·`summarizing`, 대기는 `recorded`·`paused`이거나 대기 순서가 있는 회의다(다시 시도한 `transcribe_failed` 포함). `transcribed`는 M3에서 처리가 끝난 상태라 대기 순서가 있어도 세지 않는다(APP-07). 요약 대기열이 생기는 M4부터 대기 순서로 다시 센다. 대기열은 끝난 회의의 마지막 이벤트에서 `position`을 비운다. 구간 계획이 나온 회의는 진행률을 붙인다: "처리 중 1 (42%) · 대기 2", 둘이면 "처리 중 2 (42%, 17%)". 누르면 홈으로 간다. 칩 둘레는 24px 누름 영역이다.
+  - `transcribe://gpu-failed`의 `message`는 녹음 자동 종료 이유와 같은 닫을 수 있는 경고 배너로 보인다.
 - **본문**: 화면별 동작은 본문에 둔다. 홈이 아닌 화면은 본문 맨 위에 "← 홈으로"를 둔다. 본문 폭은 `max-w-3xl`, 설정만 `max-w-5xl`이다.
-- **설정 카드**: 홈 맨 위에서 빠진 항목을 한 줄씩 보여 준다(LLM 연결 없음 → 요약(LLM) 탭, Slack 웹훅 없음 → Slack 탭, 설정 파일을 읽을 수 없음 → 일반 탭(오류와 "기본값으로 다시 시작"), M3부터 모델 → 전사 탭). 녹음은 막지 않는다.
+- **홈 목록**: 전사 중인 회의는 얇은 진행 막대와 "42% · 약 3분 남음"을 보이고, 구간 계획 전에는 "구간 나누는 중"을 보인다. 기다리는 회의의 배지는 "대기 중 · 2번째"다. `transcribe_failed`는 오류 한 줄(넘치면 말줄임)과 "다시 시도"(`resume_meeting`)를 보인다. 행 어디를 눌러도 회의가 열린다("다시 시도" 버튼만 빼고).
+- **처리 중 화면**: 진행 막대와 "구간 2/5 · 42% · 약 3분 남음", 또는 "구간 나누는 중", 기다리면 배지 "대기 중 · N번째". `meta.json`의 `backend`가 있으면 처리 장치(GPU/CPU)를 보인다. 상태나 끝난 구간 수가 바뀌면 `get_meeting`을 다시 읽는다. 실패하면 오류와 "다시 시도". `transcribed`면 `get_transcript`로 전사본을 `mm:ss` 시각과 함께 읽기 전용 텍스트로 보인다(10.4, 요약은 M4).
+- 진행률 문구는 일반 텍스트다. 매 틱을 읽어 주는 live region을 두지 않는다. 막대는 `role="progressbar"`와 값을 갖고, 움직임 줄이기 설정이면 전환 애니메이션을 끈다.
+- **설정 카드**: 홈 맨 위에서 빠진 항목을 한 줄씩 보여 준다. 전사 모델 없음(`model_status`에 설치 안 된 파일이 있거나 읽지 못함)이 맨 앞이다. 이 줄의 "모델 받기"는 바로 다운로드를 시작하고(ONB-01), 받는 동안 버튼 대신 "전사 모델을 받는 중 42%"를 보인다. 실패하면 "전사 모델을 받지 못했습니다"와 다시 "모델 받기". 옆의 "전사 설정"은 취소·직접 가져오기·미러 주소가 있는 전사 탭을 연다. 그다음 LLM 연결 없음 → 요약(LLM) 탭, Slack 웹훅 없음 → Slack 탭, 설정 파일을 읽을 수 없음 → 일반 탭(오류와 "기본값으로 다시 시작"). 녹음은 막지 않는다.
 - **설정 탭**: 왼쪽 탭 목록(좁은 창에서는 내용 위)과 오른쪽 내용. 탭은 일반, 오디오, 전사, 요약(LLM), Slack이다(ONB-07). 저장 버튼 하나가 모든 탭을 저장한다. 안 보이는 탭도 마운트된 채 숨겨 두므로 탭을 바꿔도 입력이 사라지지 않는다. 비밀값 규칙은 9.2~9.3 그대로다.
+- **전사 탭** (ONB-01, ONB-02, ONB-07): 모델 선택(5.1의 세 모델, 개발용 `tiny`는 고르게 하지 않는다), 파일별 상태(설치됨 / 없음 / 받는 중 X% (받은/전체 MB), 이어받을 `.part`가 있으면 받아 둔 양), 다운로드·취소·직접 가져오기, 모델 다운로드 주소(`model_base_url`), 전사 백엔드, 용어집. 자동 백엔드에서 `gpu_failed`면 "GPU 전사에 실패해 CPU로 처리하고 있습니다"와 GPU로 골라 저장하면 지워진다는 안내를 보인다.
+  - 모델과 주소는 다른 설정처럼 저장 버튼으로 저장한다. 다운로드·가져오기는 누르면 바로 돈다. 둘 다 `settings.json`의 모델과 주소를 쓰므로, 저장하지 않은 모델·주소 변경이 있으면 두 버튼을 막고 먼저 저장하라고 안내한다. 화면에 고른 값과 다른 옛 값으로 받는 일이 없게 하려는 것이다. 받는 동안에는 모델 선택도 막는다.
+  - 진행률은 `model://download`로 받는다. 취소는 오류로 보이지 않는다. 받기·가져오기 오류는 공용 배너가 아니라 전사 탭 안에 보인다.
+- **모델 받기 상태**: 받기는 앱에 하나이고 `ipc.ts`의 모듈 변수에 둔다(`startModelDownload`, `modelDownload`, `modelDownloadFailure`). 화면을 떠나도 받기는 계속되고, 홈 설정 카드와 전사 탭은 열릴 때 같은 받기를 이어서 보여 준다. 받기가 끝나면(성공·실패·취소) `model_status`를 다시 읽는다. 마지막 진행률 이벤트는 해시 확인과 이름 바꾸기 전에 오므로 이벤트로 판단하지 않는다. 실패 이유는 다음 받기나 가져오기 성공 때까지 남아, 화면이 닫혀 있을 때 실패해도 다음에 열면 보인다.
+  - 직접 가져오기는 `tauri-plugin-dialog`의 파일 열기로 고른 경로를 `import_model`에 넘긴다. 권한은 `dialog:allow-open` 하나만 준다(`src-tauri/capabilities/default.json`).
 
 ### 10.2 IPC
 
 | 명령 (React → Rust) | 이벤트 (Rust → React) |
 |---|---|
 | `start_recording` → `{ id, warnings }` (장치는 캡처 스레드에서 열므로 바로 돌아온다), `stop_recording` → id (두 WAV를 닫고 `recorded`가 된 뒤 돌아온다), `recording_state` → 진행 중인 녹음과 남아 있는 경고 | `recording://level` `{ elapsed_ms, mic, system, mic_bands, system_bands, waiting_permission }` (40ms마다. `mic`·`system`은 트랙별 RMS 0~1, `*_bands`는 트랙별 스펙트럼 24개 대역 0~100, 4.1) |
-| `list_meetings` (항목마다 `interrupted`: 중단된 녹음), `get_meeting`, `delete_meeting` (녹음 중이면 먼저 녹음을 끝낸다) | `recording://warning` `{ kind, message }` (`disk`, `mic_permission`, `mic_device`, `system_device`, `silence`, `length`, `sleep`. 같은 `kind`는 앞의 경고를 바꾼다) |
+| `list_meetings` (항목마다 `interrupted`: 중단된 녹음), `get_meeting`, `get_transcript(id)` → `[{ start_ms, end_ms, text }]` (`transcript.json`의 세그먼트, 읽기 전용. 경로는 `store.rs`의 `dir_for`로만 만든다), `delete_meeting` (녹음 중이면 먼저 녹음을 끝낸다) | `recording://warning` `{ kind, message }` (`disk`, `mic_permission`, `mic_device`, `system_device`, `silence`, `length`, `sleep`. 같은 `kind`는 앞의 경고를 바꾼다) |
 | `resume_meeting(id)`: 중단된 녹음의 "처리 계속", `transcribe_failed` 재시도. 둘 다 대기열에 넣는다 | `recording://stopped` `{ id, message }` (녹음 종료. 스스로 끝난 경우 `message`에 이유) |
 | `set_summarize_local(id, bool)` | `meeting://status` (상태 변경) |
 | `save_summary(id, title, body)`, `archive_meeting(id)` | `meeting://progress` `{ id, status, chunk, chunks, percent, eta_secs, position }` (아래) |

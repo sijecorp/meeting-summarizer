@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Settings as SettingsIcon } from "lucide-react";
-import { Banner, StatusBadge } from "@/components/common";
+import { Banner, mmss, phase, StatusBadge } from "@/components/common";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -15,12 +15,16 @@ import { Button } from "@/components/ui/button";
 import {
   confirmQuit,
   listMeetings,
+  onGpuFailed,
+  onMeetingProgress,
   onQuitRequested,
   onRecordingLevel,
   onRecordingStopped,
+  queueState,
   requestQuit,
   SCHEMA_VERSION,
   type MeetingItem,
+  type Progress,
   type Status,
 } from "@/lib/ipc";
 import Home from "@/screens/Home";
@@ -36,9 +40,9 @@ type Screen =
   | { name: "processing" | "review"; id: string };
 
 const REVIEWABLE: Status[] = ["review", "sent", "archived"];
-// The header chip's "처리 중 N · 대기 M".
-const RUNNING: Status[] = ["transcribing", "summarizing"];
-const WAITING: Status[] = ["recorded", "transcribed", "paused"];
+// h-6: a 24px target around the 20px badge (WCAG 2.5.8).
+const CHIP =
+  "flex h-6 items-center rounded-4xl outline-none hover:opacity-80 focus-visible:ring-3 focus-visible:ring-ring";
 
 /** Listens to levels itself and keeps whole seconds, so only the chip re-renders, once a second. */
 function RecordingChip({ onClick }: { onClick: () => void }) {
@@ -50,14 +54,9 @@ function RecordingChip({ onClick }: { onClick: () => void }) {
       unlisten.then((stop) => stop(), () => {});
     };
   }, []);
-  const pad = (n: number) => String(n).padStart(2, "0");
   return (
-    // h-6: a 24px target around the 20px badge (WCAG 2.5.8).
-    <button
-      className="flex h-6 items-center rounded-4xl outline-none hover:opacity-80 focus-visible:ring-3 focus-visible:ring-ring"
-      onClick={onClick}
-    >
-      <StatusBadge recording>{`녹음 중 ${pad(Math.floor(s / 60))}:${pad(s % 60)}`}</StatusBadge>
+    <button className={CHIP} onClick={onClick}>
+      <StatusBadge recording>{`녹음 중 ${mmss(s * 1000)}`}</StatusBadge>
     </button>
   );
 }
@@ -66,10 +65,13 @@ export default function App() {
   const [screen, setScreen] = useState<Screen>({ name: "home" });
   // Shared by the header chip and Home, so both show the same list.
   const [meetings, setMeetings] = useState<MeetingItem[] | null>(null);
+  // The last `meeting://progress` of each meeting (TRN-01, APP-07).
+  const [progress, setProgress] = useState<Record<string, Progress>>({});
   const [listError, setListError] = useState("");
   const [quitAsked, setQuitAsked] = useState(false);
   const [quitError, setQuitError] = useState("");
-  // Why a recording ended by itself (disk, 4 hours, sleep). OS notifications come in M5.
+  // Why a recording ended by itself (disk, 4 hours, sleep), the GPU fallback, or a progress
+  // listener that would not start. OS notifications come in M5.
   const [notice, setNotice] = useState("");
   const home = () => setScreen({ name: "home" });
   const quitFailed = (e: unknown) => setQuitError(`종료하지 못했습니다: ${e}`);
@@ -87,9 +89,36 @@ export default function App() {
       (e) => request === latest.current && setListError(`회의 목록을 읽지 못했습니다: ${e}`),
     );
   };
-  // ponytail: refreshed on screen changes and recording stops only; M3's progress events
-  // keep the processing counts current.
+  // Refreshed on screen changes, recording stops and status changes in progress events.
   useEffect(refresh, [screen]);
+
+  // Listening comes first and the `queue_state` snapshot second, so nothing falls between them.
+  useEffect(() => {
+    // The last status seen per meeting: a new one means the list is stale.
+    const seen = new Map<string, Status>();
+    const unlisten = onMeetingProgress((p) => {
+      if (seen.get(p.id) !== p.status) refresh();
+      seen.set(p.id, p.status);
+      setProgress((all) => ({ ...all, [p.id]: p }));
+    });
+    unlisten
+      .then(queueState)
+      // Events win: the snapshot may be older, and a running entry it brings back would never be
+      // corrected after that meeting's last event.
+      .then((list) => setProgress((all) => ({ ...Object.fromEntries(list.map((p) => [p.id, p])), ...all })))
+      .catch((e) => setNotice(`처리 진행률을 읽지 못했습니다: ${e}`));
+    return () => {
+      unlisten.then((stop) => stop(), () => {});
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = onGpuFailed(({ message }) => setNotice(message));
+    unlisten.catch((e) => setNotice(`GPU 전환 알림을 준비하지 못했습니다: ${e}`));
+    return () => {
+      unlisten.then((stop) => stop(), () => {});
+    };
+  }, []);
 
   useEffect(() => {
     const unlisten = onQuitRequested(() => setQuitAsked(true));
@@ -129,8 +158,14 @@ export default function App() {
   // A meeting from a newer app version is read-only and never runs here (like `busy_ids`).
   const current = meetings?.filter((m) => m.schema_version <= SCHEMA_VERSION) ?? [];
   const recording = current.some((m) => m.status === "recording" && !m.interrupted);
-  const running = current.filter((m) => RUNNING.includes(m.status)).length;
-  const waiting = current.filter((m) => WAITING.includes(m.status)).length;
+  const running = current.filter((m) => phase(m, progress[m.id]) === "running");
+  const waiting = current.filter((m) => phase(m, progress[m.id]) === "waiting").length;
+  // "(42%)", or "(42%, 17%)" with two running. Only once a meeting's chunk plan exists: before
+  // that, `percent` is the planning's own.
+  const percents = running.flatMap((m) => {
+    const p = progress[m.id];
+    return p?.chunks ? [`${p.percent}%`] : [];
+  });
   const banners = [quitError, listError].filter(Boolean);
 
   return (
@@ -146,12 +181,18 @@ export default function App() {
           {recording ? (
             <RecordingChip onClick={() => setScreen({ name: "recording" })} />
           ) : (
-            running + waiting > 0 && (
-              <StatusBadge>
-                {[running && `처리 중 ${running}`, waiting && `대기 ${waiting}`]
-                  .filter(Boolean)
-                  .join(" · ")}
-              </StatusBadge>
+            running.length + waiting > 0 && (
+              <button className={CHIP} onClick={home}>
+                <StatusBadge>
+                  {[
+                    running.length &&
+                      `처리 중 ${running.length}${percents.length ? ` (${percents.join(", ")})` : ""}`,
+                    waiting && `대기 ${waiting}`,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </StatusBadge>
+              </button>
             )
           )}
         </div>
@@ -186,6 +227,7 @@ export default function App() {
       {screen.name === "home" && (
         <Home
           meetings={meetings}
+          progress={progress}
           recording={recording}
           onChanged={refresh}
           onOpen={(m) =>
@@ -202,7 +244,9 @@ export default function App() {
       {screen.name === "recording" && (
         <Recording onHome={home} onStopped={(id) => setScreen({ name: "processing", id })} />
       )}
-      {screen.name === "processing" && <Processing key={screen.id} id={screen.id} onHome={home} />}
+      {screen.name === "processing" && (
+        <Processing key={screen.id} id={screen.id} progress={progress[screen.id]} onHome={home} />
+      )}
       {screen.name === "review" && <Review key={screen.id} id={screen.id} onHome={home} />}
       {screen.name === "settings" && <Settings tab={screen.tab} onHome={home} />}
 

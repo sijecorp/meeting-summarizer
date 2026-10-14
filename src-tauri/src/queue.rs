@@ -965,6 +965,10 @@ impl<R: Runtime> Queue<R> {
             if let (Some(mut p), Some(status)) = (entry, status) {
                 p.status = status;
                 p.eta_secs = None;
+                if !waiting {
+                    // Out of line, even if a recording put it back before this run could stop.
+                    p.position = None;
+                }
                 if status == Status::Transcribed {
                     p.percent = 100;
                 }
@@ -1466,6 +1470,15 @@ mod tests {
                 f.transcript(&id),
                 serde_json::json!({"segments": [{"start_ms": 0, "end_ms": 10000, "text": "구간 0"}]})
             );
+            // What the processing screen reads back (`get_transcript`).
+            assert_eq!(
+                f.store().transcript(&id).unwrap(),
+                [Segment {
+                    start_ms: 0,
+                    end_ms: 10000,
+                    text: "구간 0".into()
+                }]
+            );
             assert_eq!(f.runs(&id), ["gpu"]);
             let events = f.events.lock().unwrap();
             assert!(
@@ -1521,6 +1534,31 @@ mod tests {
             });
             // The stopped chunk ran again from its start.
             assert_eq!(f.runs(&first), ["gpu", "gpu"]);
+        }
+
+        #[test]
+        fn a_run_ending_after_a_recording_requeued_it_leaves_no_place_in_line() {
+            let f = fixture(RESULT, Backend::Auto);
+            let id = f.recorded();
+            let queue = f.queue();
+            queue.add(&id, Status::Recorded);
+            {
+                // Started (without a thread, so nothing races this test).
+                let mut inner = lock(&queue.inner);
+                inner.sched.start_next();
+                queue.publish_positions(&mut inner);
+            }
+            // A recording puts it back in line, but the run finishes before its kill lands.
+            queue.recording_started();
+            assert_eq!(f.events.lock().unwrap().last().unwrap()["position"], 1);
+            queue.end(&f.store(), &id, End::Done);
+
+            let last = f.events.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(
+                (&last["status"], &last["position"]),
+                (&"transcribed".into(), &serde_json::Value::Null)
+            );
+            assert!(queue.snapshot().is_empty());
         }
 
         #[test]

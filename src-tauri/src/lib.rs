@@ -70,7 +70,8 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main_window(app)
         }))
-        .plugin(tauri_plugin_opener::init());
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init());
     #[cfg(target_os = "macos")]
     let builder = builder.menu(app_menu);
     builder
@@ -129,6 +130,7 @@ pub fn run() {
             commands::delete_secret,
             commands::list_meetings,
             commands::get_meeting,
+            commands::get_transcript,
             commands::delete_meeting,
             commands::resume_meeting,
             commands::start_recording,

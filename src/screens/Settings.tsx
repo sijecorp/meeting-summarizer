@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { Plus, RotateCcw, Trash2 } from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
+import { Download, FolderOpen, Plus, RotateCcw, Trash2 } from "lucide-react";
 import { Banner, Field, Page } from "@/components/common";
 import {
   AlertDialog,
@@ -19,19 +20,29 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import {
+  cancelModelDownload,
   deleteSecret,
   getSettings,
   hasSecret,
+  importModel,
   listAudioDevices,
+  modelDownload,
+  modelDownloadFailure,
+  modelStatus,
   NEWER_VERSION,
+  onModelDownload,
   resetSettings,
   saveSettings,
   setSecret,
+  startModelDownload,
   type AudioDevice,
   type AudioDevices,
   type Backend,
   type LlmConnection,
   type LoadedSettings,
+  type ModelDownload,
+  type ModelFileState,
+  type ModelState,
   type SecretKind,
   type Settings as SettingsData,
 } from "@/lib/ipc";
@@ -51,6 +62,17 @@ const BACKENDS: { value: Backend; label: string }[] = [
   { value: "gpu", label: "GPU" },
   { value: "cpu", label: "CPU" },
 ];
+
+// Architecture 5.1. `tiny` is for development only and never offered.
+const MODELS = [
+  { value: "large-v3-turbo-q8_0", label: "기본: large-v3-turbo q8_0 (874MB)" },
+  { value: "large-v3-turbo", label: "원본: large-v3-turbo (1.6GB)" },
+  { value: "medium-q5_0", label: "가벼움: medium q5_0 (539MB)" },
+];
+// `model_status` lists the Whisper model, then the VAD model.
+const MODEL_FILES = ["전사 모델", "음성 구간 감지(VAD) 모델"];
+// One decimal below 10 MB, for the 0.9 MB VAD file.
+const mb = (bytes: number) => (bytes < 1e7 ? (bytes / 1e6).toFixed(1) : Math.round(bytes / 1e6));
 
 const cloudTimeout = 300;
 const localTimeout = 900;
@@ -99,6 +121,13 @@ export default function Settings({
   const [deviceError, setDeviceError] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [models, setModels] = useState<ModelState | null>(null);
+  const [received, setReceived] = useState<Record<string, ModelDownload>>({});
+  const [modelBusy, setModelBusy] = useState<"download" | "import" | null>(null);
+  // Both shown in the 전사 tab, not the shared banner. A status read that works clears its own
+  // error but never a download's or import's, which lasts until the next try.
+  const [statusError, setStatusError] = useState("");
+  const [modelError, setModelError] = useState(modelDownloadFailure);
 
   const show = async ({ settings, read_only }: LoadedSettings) => {
     setDraft(settings);
@@ -112,11 +141,42 @@ export default function Settings({
     setSecrets(Object.fromEntries(saved));
   };
 
+  const readModels = () =>
+    modelStatus().then(
+      (state) => {
+        setModels(state);
+        setStatusError("");
+      },
+      (e) => setStatusError(String(e)),
+    );
+
+  // The download lives in ipc.ts, so this also picks up one started before the screen opened.
+  const follow = (running: Promise<void>) => {
+    setModelBusy("download");
+    running.then(() => {
+      setModelBusy(null);
+      setModelError(modelDownloadFailure());
+      readModels();
+    });
+  };
+
   useEffect(() => {
     getSettings()
       .then(show)
       .catch((e) => setError(String(e)));
+    const unlisten = onModelDownload((d) => setReceived((all) => ({ ...all, [d.file]: d })));
+    unlisten.catch((e) => setStatusError(`다운로드 진행률을 받지 못했습니다: ${e}`));
+    const running = modelDownload();
+    if (running) follow(running);
+    return () => {
+      unlisten.then((stop) => stop(), () => {});
+    };
   }, []);
+
+  // Read each time the tab opens, like the audio devices.
+  useEffect(() => {
+    if (tab === "transcription") readModels();
+  }, [tab]);
 
   // Listed again each time the tab opens, so a headset plugged in meanwhile shows up.
   useEffect(() => {
@@ -235,6 +295,10 @@ export default function Settings({
       setTab("transcription");
       return setError("용어집은 100개까지 넣을 수 있습니다");
     }
+    if (!draft.model_base_url.trim()) {
+      setTab("transcription");
+      return setError("모델 다운로드 주소를 입력하세요");
+    }
     const invalid = draft.llm_connections.find(
       (c) => !isPositiveInt(c.context_tokens) || !isPositiveInt(c.timeout_secs),
     );
@@ -244,6 +308,8 @@ export default function Settings({
     }
     const value = {
       ...draft,
+      // Same rule as settings.rs: only switching the backend to GPU clears it.
+      gpu_failed: draft.gpu_failed && !(draft.backend === "gpu" && persisted.backend !== "gpu"),
       recorder_name: draft.recorder_name.trim(),
       glossary: glossary
         .split("\n")
@@ -265,6 +331,8 @@ export default function Settings({
       }
       setDraft(value);
       setPersisted(value);
+      // The model may have changed.
+      readModels();
       const problems: string[] = [];
       const stillOrphaned: SecretRef[] = [];
       for (const r of removed) {
@@ -312,6 +380,41 @@ export default function Settings({
       },
     };
   };
+
+  // Download and import act on the saved model and address: `model_status` and the backend read
+  // settings.json. So an unsaved change blocks both until 저장, rather than acting on the old one.
+  const unsaved =
+    draft.model !== persisted.model || draft.model_base_url !== persisted.model_base_url;
+  const idle = !modelBusy && !models?.downloading && !unsaved;
+  const fileState = (f: ModelFileState) => {
+    const d = received[f.file];
+    if (f.installed) return "설치됨";
+    if (modelBusy === "download" && d) {
+      return `받는 중 ${Math.floor((d.received / d.total) * 100)}% (${mb(d.received)}/${mb(d.total)}MB)`;
+    }
+    return f.received ? `없음 · ${mb(f.received)}/${mb(f.size)}MB 받아 둠` : "없음";
+  };
+
+  const startDownload = () => {
+    setReceived({});
+    setModelError("");
+    follow(startModelDownload());
+  };
+
+  // ONB-02: a model file got some other way (a colleague, a USB stick).
+  const importFile = () =>
+    open({ filters: [{ name: "모델 파일", extensions: ["bin"] }] })
+      .then((path) => {
+        if (!path) return;
+        setModelBusy("import");
+        return importModel(path)
+          .then(setModels)
+          .finally(() => setModelBusy(null));
+      })
+      .then(
+        () => setModelError(""),
+        (e) => setModelError(String(e)),
+      );
 
   // A pinned device missing from the list still shows, so the select is never blank. Only a
   // list that loaded can tell it is unplugged.
@@ -383,8 +486,72 @@ export default function Settings({
 
             <section hidden={tab !== "transcription"} className="space-y-4">
               <h2 className="sr-only">전사</h2>
-              <Field label="모델 (변경은 준비 중입니다)">
-                <Input value={draft.model} readOnly />
+              {statusError && <Banner kind="error">{statusError}</Banner>}
+              {modelError && <Banner kind="error">{modelError}</Banner>}
+              {/* 5.4: only automatic mode falls back; choosing GPU and saving clears it. */}
+              {persisted.gpu_failed && persisted.backend === "auto" && (
+                <Banner kind="warning">
+                  GPU 전사에 실패해 CPU로 처리하고 있습니다. 전사 백엔드를 GPU로 골라 저장하면 다시
+                  GPU로 처리합니다.
+                </Banner>
+              )}
+              <SelectField
+                label="모델"
+                value={draft.model}
+                // A hand-set model (like `tiny`) still shows, so the select is never blank.
+                options={
+                  MODELS.some((m) => m.value === draft.model)
+                    ? MODELS
+                    : [...MODELS, { value: draft.model, label: draft.model }]
+                }
+                disabled={!!modelBusy}
+                onChange={(model) => edit({ model })}
+              />
+              <div className="space-y-3 rounded-lg border p-4">
+                {models && (
+                  <ul className="space-y-1 text-sm">
+                    {models.files.map((f, i) => (
+                      <li key={f.file} className="flex flex-wrap justify-between gap-x-4">
+                        <span>
+                          {MODEL_FILES[i]} <span className="text-muted-foreground">{f.file}</span>
+                        </span>
+                        <span>{fileState(f)}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    disabled={!idle || !models?.files.some((f) => !f.installed)}
+                    onClick={startDownload}
+                  >
+                    <Download aria-hidden />
+                    다운로드
+                  </Button>
+                  <Button
+                    variant="outline"
+                    disabled={modelBusy !== "download" && !models?.downloading}
+                    onClick={() => cancelModelDownload().catch((e) => setModelError(String(e)))}
+                  >
+                    취소
+                  </Button>
+                  <Button variant="outline" disabled={!idle} onClick={importFile}>
+                    <FolderOpen aria-hidden />
+                    {modelBusy === "import" ? "가져오는 중" : "직접 가져오기"}
+                  </Button>
+                </div>
+                {unsaved && (
+                  <p className="text-sm text-muted-foreground">
+                    바꾼 모델과 주소는 저장한 뒤에 받거나 가져올 수 있습니다
+                  </p>
+                )}
+              </div>
+              <Field label="모델 다운로드 주소 (사내 미러가 있으면 바꿉니다)">
+                <Input
+                  value={draft.model_base_url}
+                  placeholder="https://huggingface.co"
+                  onChange={(e) => edit({ model_base_url: e.target.value })}
+                />
               </Field>
               <SelectField
                 label="전사 백엔드"
@@ -613,17 +780,19 @@ function SelectField({
   label,
   value,
   options,
+  disabled,
   onChange,
 }: {
   label: string;
   value: string;
   options: { value: string; label: string }[];
+  disabled?: boolean;
   onChange: (value: string) => void;
 }) {
   return (
     <div className="grid gap-1.5 text-sm">
       <span className="font-medium text-muted-foreground">{label}</span>
-      <Select value={value} onValueChange={onChange}>
+      <Select value={value} disabled={disabled} onValueChange={onChange}>
         <SelectTrigger aria-label={label} className="w-full">
           <SelectValue />
         </SelectTrigger>

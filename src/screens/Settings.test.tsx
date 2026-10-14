@@ -1,12 +1,30 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { emit } from "@tauri-apps/api/event";
+import { mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, expect, test } from "vitest";
-import type { AudioDevices, LoadedSettings } from "../lib/ipc";
+import {
+  modelDownload,
+  modelDownloadFailure,
+  startModelDownload,
+  type AudioDevices,
+  type LoadedSettings,
+  type ModelFileState,
+  type ModelState,
+} from "../lib/ipc";
 import Settings from "./Settings";
 
-afterEach(() => {
+// The model download is app-wide (ipc.ts): each test's is settled and awaited here, and a failure
+// it left (kept until the next download) is cleared by one that works, so nothing leaks into the
+// next test. No clearMocks(): the screen unlistens asynchronously after unmount (see App.test.tsx).
+let release = () => {};
+afterEach(async () => {
   cleanup();
-  clearMocks();
+  release();
+  await modelDownload();
+  if (modelDownloadFailure()) {
+    mockIPC(() => undefined);
+    await startModelDownload();
+  }
 });
 
 const loaded: LoadedSettings = {
@@ -356,4 +374,163 @@ test("read-only settings disable the key inputs and 저장", async () => {
   expect(screen.getByRole("button", { name: "저장" }).matches(":disabled")).toBe(true);
   // The tabs stay usable for reading.
   expect(screen.getByRole("button", { name: "Slack" }).matches(":disabled")).toBe(false);
+});
+
+const WHISPER = "ggml-large-v3-turbo-q8_0.bin";
+const VAD = "ggml-silero-v6.2.0.bin";
+const models = (whisper: Partial<ModelFileState> = {}): ModelState => ({
+  files: [
+    { file: WHISPER, size: 874_188_075, installed: false, received: 0, ...whisper },
+    { file: VAD, size: 885_098, installed: true, received: 0 },
+  ],
+  downloading: false,
+});
+
+test("전사 tab: file states, download progress from events, and a quiet cancel", async () => {
+  const cmds: string[] = [];
+  mockIPC(
+    (cmd) => {
+      cmds.push(cmd);
+      if (cmd === "get_settings") return loaded;
+      if (cmd === "has_secret") return true;
+      if (cmd === "model_status") return models({ received: 437_094_037 });
+      if (cmd === "download_models") {
+        return new Promise((_, reject) => (release = () => reject("모델 다운로드를 취소했습니다")));
+      }
+      if (cmd === "cancel_model_download") release();
+    },
+    { shouldMockEvents: true },
+  );
+  render(<Settings tab="transcription" onHome={() => {}} />);
+
+  expect(await screen.findByText("없음 · 437/874MB 받아 둠")).toBeTruthy();
+  expect(screen.getByText("설치됨")).toBeTruthy();
+  // `tiny` is development only.
+  expect(screen.getByRole("combobox", { name: "모델" }).textContent).toBe("기본: large-v3-turbo q8_0 (874MB)");
+
+  fireEvent.click(screen.getByRole("button", { name: "다운로드" }));
+  await act(() => emit("model://download", { file: WHISPER, received: 524_512_845, total: 874_188_075 }));
+  expect(await screen.findByText("받는 중 60% (525/874MB)")).toBeTruthy();
+  expect((screen.getByRole("button", { name: "다운로드" }) as HTMLButtonElement).disabled).toBe(true);
+
+  fireEvent.click(screen.getByRole("button", { name: "취소" }));
+  await waitFor(() =>
+    expect((screen.getByRole("button", { name: "다운로드" }) as HTMLButtonElement).disabled).toBe(false),
+  );
+  expect(cmds).toContain("cancel_model_download");
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+test("직접 가져오기 hands the picked file to import_model", async () => {
+  const calls: Call[] = [];
+  const path = "/Users/me/Downloads/ggml-large-v3-turbo-q8_0.bin";
+  mockIPC((cmd, args) => {
+    calls.push({ cmd, args: args as Call["args"] });
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "has_secret") return true;
+    if (cmd === "model_status") return models();
+    if (cmd === "plugin:dialog|open") return path;
+    if (cmd === "import_model") return models({ installed: true });
+  });
+  render(<Settings tab="transcription" onHome={() => {}} />);
+
+  expect(await screen.findByText("없음")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "직접 가져오기" }));
+
+  await waitFor(() => expect(screen.getAllByText("설치됨")).toHaveLength(2));
+  expect(calls.find((c) => c.cmd === "import_model")?.args).toEqual({ path });
+});
+
+test("a failed download shows its error in the 전사 tab, not the shared banner", async () => {
+  mockIPC((cmd) => {
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "has_secret") return true;
+    if (cmd === "model_status") return models();
+    if (cmd === "download_models") throw new Error("huggingface.co에 연결할 수 없습니다");
+  });
+  render(<Settings tab="transcription" onHome={() => {}} />);
+
+  expect(await screen.findByText("없음")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "다운로드" }));
+
+  expect((await screen.findByRole("alert")).textContent).toMatch(/huggingface\.co에 연결할 수 없습니다/);
+  fireEvent.click(screen.getByRole("button", { name: "일반" }));
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+// Download and import act on what settings.json holds, so an unsaved change waits for 저장.
+test("an unsaved model address blocks download and import until saved", async () => {
+  mockIPC((cmd) => {
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "has_secret") return true;
+    if (cmd === "model_status") return models();
+  });
+  render(<Settings tab="transcription" onHome={() => {}} />);
+  const button = (name: string) => screen.getByRole("button", { name }) as HTMLButtonElement;
+
+  expect(await screen.findByText("없음")).toBeTruthy();
+  fireEvent.change(screen.getByRole("textbox", { name: /^모델 다운로드 주소/ }), {
+    target: { value: "https://mirror.example.com" },
+  });
+  expect(button("다운로드").disabled).toBe(true);
+  expect(button("직접 가져오기").disabled).toBe(true);
+  expect(screen.getByText("바꾼 모델과 주소는 저장한 뒤에 받거나 가져올 수 있습니다")).toBeTruthy();
+
+  fireEvent.click(button("저장"));
+  expect(await screen.findByText("저장했습니다")).toBeTruthy();
+  expect(button("다운로드").disabled).toBe(false);
+  expect(button("직접 가져오기").disabled).toBe(false);
+});
+
+// The download lives in ipc.ts, not in the screen: leaving and coming back must not lose it, and a
+// failure while the screen was closed shows on the next visit.
+test("reopened mid-download, the tab follows the same download and later shows its failure", async () => {
+  let fail = (_: string) => {};
+  mockIPC(
+    (cmd) => {
+      if (cmd === "get_settings") return loaded;
+      if (cmd === "has_secret") return true;
+      if (cmd === "model_status") return models();
+      if (cmd === "download_models") {
+        return new Promise((resolve, reject) => {
+          release = () => resolve(undefined);
+          fail = reject;
+        });
+      }
+    },
+    { shouldMockEvents: true },
+  );
+  const button = (name: string) => screen.getByRole("button", { name }) as HTMLButtonElement;
+  const first = render(<Settings tab="transcription" onHome={() => {}} />);
+  expect(await screen.findByText("없음")).toBeTruthy();
+  fireEvent.click(button("다운로드"));
+  first.unmount();
+
+  const second = render(<Settings tab="transcription" onHome={() => {}} />);
+  await waitFor(() => expect(button("취소").disabled).toBe(false));
+  expect(button("다운로드").disabled).toBe(true);
+  // One decimal below 10 MB.
+  await act(() => emit("model://download", { file: WHISPER, received: 4_370_940, total: 874_188_075 }));
+  expect(await screen.findByText("받는 중 0% (4.4/874MB)")).toBeTruthy();
+  second.unmount();
+
+  await act(async () => fail("huggingface.co에 연결할 수 없습니다"));
+  render(<Settings tab="transcription" onHome={() => {}} />);
+  expect((await screen.findByRole("alert")).textContent).toMatch(/huggingface\.co에 연결할 수 없습니다/);
+  expect(button("다운로드").disabled).toBe(false);
+});
+
+test("the 전사 tab explains a GPU fallback in automatic mode", async () => {
+  mockIPC((cmd) => {
+    if (cmd === "get_settings") return { ...loaded, settings: { ...loaded.settings, gpu_failed: true } };
+    if (cmd === "has_secret") return true;
+    if (cmd === "model_status") return models();
+  });
+  render(<Settings tab="transcription" onHome={() => {}} />);
+
+  expect(
+    await screen.findByText(
+      "GPU 전사에 실패해 CPU로 처리하고 있습니다. 전사 백엔드를 GPU로 골라 저장하면 다시 GPU로 처리합니다.",
+    ),
+  ).toBeTruthy();
 });

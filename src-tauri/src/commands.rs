@@ -4,6 +4,7 @@ use crate::audio::{self, AudioDevices, Recorder, RecordingState};
 use crate::queue::{Progress, Queue};
 use crate::settings::{self, LoadedSettings, SecretKind, Settings, SettingsStore};
 use crate::store::{Meta, Status, Store};
+use crate::transcribe::engine::Segment;
 use crate::transcribe::model::{self, ModelState, Models};
 use serde::Serialize;
 use std::path::Path;
@@ -82,6 +83,12 @@ pub fn get_meeting(store: State<'_, Store>, id: String) -> Result<MeetingDetail,
         meta: store.get(&id)?,
         summary: store.summary(&id)?,
     })
+}
+
+/// The processing screen shows the transcript until summarizing comes (M4).
+#[tauri::command(async)]
+pub fn get_transcript(store: State<'_, Store>, id: String) -> Result<Vec<Segment>, String> {
+    store.transcript(&id)
 }
 
 #[tauri::command(async)]

@@ -113,6 +113,10 @@ export const listAudioDevices = () => invoke<AudioDevices>("list_audio_devices")
 
 export const listMeetings = () => invoke<MeetingItem[]>("list_meetings");
 export const getMeeting = (id: string) => invoke<MeetingDetail>("get_meeting", { id });
+/** Times are from the start of the recording (architecture 5.2). */
+export type Segment = { start_ms: number; end_ms: number; text: string };
+/** `transcript.json` of a transcribed meeting. Plain text: never render it as HTML (10.4). */
+export const getTranscript = (id: string) => invoke<Segment[]>("get_transcript", { id });
 export const deleteMeeting = (id: string) => invoke<void>("delete_meeting", { id });
 /** "처리 계속" for an interrupted recording, or a retry after `transcribe_failed`: queues it. */
 export const resumeMeeting = (id: string) => invoke<Meta>("resume_meeting", { id });
@@ -189,11 +193,51 @@ export type ModelState = { files: ModelFileState[]; downloading: boolean };
 /** `model://download`, about once per percent. */
 export type ModelDownload = { file: string; received: number; total: number };
 export const modelStatus = () => invoke<ModelState>("model_status");
-/** Resolves when both files are installed and verified; rejects with the reason ("…취소했습니다" after a cancel). */
-export const downloadModels = () => invoke<void>("download_models");
+
+// One download for the whole app: it outlives the screen that started it (874 MB takes a while),
+// so Home's setup card and the settings' 전사 tab both follow the same one.
+let download: Promise<void> | null = null;
+let cancelled = false;
+let failure = "";
+
+/**
+ * ONB-01: starts `download_models`, or joins the one running. Settles when both files are
+ * installed and verified, or when it fails. Never rejects: the reason stays in
+ * `modelDownloadFailure()` until the next download or a successful import, so a screen opened
+ * later still shows it. A cancel leaves no reason.
+ */
+export const startModelDownload = () => {
+  if (!download) {
+    failure = "";
+    // A cancel clicked as the last download settled must not hide this one's failure.
+    cancelled = false;
+    download = invoke<void>("download_models")
+      .catch((e) => {
+        if (!cancelled) failure = String(e);
+      })
+      .finally(() => {
+        download = null;
+        cancelled = false;
+      });
+  }
+  return download;
+};
+/** The download running, if any. */
+export const modelDownload = () => download;
+export const modelDownloadFailure = () => failure;
 /** What arrived stays for resuming. */
-export const cancelModelDownload = () => invoke<void>("cancel_model_download");
+export const cancelModelDownload = () => {
+  cancelled = true;
+  return invoke<void>("cancel_model_download").catch((e) => {
+    cancelled = false;
+    throw e;
+  });
+};
 /** Installs a picked model file if its size and sha256 match (ONB-02). */
-export const importModel = (path: string) => invoke<ModelState>("import_model", { path });
+export const importModel = (path: string) =>
+  invoke<ModelState>("import_model", { path }).then((state) => {
+    failure = "";
+    return state;
+  });
 export const onModelDownload = (handler: (progress: ModelDownload) => void) =>
   listen<ModelDownload>("model://download", (e) => handler(e.payload));
