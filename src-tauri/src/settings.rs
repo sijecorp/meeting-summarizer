@@ -166,14 +166,37 @@ impl SettingsStore {
 
     pub fn save(&self, mut settings: Settings) -> Result<(), String> {
         let _guard = self.lock.lock().unwrap();
-        if let Ok(bytes) = fs::read(&self.path) {
-            let stored = serde_json::from_slice::<serde_json::Value>(&bytes)
-                .ok()
-                .and_then(|v| v["schema_version"].as_u64());
-            if stored.is_some_and(|v| v > SCHEMA_VERSION.into()) {
-                return Err(NEWER_VERSION.to_string());
-            }
+        let stored = fs::read(&self.path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .unwrap_or_default();
+        if stored["schema_version"]
+            .as_u64()
+            .is_some_and(|v| v > SCHEMA_VERSION.into())
+        {
+            return Err(NEWER_VERSION.to_string());
         }
+        // `gpu_failed` belongs to the queue (architecture 5.4): a save from the settings screen
+        // keeps the stored value, and switching the backend to "GPU" clears it.
+        settings.gpu_failed = stored["gpu_failed"].as_bool().unwrap_or(false)
+            && !(settings.backend == Backend::Gpu && stored["backend"] != "gpu");
+        self.write(settings)
+    }
+
+    /// The GPU crashed twice on one chunk: automatic mode uses the CPU from now on (TRN-06).
+    pub fn mark_gpu_failed(&self) -> Result<(), String> {
+        let _guard = self.lock.lock().unwrap();
+        let loaded = self.load()?;
+        if loaded.read_only {
+            return Err(NEWER_VERSION.to_string());
+        }
+        self.write(Settings {
+            gpu_failed: true,
+            ..loaded.settings
+        })
+    }
+
+    fn write(&self, mut settings: Settings) -> Result<(), String> {
         validate(&settings)?;
         settings.schema_version = SCHEMA_VERSION;
         let bytes = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
@@ -383,6 +406,33 @@ mod tests {
         assert!(loaded.read_only);
         assert_eq!(store.save(Settings::default()).unwrap_err(), NEWER_VERSION);
         assert_eq!(fs::read(&store.path).unwrap(), newer);
+    }
+
+    #[test]
+    fn gpu_failed_survives_settings_saves_until_gpu_is_chosen() {
+        let (_tmp, store) = store();
+        store.save(Settings::default()).unwrap();
+        store.mark_gpu_failed().unwrap();
+        assert!(store.load().unwrap().settings.gpu_failed);
+
+        // The settings screen sends what it loaded earlier, before the queue marked the GPU.
+        let stale = Settings {
+            recorder_name: "홍길동".into(),
+            ..Settings::default()
+        };
+        store.save(stale.clone()).unwrap();
+        let loaded = store.load().unwrap().settings;
+        assert!(loaded.gpu_failed);
+        assert_eq!(loaded.recorder_name, "홍길동");
+
+        store
+            .save(Settings {
+                backend: Backend::Gpu,
+                gpu_failed: true,
+                ..stale
+            })
+            .unwrap();
+        assert!(!store.load().unwrap().settings.gpu_failed);
     }
 
     #[test]

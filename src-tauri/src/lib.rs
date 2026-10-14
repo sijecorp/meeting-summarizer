@@ -1,7 +1,11 @@
 mod audio;
 mod commands;
+mod queue;
 mod settings;
 mod store;
+mod transcribe;
+
+pub use transcribe::engine::worker_main;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "macos")]
@@ -71,8 +75,9 @@ pub fn run() {
     let builder = builder.menu(app_menu);
     builder
         .setup(|app| {
-            // Recordings (and later models) stay out of the Windows roaming profile (8.1).
-            let store = store::Store::new(app.path().app_local_data_dir()?.join("meetings"))?;
+            // Recordings and models stay out of the Windows roaming profile (8.1).
+            let local = app.path().app_local_data_dir()?;
+            let store = store::Store::new(local.join("meetings"))?;
             // Single instance guarantees this process owns the meetings folder.
             store.recover();
             app.manage(store);
@@ -80,6 +85,13 @@ pub fn run() {
             app.manage(settings::SettingsStore::new(
                 app.path().app_data_dir()?.join("settings.json"),
             ));
+            app.manage(transcribe::model::Models::new(local.join("models")));
+            app.manage(queue::Queue::new(
+                app.handle().clone(),
+                std::env::current_exe()?,
+            ));
+            // TRN-01: what recovery left `recorded` or `paused` goes back in line, oldest first.
+            app.state::<queue::Queue>().enqueue_pending();
 
             let tray_menu = Menu::with_items(
                 app,
@@ -125,6 +137,11 @@ pub fn run() {
             commands::list_audio_devices,
             commands::confirm_quit,
             commands::request_quit,
+            commands::queue_state,
+            commands::model_status,
+            commands::download_models,
+            commands::cancel_model_download,
+            commands::import_model,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -141,6 +158,10 @@ pub fn run() {
             // Every exit path, including Dock quit and OS shutdown, which skip ExitRequested.
             // The recording goes first: its WAV files are finalized and it becomes `recorded`.
             RunEvent::Exit => {
+                // Workers first: child processes would outlive the app.
+                if let Some(queue) = app.try_state::<queue::Queue>() {
+                    queue.shutdown();
+                }
                 if let Some(recorder) = app.try_state::<audio::Recorder>() {
                     recorder.stop(None);
                 }

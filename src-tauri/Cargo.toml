@@ -32,7 +32,20 @@ rubato = "5.0.1"
 realfft = "3.5.0"
 rtrb = "0.4.0"
 keepawake = "0.6.1"
+# Pinned (M0 exit condition): bundles whisper.cpp 1.8.3 with the built-in Silero VAD. Building it
+# needs cmake. GPU features are per target below (architecture 5.4).
+whisper-rs = "0.16.0"
+# Model hashes. Same version the tree already has.
+sha2 = "0.10.9"
+# Model download, later LLM and Slack. The OS TLS stack and certificate store, so a company mirror
+# with an in-house CA just works; system-proxy for company proxies.
+reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "system-proxy"] }
 
+
+# Model hashes in dev builds and tests: unoptimized sha2 runs at ~30 MB/s, so checking the 874 MB
+# model took about half a minute.
+[profile.dev.package.sha2]
+opt-level = 3
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
@@ -54,10 +67,15 @@ objc2 = "0.6.5"
 objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware", "objc2", "objc2-foundation"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFDictionary", "CFNumber", "CFString"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSString", "NSUUID", "NSValue"] }
+whisper-rs = { version = "0.16.0", features = ["metal"] }
 
 [target."cfg(windows)".dependencies]
+# Needs the Vulkan SDK (VULKAN_SDK) to build and ships vulkan-1.dll next to the app (architecture 5.4).
+whisper-rs = { version = "0.16.0", features = ["vulkan"] }
 # Reference clocks and disk space (architecture 4.2, 4.6). Same version tauri already pulls in.
 windows-sys = { version = "0.61.2", features = ["Win32_System_WindowsProgramming", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# The mock runtime, so the queue's state-writing path runs in tests without a window.
+tauri = { version = "2", features = ["test"] }

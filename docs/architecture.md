@@ -44,9 +44,9 @@
 | 링 버퍼 | `rtrb` | 오디오 콜백 → 기록 스레드. 락·할당 없는 SPSC |
 | WAV 기록 | `hound` | |
 | 리샘플 | `rubato` 5 | 장치 샘플레이트 → 16kHz. 안티에일리어싱 FFT 리샘플러(`Fft`) |
-| 전사 | `whisper-rs` (whisper.cpp 바인딩) | 버전은 **[S3]**로 고정. features: macOS `metal`, Windows `vulkan` |
-| HTTP | `reqwest` | LLM, Slack, 모델 다운로드 |
-| 해시 | `sha2` | 모델 검증 |
+| 전사 | `whisper-rs` 0.16.0 (whisper.cpp 바인딩) | M3에서 0.16.0으로 고정했다(`whisper-rs-sys` 0.15.0, whisper.cpp 1.8.3 내장). 내장 VAD, `suppress_nst`, `no_context`, initial prompt, `use_gpu`, 진행률 콜백이 모두 있다. features는 `Cargo.toml`에서 대상별로 준다: macOS `metal`, Windows `vulkan`. 빌드에 `cmake`가 필요하다. Windows Vulkan 빌드 확인은 **[S3]** CI에 남아 있다 |
+| HTTP | `reqwest` 0.13 (`default-features = false`, `native-tls`, `system-proxy`) | LLM, Slack, 모델 다운로드. OS의 TLS와 인증서 저장소를 써서 사내 미러의 사내 CA를 따로 설정하지 않아도 믿는다. 기본값(rustls + aws-lc-rs)은 C 빌드가 하나 더 붙는다. M4·M5에서 `json` 등 필요한 기능만 더한다 |
+| 해시 | `sha2` 0.10 | 모델 검증. 트리에 이미 있던 버전이라 중복이 없다 |
 | 비밀값 | `keyring` 4.x | `tauri-plugin-stronghold`는 지원 중단돼 쓰지 않는다 |
 | 절전 방지 | `keepawake` | |
 | Tauri 플러그인 | `tauri-plugin-notification` >= 2.6.0(데스크톱 알림 클릭 `onAction`이 이 버전부터 동작), `tauri-plugin-dialog`(파일 선택), `tauri-plugin-single-instance`(두 번째 실행 차단, eng review D14), 내장 tray-icon | 자동 업데이트(`tauri-plugin-updater`)는 파일럿 뒤로 미뤘다(eng review D2) |
@@ -55,7 +55,7 @@
 
 ```
 src-tauri/src/
-  main.rs            진입점 (기존). `--transcribe-worker <meeting> <chunk> <backend>` 인자로 실행되면 전사 워커 모드로 동작 (5.3)
+  main.rs            진입점 (기존). `--plan-chunks`·`--transcribe-worker` 인자로 실행되면 앱을 띄우지 않고 전사 워커로 동작 (5.3)
   lib.rs             Builder, 플러그인, 트레이, 명령 등록
   commands.rs        React에서 부르는 명령 모음
   settings.rs        settings.json 읽기·쓰기 + keyring 래퍼
@@ -167,6 +167,10 @@ for 각 20ms 프레임:
 
 임계값(-45 dBFS), 감쇠(-20dB), attack·release 값은 **[S4]**에서 조정한다.
 
+- 구현(`audio/mix.rs`): 목표 이득은 20ms 프레임마다 정하고, 실제 이득은 샘플마다 1차 스무딩(시상수 attack 5ms, release 300ms)으로 따라간다. 이득은 구간 사이에 이어지지 않고 구간마다 1에서 시작한다. 첫 300ms만 영향이 있어 무시한다.
+- 소프트 리미터: |x| ≤ 0.5는 그대로, 그 위는 tanh 곡선으로 1.0에 다가가기만 하고 넘지 않는다.
+- 두 WAV에서 같은 위치의 창을 `hound` seek로 읽는다. 길이는 두 트랙 중 짧은 쪽에 맞춘다.
+
 4시간 녹음을 f32로 한꺼번에 메모리에 올리면 약 920MB이므로, 항상 창이나 구간 단위로만 읽는다. 처리 단계는 회의 폴더에 오디오를 새로 쓰지 않으므로, 디스크 부족으로 녹음이 끝난 직후에도 처리가 디스크를 더 쓰지 않는다(전사·요약 결과는 수십 KB).
 
 ### 4.6 디스크 공간 (REC-11, eng review D7)
@@ -188,45 +192,70 @@ for 각 20ms 프레임:
 | 원본(선택) | `ggerganov/whisper.cpp` / `ggml-large-v3-turbo.bin` | 1,624,555,275 B | `1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69` |
 | CPU 폴백 후보 **[S2]** | `ggerganov/whisper.cpp` / `ggml-medium-q5_0.bin` | 539,212,467 B | `19fea4b380c3a618ec4723c3eef2eb785ffba0d0538cf43f8f235e7b3b34220f` |
 | VAD | `ggml-org/whisper-vad` / `ggml-silero-v6.2.0.bin` | 885,098 B | `2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987` |
+| 개발·시험용 | `ggerganov/whisper.cpp` / `ggml-tiny.bin` | 77,691,713 B | `be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21` (2026-10-14 확인) |
+
+- `settings.json`의 `model` 값은 `large-v3-turbo-q8_0`(기본), `large-v3-turbo`, `medium-q5_0`, `tiny`다. `tiny`는 큰 모델을 받지 않고 처리 흐름을 시험하려고 둔 값이다. 설정 화면은 고르게 하지 않고, `settings.json`을 손으로 고쳐야 쓴다.
 
 - **다운로드 URL**: `{base}/{repo}/resolve/main/{file}`. 기본 `base`는 `https://huggingface.co`이고, 설정에서 사내 미러로 바꿀 수 있다(ONB-02).
-- **저장 위치**: 앱 데이터 폴더의 `models/`.
+- **저장 위치**: 앱 로컬 데이터 폴더(`app_local_data_dir`, 8.1)의 `models/`.
 - **다운로드 절차**: `.part` 파일로 받는다. 연결 10초, 데이터가 30초 동안 한 바이트도 오지 않으면 중단하고, 다음 시도 때 `Range` 헤더로 이어받는다. 끝나면 sha256을 검증하고, 맞으면 이름을 바꾼다. 해시가 틀리면 `.part`를 지우고 실패로 보고한다.
-- **직접 가져오기**: 녹음자가 고른 파일을 복사하고 같은 방식으로 해시를 검증한다.
+  - 파일마다 3번까지 시도한다. 연결 실패·시간 초과·끊김만 다시 시도하고(이어받기), HTTP 오류와 해시 불일치는 바로 실패다. 실패해도 `.part`는 남아 다음 "받기"가 이어받는다.
+  - 이어받을 때는 응답의 `Content-Range` 시작이 `.part` 크기와 같을 때만 덧붙인다. 다르면 `.part`를 지우고 처음부터 받는다. `Range`를 보냈는데 200(파일 전체)이 오면, `Content-Length`가 모델 크기와 같을 때만 `.part`를 비우고 받고, 아니면 실패로 보고한다. 크기가 다 찬 `.part`는 받지 않고 해시 검증부터 한다.
+  - 진행률은 `model://download`로 약 1%마다 보낸다. 취소(`cancel_model_download`)는 다운로드 작업을 어디서 기다리든 바로 끊는다. 받은 만큼은 `.part`에 남고, 바로 직접 가져오기를 할 수 있다. 결과는 "모델 다운로드를 취소했습니다"다. 해시 확인(블로킹 작업)은 끊을 수 없어 끝까지 돌지만, 취소된 다운로드는 그 뒤로 파일 이름 바꾸기·삭제를 하지 않는다. 다운로드마다 취소 표시를 두고, 이름 바꾸기·삭제는 그 표시의 잠금 안에서 표시가 꺼져 있을 때만 한다. 취소도 같은 잠금 안에서 표시를 켠다.
+  - 대기열이 시작할 수 있는지 볼 때는 크기만 확인한다. 크기가 맞아도 내용이 틀릴 수 있으므로 "받기"는 설치된 파일의 해시를 다시 확인하고, 틀리면 지우고 다시 받는다. 워커가 모델을 불러오지 못하면(종료 코드 3) 대기열이 두 파일의 해시를 확인한다. 틀린 파일은 지우고 "손상됐습니다. 다시 받아 주세요", 없거나 읽을 수 없으면 "없거나 읽을 수 없습니다. 다시 받아 주세요", 둘 다 맞으면 파일 문제가 아니므로(예: 메모리 부족) 다른 앱을 닫고 다시 시도하라고 안내한다. 다운로드·가져오기가 도는 동안에는 해시만 보고 지우지 않는다(그 파일을 설치하는 중일 수 있다).
+- **직접 가져오기**: 녹음자가 고른 파일의 크기로 어느 모델인지 고르고(맞는 것이 없으면 거부), `{파일}.import`로 복사해 디스크에 내린(`sync_all`) 뒤 같은 방식으로 해시를 검증한다. 다운로드의 `.part`는 이어받기용으로 그대로 둔다. 다운로드 중에는 가져오기를 받지 않는다.
+- **모델이 없을 때**: 대기열은 회의를 시작하지 않고 기다리게 둔다. 받기·가져오기가 끝나거나 설정을 저장하면 대기열을 다시 돌린다. 시작한 뒤에 모델이 없어졌으면 그 회의를 실패로 두지 않고 대기열 맨 앞에 돌려놓는다.
 - **S3 실패 시 변화**: 내장 VAD가 없는 `whisper-rs` 버전으로 고정하면, VAD를 Silero ONNX 모델과 `ort` 크레이트로 따로 돌린다. 그러면 위 표의 VAD 항목이 ONNX 파일로 바뀌고 의존성에 `ort`가 추가된다.
 
 ### 5.2 구간 나누기와 실행
 
 - **녹음 길이 (M2 → M3 인계)**: 녹음 길이는 `meta.json`의 `duration_ms`가 아니라 두 WAV 중 짧은 쪽의 길이(`min(len)`)로 정한다. 쓰기 오류로 끝난 녹음은 WAV가 마지막 5초 flush까지만 유효해 `duration_ms`보다 짧고, 중단된 녹음은 `duration_ms`가 0이다.
 
-1. 워커를 `--plan-chunks {id}` 모드로 한 번 띄운다. 워커는 두 트랙을 10분 창(앞 창과 30초 겹침) 단위로 읽어 메모리에서 합치고 `WhisperVadContext`로 음성 구간 목록을 얻은 뒤, 구간 경계를 JSON으로 출력한다. whisper/ggml 네이티브 코드는 모두 워커 안에서만 돈다. 이 API는 샘플 슬라이스 전체를 한 번에 받으므로, 4시간 녹음을 통째로 넘기면 f32로 약 920MB가 된다. 그래서 창 단위로 나눈다. 겹친 30초에서 나온 구간은 시작 시각 기준으로 중복을 제거한다.
-2. 음성 구간을 앞에서부터 모아, 누적 길이가 10분을 넘기 직전의 무음 지점에서 자른다.
-3. 구간마다 `whisper_full`을 실행한다.
-   - 파라미터: `language="ko"`, VAD 켬, `no_context=true`, `suppress_nst=true`, `temperature` 폴백 기본값 유지, 스레드 수 = 물리 코어 수(S2에서 측정해 조정).
-   - 용어집을 initial prompt에 넣을지는 **[S2]**로 정한다.
-4. 구간 결과를 `transcript.partial.jsonl`에 한 줄로 추가한다. 형식: `{"chunk":3,"start_ms":...,"end_ms":...,"segments":[{"start_ms","end_ms","text"}]}`.
-5. 마지막 구간이 끝나면 합쳐서 `transcript.json`을 쓰고 상태를 `transcribed`로 바꾼다.
+1. 워커를 `--plan-chunks` 모드로 한 번 띄운다. 워커는 두 트랙을 10분 창(앞 창과 30초 겹침) 단위로 읽어 메모리에서 합치고 `WhisperVadContext`로 음성 구간 목록을 얻은 뒤, 구간 경계를 JSON으로 출력한다. whisper/ggml 네이티브 코드는 모두 워커 안에서만 돈다. 이 API는 샘플 슬라이스 전체를 한 번에 받으므로, 4시간 녹음을 통째로 넘기면 f32로 약 920MB가 된다. 그래서 창 단위로 나눈다. 창마다 찾은 음성 구간을 모두 모아 겹치거나 맞닿은 구간을 하나로 합친다(합집합). 그래서 두 창이 함께 본 발화도, 창 끝에서 잘린 발화도 구간 하나가 된다.
+2. 구간을 앞에서부터 자른다. 구간 끝은 시작에서 10분에 가장 가까운 무음 지점이다. 무음 지점은 음성 구간 사이(맨 앞·맨 뒤 포함)에서 음성 경계로부터 0.5초 떨어진 곳(무음이 1초보다 짧으면 가운데)이고, 시작에서 5~12분 사이만 본다. 그 안에 무음이 없으면 10분에서 자른다. 그래서 마지막 구간 말고는 5분보다 짧거나 12분보다 긴 구간이 없다. 길이는 벽시계 기준이라 구간 메모리가 12분(f32 약 46MB)을 넘지 않는다. 계획은 `chunks.json`에 한 번 저장하고, 재개할 때 다시 만들지 않는다.
+3. 구간마다 워커를 띄워 Whisper를 실행한다. VAD상 음성이 0인 구간은 워커를 띄우지 않고 빈 결과로 둔다.
+   - **VAD는 워커가 직접 한다.** whisper.cpp는 VAD 단계(음성만 잘라 이어 붙이기)를 `whisper_full` 안에서만 한다. whisper-rs 0.16의 `WhisperState::full`은 `whisper_full_with_state`를 불러 이 단계를 건너뛰므로, `enable_vad`만 켜면 무음과 잡음까지 전사한다(tiny 모델로 잡음을 넣으면 "MBC 뉴스 …입니다"가 나왔다). 그래서 워커가 같은 Silero 모델(기본 파라미터)로 구간의 음성을 찾고, whisper.cpp와 같은 방식으로 이어 붙인다(구간마다 뒤로 0.1초 더, 사이에 0.1초 무음). 세그먼트 시각은 원래 녹음 시각으로 되돌린다. 음성이 없으면 Whisper 모델을 불러오지 않는다.
+   - 시각 되돌리기는 일부러 whisper.cpp와 다르다. whisper.cpp는 이어 붙인 오디오와 원래 오디오 사이를 선형으로 보간한다. 여기서는 음성 조각 안에서는 1:1로 옮기고, 조각 사이(잘라 낸 무음 자리)에 떨어진 시각은 가까운 발화 쪽으로 붙인다. 세그먼트 시작은 다음 조각의 시작으로, 끝은 앞 조각의 끝으로 간다. 그래서 세그먼트가 잘라 낸 무음만큼 일찍 시작하거나 늦게 끝나지 않는다.
+   - 파라미터: `language="ko"`, 위의 VAD, `no_context=true`, `suppress_nst=true`, `temperature` 폴백 기본값 유지.
+   - 샘플링은 beam search(beam 5)다. S2가 쓰는 `whisper-cli`의 기본값과 같아야 S2의 속도·정확도가 앱에 그대로 맞는다.
+   - 스레드 수는 논리 CPU의 절반이다. 워커가 2개까지 동시에 돌기 때문이다(TRN-01). SMT 기기에서는 물리 코어 수, Apple Silicon에서는 코어의 절반이다. S2에서 측정해 조정한다.
+   - 용어집을 initial prompt에 넣을지는 **[S2]**로 정한다. 지금은 넣지 않는다. S2에서 넣기로 하면 용어집을 워커 인자 하나로 더 넘겨 `set_initial_prompt`에 넣는다(Whisper는 앞쪽 약 224토큰만 쓴다).
+4. 구간 결과(환각 필터를 거친 세그먼트)를 `transcript.partial.jsonl`의 한 줄로 저장한다. 형식: `{"chunk":3,"start_ms":...,"end_ms":...,"segments":[{"start_ms","end_ms","text"}]}`. 시각은 녹음 시작 기준 ms다. 파일에 덧붙이지 않고 매번 전체를 원자적으로 다시 쓴다(구간 24개 이하, 각 수 KB). 강제 종료가 반쯤 쓴 줄을 남기지 않게 하려는 것이다. `meta.json`의 `chunks_done`과 `backend`(마지막 구간을 처리한 장치)도 함께 고친다.
+5. 마지막 구간이 끝나면 합쳐서 `transcript.json`을 쓰고 상태를 `transcribed`로 바꾼다. 형식: `{"segments":[{"start_ms","end_ms","text"}]}` (모든 구간의 세그먼트를 순서대로). 요약(M4)은 이 파일을 읽는다.
 
-**재개 단위는 구간이다.** 재개할 때는 `transcript.partial.jsonl`의 마지막 구간 다음부터 처리한다.
+**재개 단위는 구간이다.** 재개할 때는 `transcript.partial.jsonl`의 마지막 구간 다음부터 처리한다. 줄의 구간 번호와 경계가 `chunks.json`의 다음 구간과 맞는 데까지만 믿고, 맞지 않는 줄부터는 다시 처리한다.
 
 ### 5.3 전사 워커 프로세스와 중단 (TRN-06, TRN-09)
 
 전사는 **같은 실행 파일을 자식 프로세스로 띄워** 돌린다(eng review D5). whisper.cpp가 GPU 드라이버 문제 등으로 비정상 종료해도 앱, 녹음, UI는 살아 있다.
 
 ```
-queue.rs ──spawn── 앱 실행 파일 --transcribe-worker {id} {chunk} {gpu|cpu}
+queue.rs ──spawn── 앱 실행 파일 --transcribe-worker {회의 폴더} {시작 ms} {끝 ms} {gpu|cpu} {모델} {VAD 모델}
    ▲                    │ stdout: JSON 한 줄씩
    │                    │   {"type":"progress","pct":42}
-   │                    │   {"type":"result","chunk":3,"segments":[...]}
+   │                    │   {"type":"result","device":"gpu","segments":[{"start_ms","end_ms","text"}]}
    └──── 종료 코드 ─────┘ 0 = 정상, 그 외 = 실패/크래시
+
+queue.rs ──spawn── 앱 실행 파일 --plan-chunks {회의 폴더} {VAD 모델}
+                        │   {"type":"progress","pct":10}
+                        │   {"type":"plan","len_ms":...,"chunks":[{"start_ms","end_ms","speech_ms"}]}
 ```
+
+- 워커 인자는 회의 id 대신 경로를 받는다. 워커는 Tauri 앱을 띄우지 않으므로 앱 데이터 폴더를 알 수 없고, 알 필요도 없다. `main.rs`가 Tauri 빌더보다 먼저 인자를 보므로 워커는 창을 열지 않고 단일 실행 검사에도 걸리지 않는다.
+- `result`의 `device`는 실제로 돈 장치다. GPU 컨텍스트를 만들지 못하면 워커가 CPU로 바꿔 `cpu`를 보낸다(5.4).
+- 워커는 stdin을 읽고 있다가 닫히면(앱이 크래시·강제 종료됨) 바로 끝난다. 자식 프로세스는 부모가 죽어도 남기 때문에, 이게 없으면 다시 켠 앱의 새 워커 옆에서 남은 워커가 GPU와 메모리를 계속 쓴다.
+- Windows는 `CREATE_NO_WINDOW`로 띄워 콘솔 창이 뜨지 않게 한다.
+- 워커는 결과 줄을 출력한 뒤 stdout을 비우고 소멸자 없이 바로 끝난다(macOS `_exit`, Windows `process::exit`). Metal·Vulkan 정리 단계의 크래시가 이미 보낸 결과를 지우고 `gpu_failed`를 남기지 않게 하려는 것이다. stdin 감시로 끝날 때도 같다.
+- **무응답 감시**: 워커가 stdout에 5분 동안 한 줄도 내지 않으면 부모가 kill하고 크래시로 센다(5.4의 GPU 재시도 대상). 워커는 Whisper 창(30초 분량)마다, 구간 나누기는 10분 창마다 진행률을 낸다. 874MB 모델 로딩도 수 초다.
+- 부모는 stdout을 바이트로 읽어 한 줄씩 JSON으로 해석한다. 우리 줄이 아니거나 UTF-8이 아닌 줄은 건너뛴다. stdout이 닫힌 뒤에도 프로세스가 실제로 끝날 때까지는 kill할 수 있게 둔다.
 
 - **동시 실행** (TRN-01, 사용자 결정 2026-10-14): 워커 프로세스는 회의 2개까지 동시에 돈다. 나머지 회의는 대기열에서 들어온 순서(FIFO)대로 기다리고, 화면에 대기 순서를 보여 준다. 워커마다 모델을 따로 올리므로 메모리 사용이 두 배다. 8GB 기기에서 문제가 되는지 파일럿에서 본다.
 - 워커는 구간 하나를 처리하고 끝난다. 모델 로딩(수 초)은 구간마다 반복되지만, 구간이 10분 분량이라 비중이 작다.
 - 결과는 부모(`queue.rs`)가 받아 `transcript.partial.jsonl`에 쓴다. 워커는 회의 폴더의 오디오를 읽기만 한다.
-- **중단**: 녹음이 시작되면 부모가 실행 중인 워커 프로세스를 모두 kill한다. 그 구간의 결과는 버리고, 녹음이 끝나면 회의마다 그 구간부터 다시 처리한다. abort 콜백에 기대지 않는다.
-- 워커의 stderr는 회의 폴더의 `worker.log`에 남긴다(크래시 원인 확인용).
-- **종료 코드 계약**: `0` 정상, `2` 입력·파일 오류(오디오 없음, 인자 오류), `3` 모델 로드 실패(파일 손상·경로 오류), 그 외 코드나 시그널 종료는 **크래시**. 5.4의 GPU 실패 판정은 크래시만 센다. `2`·`3`은 GPU와 무관하므로 바로 `transcribe_failed`로 바꾸고 원인을 보여준다(`3`이면 "모델 다시 받기"를 제안한다).
+- **중단**: 녹음이 시작되면 부모가 실행 중인 워커 프로세스를 모두 kill한다. 그 구간의 결과는 버리고, 녹음이 끝나면 회의마다 그 구간부터 다시 처리한다. abort 콜백에 기대지 않는다. kill하기 전에 "멈춘 이유"(녹음, 삭제, 종료)를 먼저 기록하므로 kill은 크래시로 세지 않는다. 멈춘 회의는 `paused`로 기록하고 대기열 맨 앞으로 돌아간다(원래 순서대로). 워커 스레드가 끝나기 전에는 같은 회의를 다시 시작하지 않는다.
+- 워커의 stderr는 회의 폴더의 `worker.log`에 덧붙인다(크래시 원인 확인용). 실행마다 `--- {인자} ---` 줄을 먼저 쓴다. 실패 원인으로는 그 머리줄을 뺀 마지막 줄을 보여 준다.
+- **종료 코드 계약**: `0` 정상, `2` 입력·파일 오류(오디오 없음, 인자 오류), `3` 모델 로드 실패(파일 손상·경로 오류), 그 외 코드나 시그널 종료는 **크래시**. 5.4의 GPU 실패 판정은 크래시(무응답 감시로 kill한 것 포함)만 센다. `2`·`3`은 GPU와 무관하므로 바로 `transcribe_failed`로 바꾸고 원인을 보여준다(`3`이면 해시를 확인해 "모델 다시 받기" 또는 메모리 안내, 5.1).
+  - 대기열이 보내지 않은 SIGKILL(macOS 메모리 부족 시 OS가 보냄)은 크래시로 세지 않는다. 그 회의만 `transcribe_failed`로 바꾸고 "메모리가 부족해 전사가 중단되었습니다"를 보여 준다. `gpu_failed`는 쓰지 않는다.
 
 ### 5.4 백엔드 선택과 크래시 판정 (TRN-05, TRN-06)
 
@@ -234,21 +263,24 @@ queue.rs ──spawn── 앱 실행 파일 --transcribe-worker {id} {chunk} {g
 - **Vulkan 로더 동봉**: Vulkan 빌드는 `vulkan-1.dll`에 로드 타임 의존성이 있다. 이 DLL이 없는 PC에서는 앱이 아예 시작되지 않는다. 그래서 LunarG Vulkan Loader(Apache-2.0)의 `vulkan-1.dll`을 실행 파일 옆에 함께 설치한다. 설치 경로는 **[S3]**에서 확인한다.
 - **자동 선택 순서**:
   1. `settings.json`에 `gpu_failed=true`가 있으면 CPU를 쓴다.
-  2. GPU 컨텍스트 생성을 시도하고, 실패하면 CPU로 바꾼다.
-- **강제 설정**: 설정에서 백엔드를 "GPU"로 바꾸면 `gpu_failed`를 `false`로 되돌린다. "CPU"로 바꾸면 항상 CPU를 쓴다.
+  2. GPU 컨텍스트 생성을 시도하고, 실패하면 CPU로 바꾼다. GPU 장치가 아예 없으면 whisper.cpp가 스스로 CPU로 돈다. 이 경우 워커는 `gpu`로 보고하므로 `meta.json`의 `backend`가 실제와 다를 수 있다.
+- **강제 설정**: 설정에서 백엔드를 "GPU"로 바꾸면 `gpu_failed`를 `false`로 되돌린다. "CPU"로 바꾸면 항상 CPU를 쓴다. "GPU"일 때는 `gpu_failed`와 상관없이 구간마다 GPU로 시작한다.
+- **`gpu_failed`는 대기열이 쓴다**: 설정 화면의 저장(`save_settings`)은 저장돼 있던 `gpu_failed` 값을 그대로 두고, 백엔드가 "GPU"로 바뀔 때만 `false`로 만든다. 설정 화면이 대기열이 쓴 값을 예전 값으로 덮어쓰지 않게 하려는 것이다. 대기열은 `mark_gpu_failed`로 따로 쓴다.
+- 장치는 구간마다 설정을 다시 읽어 정한다. 그래서 한 회의가 `gpu_failed`를 쓰면 함께 돌던 다른 회의도 다음 구간부터 CPU를 쓴다.
 - **GPU 워커 크래시** (5.3 종료 코드 계약의 "크래시", 또는 kill하지 않았는데 결과 없이 끝남):
   - 같은 구간을 GPU 워커로 **한 번** 즉시 다시 실행한다.
-  - 다시 비정상 종료하면 `settings.json`에 `gpu_failed=true`를 쓰고, 녹음자에게 "GPU 처리가 불안정해 CPU로 전환했습니다. 처리 시간이 길어집니다" 알림을 띄운 뒤, 같은 구간을 CPU 워커로 처리한다.
+  - 다시 비정상 종료하면 `settings.json`에 `gpu_failed=true`를 쓰고, 녹음자에게 "GPU 처리가 불안정해 CPU로 전환했습니다. 처리 시간이 길어집니다" 알림을 띄운 뒤, 같은 구간을 CPU 워커로 처리한다. M3의 알림은 `transcribe://gpu-failed` 이벤트이고, OS 알림은 M5에서 붙인다.
   - CPU 워커까지 비정상 종료하면 회의를 `transcribe_failed`로 바꾸고 원인(`worker.log` 마지막 줄)을 보여준다.
   - 앱 재시작은 필요 없다. 크래시 횟수는 처리 중 메모리에만 둔다.
-- **비정상 결과 검사** (TRN-07): 구간 결과가 아래 중 하나면 그 구간을 CPU로 다시 처리한다.
+- **비정상 결과 검사** (TRN-07): 환각 필터를 거친 구간 결과가 아래 중 하나면 그 구간을 CPU로 한 번 다시 처리한다. GPU 결과에만 한다. CPU 결과는 다시 돌려도 같으므로 이상해 보여도 그대로 쓴다.
   - VAD상 음성이 30초 넘게 있는데 전사 텍스트가 비어 있다.
-  - 같은 토큰이 8번 넘게 연속으로 반복된다.
+  - 같은 토큰이 8번 넘게 연속으로 반복된다. 토큰은 Whisper 토큰이 아니라 공백으로 나눈 낱말(문장부호 제거)이다. 띄어쓰기 없이 반복되는 말("아아아아…")은 잡지 못한다.
 
 ### 5.5 환각 필터 (TRN-08)
 
-- 세그먼트 텍스트를 정규화한다: 앞뒤 공백 제거, 문장부호 제거, 연속 공백을 하나로.
-- 정규화한 텍스트가 `resources/hallucinations.ko.txt`의 한 줄과 **정확히 같을 때만** 그 세그먼트를 버린다.
+- 세그먼트 텍스트를 정규화한다: 앞뒤 공백 제거, 문장부호 제거, 연속 공백을 하나로. 문장부호는 글자·숫자·공백이 아닌 모든 문자다(전각 문장부호, 따옴표, "…", "♪" 포함).
+- 정규화한 텍스트가 `src-tauri/src/resources/hallucinations.ko.txt`의 한 줄과 **정확히 같을 때만** 그 세그먼트를 버린다. 정규화하면 빈 문자열이 되는 세그먼트("♪", "...")도 버린다. 낱말이 없어 전사본에 남길 내용이 없기 때문이다.
+- 목록은 빌드에 넣는다(`include_str!`). 파일럿 동안 새 버전은 설치 파일로 나가므로, 목록 수정도 새 빌드로 나간다. `#`로 시작하는 줄과 빈 줄은 무시한다.
 - 초기 목록 예: `시청해주셔서 감사합니다`, `구독과 좋아요 부탁드립니다`, `다음 영상에서 만나요`. 파일럿에서 발견되는 대로 추가한다.
 
 ## 6. 요약
@@ -352,14 +384,16 @@ queue.rs ──spawn── 앱 실행 파일 --transcribe-worker {id} {chunk} {g
 {앱 데이터}/
   settings.json            비밀값 없는 설정
 {로컬 앱 데이터}/
-  models/                  5.1의 모델 파일
+  models/                  5.1의 모델 파일 (받는 중에는 {파일}.part)
   meetings/
     2026-10-13T1400-a1b2/
       meta.json
       mic.wav
       system.wav
-      transcript.partial.jsonl
-      transcript.json
+      chunks.json              구간 계획 (5.2)
+      transcript.partial.jsonl 끝난 구간 결과 (5.2)
+      transcript.json          전사본 (5.2)
+      worker.log               워커 stderr (5.3)
       summary.generated.md
       summary.md
 ```
@@ -414,14 +448,21 @@ recording ─▶ recorded ─▶ transcribing ─▶ transcribed ─▶ summariz
 
 ### 8.4 처리 대기열과 시작 시 복구 (queue.rs, store.rs, lib.rs)
 
-- 대기열에서 회의를 들어온 순서대로 꺼내 2개까지 동시에 처리한다(5.3). 상태에 따라 전사 → 요약 순서로 진행한다.
+- 대기열에서 회의를 들어온 순서대로 꺼내 2개까지 동시에 처리한다(5.3). 처리가 끝나면(녹음으로 멈춘 경우와 모델이 사라진 경우 말고는) 대기열에서도 뺀다. 상태에 따라 전사 → 요약 순서로 진행한다. M3에서는 전사까지만 하고 `transcribed`에서 멈춘다. 요약은 M4에서 붙인다.
 - 녹음이 시작되면 실행 중인 전사 워커를 모두 kill하고(5.3), 로컬 LLM 요약이면 요청도 취소한다. 녹음이 끝나면 같은 회의의 같은 구간부터 다시 진행한다.
+  - 녹음 중에는 아무 회의도 시작하지 않는다. 멈춘 회의는 `paused`로 기록하고 대기열 맨 앞으로 돌아간다.
+  - 녹음 시작은 `Recorder::start`가, 녹음 끝은 기록 스레드가 알린다. 그래서 4시간·절전·디스크 부족으로 스스로 끝난 녹음도 대기열에 들어간다. 녹음 시작이 실패하면 대기열을 바로 다시 돌린다. 앞 녹음의 기록 스레드가 아직 파일을 닫는 중이면 새 녹음은 그 스레드가 끝날 때까지 기다린다. 앞 녹음의 "녹음 끝" 알림이 새 녹음의 "녹음 시작" 뒤에 와서 녹음 중에 전사가 다시 도는 일을 막는다.
+  - 멈춘 회의의 `paused`를 쓰지 못했으면(디스크 오류) 디스크에는 `transcribing`이 남는다. 대기열은 이 회의를 다시 시작할 때 `transcribing`도 받아 준다(이 프로세스에서 한 회의는 한 번에 하나만 돈다). 앱을 껐다 켜면 복구가 `paused`로 고친다.
+- **대기열에 들어가는 때** (TRN-01): 앱 시작(복구 뒤), 녹음이 끝날 때, `resume_meeting`(중단된 녹음의 "처리 계속", `transcribe_failed` 재시도). 앞의 두 경우는 `recorded`·`paused` 회의를 모두 오래된 순서로 넣는다. 이미 줄에 있거나 실행 중인 회의는 다시 넣지 않는다.
+- 모델 파일이 없으면 아무 회의도 시작하지 않고 기다린다(5.1). 받기·가져오기가 끝나면 시작한다.
+- 삭제는 `deleting`을 먼저 쓰고, 대기열에서 빼고, 워커를 kill하고, 그 회의의 처리가 끝날 때까지 기다린 뒤 폴더를 지운다(8.3 2~3단계). 같은 회의를 두 번 지우면 두 번째도 처리가 끝나기를 기다린다. 먼저 끝난 쪽이 폴더를 지웠으면 두 번째는 그대로 성공한다.
+- 처리 스레드가 패닉해도(디버그 빌드) 실패로 기록하고 자리를 비운다. 릴리스 빌드는 `panic = "abort"`라 앱이 끝나고, 다음 실행 때 복구가 처리한다.
 - **단일 실행** (APP-06, eng review D14): `tauri-plugin-single-instance`를 빌더에 가장 먼저 등록한다. 두 번째 실행은 즉시 끝나고, 실행 중인 인스턴스가 메인 창을 보여 주고 앞으로 가져온다. 그래서 아래 복구는 항상 회의 폴더를 소유한 인스턴스 하나에서만 돈다.
 - 앱 시작 시 `store.rs`의 복구 함수가 모든 `meta.json`을 읽어 다음을 한다.
   - `recording` → 디스크의 상태는 그대로 두고, 메모리에서 "중단된 녹음"으로 표시한다. 녹음자가 "처리 계속"을 고르면 `recorded`로 바꿔 대기열에 넣는다. 종료 확인(8.5)의 "진행 중인 작업"에는 세지 않는다. 실행 중에 녹음을 끝냈는데 `recorded`를 쓰지 못한 회의(디스크가 가득 참 등)도 "중단된 녹음"이 된다. 공간을 비운 뒤 "처리 계속"이 다시 쓴다.
   - `deleting` → 폴더 삭제를 마저 한다.
   - `transcribing`, `summarizing` → 앱 자체가 중간에 꺼진 경우다(워커 크래시와 무관). 디스크에 `paused`로 고쳐 쓴 뒤 대기열에 넣는다. 실제로 돌지 않는 작업을 디스크가 "진행 중"이라고 주장하지 않게 하려는 것이다.
-  - `paused`, `recorded`, `transcribed` → 대기열에 넣는다.
+  - `paused`, `recorded`, `transcribed` → 대기열에 넣는다. `transcribed`는 요약 단계가 생기는 M4부터 넣는다.
 
 ### 8.5 앱 종료 처리 (APP-02, TRN-06)
 
@@ -430,7 +471,7 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 | 종료 경로 | 이벤트 | 처리 |
 |---|---|---|
 | 트레이 메뉴 "종료", 직접 만든 앱 메뉴 "종료"(`CmdOrCtrl+Q` 단축키, `app.exit(0)` 호출) | `ExitRequested` → `Exit` | 진행 중인 녹음·처리가 있으면 `prevent_exit()` 후 확인을 받는다. 확인하면 `paused`를 기록하고 종료한다 |
-| macOS Dock "종료", OS 종료·로그아웃 | `Exit`만 | 확인을 받을 수 없다. `Exit` 안에서 녹음 중이면 먼저 녹음을 끝내 두 WAV를 닫고 `recorded`를 쓴다(기록 스레드 한 주기, 수십 ms). 그다음 진행 중인 회의의 `meta.json`을 동기로 `paused`로 기록한다. 빠르게 끝나야 하므로 회의마다 파일 하나 쓰기만 한다 |
+| macOS Dock "종료", OS 종료·로그아웃 | `Exit`만 | 확인을 받을 수 없다. `Exit` 안에서 먼저 전사 워커를 모두 kill한다(자식 프로세스는 앱이 끝나도 남는다). 녹음 중이면 녹음을 끝내 두 WAV를 닫고 `recorded`를 쓴다(기록 스레드 한 주기, 수십 ms). 그다음 진행 중인 회의의 `meta.json`을 동기로 `paused`로 기록한다. 빠르게 끝나야 하므로 회의마다 파일 하나 쓰기만 한다 |
 | 크래시, 강제 종료, 전원 차단 | 없음 | 다음 실행 때 8.4 복구와 5.4 비정상 종료 판정이 처리한다. 녹음은 5초 flush 덕분에 최대 5초만 잃는다 |
 
 - macOS 기본 앱 메뉴의 "Quit" 항목은 `ExitRequested`를 보내지 않으므로, 기본 메뉴 대신 직접 만든 메뉴를 쓴다.
@@ -508,16 +549,29 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 |---|---|
 | `start_recording` → `{ id, warnings }` (장치는 캡처 스레드에서 열므로 바로 돌아온다), `stop_recording` → id (두 WAV를 닫고 `recorded`가 된 뒤 돌아온다), `recording_state` → 진행 중인 녹음과 남아 있는 경고 | `recording://level` `{ elapsed_ms, mic, system, mic_bands, system_bands, waiting_permission }` (40ms마다. `mic`·`system`은 트랙별 RMS 0~1, `*_bands`는 트랙별 스펙트럼 24개 대역 0~100, 4.1) |
 | `list_meetings` (항목마다 `interrupted`: 중단된 녹음), `get_meeting`, `delete_meeting` (녹음 중이면 먼저 녹음을 끝낸다) | `recording://warning` `{ kind, message }` (`disk`, `mic_permission`, `mic_device`, `system_device`, `silence`, `length`, `sleep`. 같은 `kind`는 앞의 경고를 바꾼다) |
-| `resume_meeting(id)`: 중단된 녹음의 "처리 계속", `transcribe_failed` 재시도(M3) | `recording://stopped` `{ id, message }` (녹음 종료. 스스로 끝난 경우 `message`에 이유) |
+| `resume_meeting(id)`: 중단된 녹음의 "처리 계속", `transcribe_failed` 재시도. 둘 다 대기열에 넣는다 | `recording://stopped` `{ id, message }` (녹음 종료. 스스로 끝난 경우 `message`에 이유) |
 | `set_summarize_local(id, bool)` | `meeting://status` (상태 변경) |
-| `save_summary(id, title, body)`, `archive_meeting(id)` | `meeting://progress` (구간 진행률, 대기열 위치) |
-| `send_to_slack(id, webhook)` | `model://download` (진행률) |
-| `retry_summary(id, connection)` | |
-| `get_settings`, `save_settings`, `set_secret`, `has_secret`, `delete_secret` (비밀값 자체는 프론트엔드로 돌려주지 않는다) | `app://quit-requested` (진행 중 작업이 있을 때 종료 확인 요청, 8.5) |
+| `save_summary(id, title, body)`, `archive_meeting(id)` | `meeting://progress` `{ id, status, chunk, chunks, percent, eta_secs, position }` (아래) |
+| `send_to_slack(id, webhook)` | `model://download` `{ file, received, total }` (약 1%마다) |
+| `retry_summary(id, connection)` | `transcribe://gpu-failed` `{ message }` (GPU 크래시 2번 → CPU로 전환, 5.4) |
+| `queue_state` → `meeting://progress`와 같은 항목의 배열. 이벤트가 오기 전 첫 화면용 (실행 중인 회의 먼저, 그다음 대기 순서) | |
+| `get_settings`, `save_settings`(저장 뒤 대기열을 다시 돌린다), `set_secret`, `has_secret`, `delete_secret` (비밀값 자체는 프론트엔드로 돌려주지 않는다) | `app://quit-requested` (진행 중 작업이 있을 때 종료 확인 요청, 8.5) |
 | `confirm_quit` (종료 확인 후 진행 중 작업을 `paused`로 기록하고 종료), `request_quit` (Windows Ctrl+Q 경로) | |
 | `reset_settings` (`settings.json`이 손상됐을 때만: 원본을 `settings.json.bak-<시각>`으로 옮기고 기본값으로 시작) | |
-| `download_models`, `import_model(path)`, `test_system_audio`, `send_test_message` | |
+| `model_status` → `{ files: [{ file, size, installed, received }], downloading }` (설정의 모델과 VAD 모델. `received`는 이어받을 `.part` 크기), `download_models` (두 파일이 설치·검증되면 끝나고, 실패하면 이유를 돌려준다), `cancel_model_download`, `import_model(path)` → `model_status`와 같은 값 | |
+| `test_system_audio`, `send_test_message` | |
 | `list_audio_devices` → `{ inputs, outputs }`, 항목은 `{ id, name }`. `id`는 cpal `DeviceId` 문자열(`host:id`)이라 `input_device`·`output_device`에 그대로 저장하면 캡처 스레드가 같은 장치를 연다. 장치 호출이 멈출 수 있어 blocking 스레드에서 열거하고, 우리 private aggregate 장치(macOS 시스템 오디오 탭)는 뺀다 | |
+
+**`meeting://progress`** (TRN-01, APP-07): 회의가 줄에 들어올 때, 대기 순서가 바뀔 때, 처리가 시작될 때, 구간 진행률이 바뀔 때, 끝날 때 보낸다.
+
+| 필드 | 뜻 |
+|---|---|
+| `id` | 회의 id |
+| `status` | 지금 상태. 기다리는 동안은 디스크 상태(`recorded`, `paused`, `transcribe_failed`), 처리 중에는 `transcribing`. 마지막 이벤트는 끝난 상태(`transcribed`, `transcribe_failed`, 녹음으로 멈췄으면 `paused`) |
+| `chunk`, `chunks` | 끝난 구간 수와 전체 구간 수. 구간 계획이 나오기 전에는 `chunks`가 0이다 |
+| `percent` | `chunks`가 0인 동안은 구간 나누기(`--plan-chunks`)의 진행률이다. 그 뒤는 녹음 전체 기준 0~100(끝난 구간 길이 + 지금 구간의 워커 진행률 × 그 구간 길이)이라 0부터 다시 오른다 |
+| `eta_secs` | 남은 시간(초). 이번 실행에서 처리한 오디오 길이와 걸린 시간의 비율을 남은 길이에 곱한다. 처리한 오디오가 1분이 안 되거나 10초가 안 지났으면 `null` |
+| `position` | 기다리는 동안 1부터 세는 대기 순서. 실행 중이면 `null` |
 
 ### 10.3 색상 토큰
 
@@ -648,15 +702,19 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 | 대상 | 확인하는 것 |
 |---|---|
 | `clock.rs` 정렬 | 가짜 시계 값으로 무음 채우기, 넘친 샘플 버리기(경계값 포함), 절전 5분 이하 = 계속 / 초과 = 종료, 데이터 공백은 절전이 아님, 0.1% 빠른 장치와 느린 장치를 4시간 돌려도 두 트랙 차이 0.21초 이하 |
-| `mix.rs` | 시스템 소리가 있을 때 마이크 감쇠, 클리핑 없음 |
+| `mix.rs` | 시스템 소리가 있을 때 마이크 감쇠(-20dB, attack 5ms·release 300ms 시점의 이득), 조용할 때 그대로, 클리핑 없음, 창만 읽고 짧은 트랙에 맞춤 |
 | `writer.rs` 기록 경로 | 쓰기 오류 주입 시 상태 `recorded` + 마지막 flush 길이만큼 읽히는 WAV (D7), `recorded`를 못 쓰면 중단된 녹음, 5분 넘는 절전은 절전 시점에서 종료, 3시간 50분 경고와 4시간 종료, 마이크 3초 0버퍼 경고, 48k 스테레오·44.1k 모노 → 16kHz 길이와 주파수 |
 | `filter.rs` | 정확히 일치할 때만 제거, 비슷한 문장은 남김, 반복 토큰·빈 결과 검사 |
-| `queue.rs` + 가짜 워커 | 크래시 → GPU 1회 재시도 → `gpu_failed` → CPU (D5), 종료 코드 3 → `gpu_failed` 아님 (5.3), 녹음 시작 → kill → 같은 구간 재처리, 마지막 완료 구간 다음부터 재개. 가짜 워커는 종료 코드만 내는 작은 실행 파일이고, `queue.rs`는 실행할 명령을 생성자로 받는다 |
+| `queue.rs` | 판단은 순수 함수로 확인한다: 2개 동시 실행과 FIFO 대기 순서, 녹음 시작 → 실행 중인 회의가 원래 순서로 맨 앞에 돌아가고 녹음 중에는 시작 안 함, 크래시 → GPU 1회 재시도 → `gpu_failed` → CPU (D5), 종료 코드 2·3과 OS의 SIGKILL → `gpu_failed` 아님 (5.3), 무응답은 크래시로 셈, GPU 결과가 비정상이면 CPU로 한 번, 마지막 완료 구간 다음부터 재개(찢어진 줄·계획과 다른 줄에서 멈춤), 진행률·남은 시간. 프로세스 처리는 `sh`를 가짜 워커로 써서 확인한다(unix): stdout 줄(잡음·UTF-8 아닌 줄 건너뜀)과 종료 코드·시그널, 녹음 시작 → 1초 안에 kill되고 크래시로 세지 않음, 무응답 → kill. 상태를 쓰는 경로 전체는 `tauri::test` 모의 런타임에서 셸 스크립트 워커로 확인한다: 끝까지 → `transcript.json` + `transcribed`, 녹음 → 디스크에 `paused` + 맨 앞 → 같은 구간부터 다시, CPU 크래시 → `transcribe_failed` + `error`, GPU 크래시 2번 → `gpu_failed` + CPU로 완료, 종료 코드 3 → 해시 확인 후 손상 안내와 파일 삭제, 동시에 두 번 삭제해도 둘 다 성공하고 처리가 끝난 뒤 폴더 삭제. 모델 실패 문구(메모리·손상·없음)는 따로 확인한다 |
+| 구간 나누기 (`engine.rs`) | 겹친 창의 음성 구간 합치기, 10분에 가장 가까운 무음에서 자름, 5~12분 범위, 무음 없는 연속 발화는 10분에서 자름, 무음·짧은 녹음 |
+| 음성만 잘라 잇기 (`engine.rs` `Speech`) | whisper.cpp와 같은 이어 붙이기(0.1초 겹침, 0.1초 무음), 조각 안은 1:1, 무음 자리에 떨어진 시작은 다음 조각 시작·끝은 앞 조각 끝, 오디오 끝을 넘은 시각, 음성이 없을 때 |
+| 워커 종료 코드 (`engine.rs`) | 인자 오류·녹음 없음 → 2, 모델 없음 → 3 |
+| `settings.rs` | 설정 화면 저장이 `gpu_failed`를 덮어쓰지 않고, 백엔드를 GPU로 바꾸면 지움 |
 | `slack.rs` | 페이로드 형식, 12,000자 경계, mrkdwn 변환 |
 | 수정 수 계산 | 줄 추가·삭제·변경, 제목 변경 |
 | `store.rs` | 상태 전이, 원자적 쓰기, 동시 갱신 두 개가 모두 남음 (8.2), 복구 분류 (8.4), 중단된 녹음의 처리 계속·삭제 (STO-03), 높은 `schema_version` → 읽기 전용 (D9) |
 | `summarize.rs` | 토큰 추정과 구간 나누기, 실패 분류 (6.4), 30자 미만 → LLM 요청 없음 (D8) |
-| `model.rs` | 해시 불일치 시 `.part` 삭제 |
+| `model.rs` | 해시 불일치 시 `.part` 삭제, 가져오기는 크기·해시가 맞을 때만 설치. 로컬 HTTP 서버(`TcpListener`)로: `Content-Range` 위치 확인, `Range`에 200이 오면 모델 크기일 때만 덮어씀, 너무 큰 `.part`는 처음부터, 크기는 맞고 해시가 틀린 설치 파일은 다시 받음, 멈춘 다운로드 취소가 바로 끝나고 가져오기를 막지 않음. 해시 확인 중에 취소하면 확인이 끝난 뒤에도 설치하지 않음(256MB 파일), 취소 표시가 켜진 설치는 이름 바꾸기·삭제를 하지 않음, 해시 확인 결과(정상·손상·없음)와 다운로드 중에는 손상 파일을 지우지 않음. 네트워크 시험(`cargo test -- --ignored downloads_and_resumes`): VAD 모델을 받고, 절반으로 자른 `.part`를 `Range`로 이어받음 |
 | 검토 화면 (Vitest) | `<img src=x onerror=...>`가 든 요약이 텍스트로 표시됨 (D6), 빈 녹음 안내와 전송 버튼 비활성화 (D8), "미정" 강조 |
 | 녹음 화면 (Vitest) | 레벨 이벤트로 경과 시간·스펙트럼 막대 높이·음량 표시, 경고 배너 닫기와 같은 종류가 다시 오면 다시 표시 |
 

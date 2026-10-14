@@ -338,12 +338,26 @@ impl Store {
         self.update(id, |meta| transition(meta, to))
     }
 
-    /// Architecture 8.3 delete procedure.
+    /// Architecture 8.3 delete procedure, for a meeting no work runs on.
     pub fn delete(&self, id: &str) -> Result<(), String> {
+        self.delete_with(id, || {})
+    }
+
+    /// Architecture 8.3 delete procedure. `cancel` is steps 2–3: stop the meeting's work and
+    /// return once it has stopped. It runs after `deleting` is written, so nothing restarts it.
+    pub fn delete_with(&self, id: &str, cancel: impl FnOnce()) -> Result<(), String> {
         let lock = self.lock_for(id)?;
         {
             let _guard = lock.lock().unwrap();
-            let mut meta = self.read(id)?;
+            let mut meta = match self.read(id) {
+                Ok(meta) => meta,
+                // Already gone: a delete of the same meeting finished first.
+                Err(_) if !self.dir_for(id)?.join("meta.json").exists() => {
+                    self.locks.lock().unwrap().remove(id);
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
             if meta.schema_version > SCHEMA_VERSION {
                 return Err(NEWER_VERSION.to_string());
             }
@@ -353,9 +367,13 @@ impl Store {
             }
         }
         // Outside the lock: the work being stopped may itself be waiting to write meta.json.
-        cancel_work(id);
+        cancel();
         let _guard = lock.lock().unwrap();
-        remove_meeting_dir(&self.dir_for(id)?).map_err(|e| format!("회의 폴더 삭제 실패: {e}"))?;
+        match remove_meeting_dir(&self.dir_for(id)?) {
+            // A second delete of the same meeting: the first one has removed it meanwhile.
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            removed => removed.map_err(|e| format!("회의 폴더 삭제 실패: {e}"))?,
+        }
         self.locks.lock().unwrap().remove(id);
         Ok(())
     }
@@ -379,8 +397,8 @@ impl Store {
                     Ok(())
                 }
                 Recovery::FinishDelete => self.delete(&meta.id),
-                // ponytail: no queue until M3. Write the `paused` that exit handling (8.5) would
-                // have written, so nothing on disk claims work that is not running.
+                // Write the `paused` that exit handling (8.5) would have written, so nothing on
+                // disk claims work that is not running. The queue picks it up after this.
                 Recovery::Requeue
                     if matches!(meta.status, Status::Transcribing | Status::Summarizing) =>
                 {
@@ -423,7 +441,7 @@ impl Store {
     }
 
     /// "처리 계속" for an interrupted recording (STO-03). The WAV files keep what their last
-    /// 5 s flush wrote. Until the queue lands (M3) this only writes `recorded`.
+    /// 5 s flush wrote. The caller queues the now `recorded` meeting.
     pub fn continue_interrupted(&self, id: &str) -> Result<Meta, String> {
         if !self.is_interrupted(id) {
             return Err(format!("중단된 녹음이 아닙니다: {id}"));
@@ -490,11 +508,6 @@ fn remove_meeting_dir(dir: &Path) -> std::io::Result<()> {
     }
     Ok(())
 }
-
-/// Delete step 2–3: stop the meeting's transcription worker and LLM request, and wait until they
-/// have stopped. M3/M4 (queue) hook in here. A recording is stopped by `delete_meeting` before
-/// the delete starts, since the recorder lives outside the store.
-fn cancel_work(_id: &str) {}
 
 #[cfg(test)]
 mod tests {
@@ -858,6 +871,19 @@ mod tests {
 
         assert!(store.update("2026-01-01T0000-ffff", |_| Ok(())).is_err());
         assert!(!store.dir.join("2026-01-01T0000-ffff").exists());
+    }
+
+    #[test]
+    fn deleting_a_deleted_meeting_succeeds() {
+        let (_tmp, store) = store();
+        let id = put(&store, Review).id;
+        store.delete(&id).unwrap();
+        store.delete(&id).unwrap();
+        assert!(store.locks.lock().unwrap().is_empty());
+        // A broken meta.json is not "gone".
+        let broken = put(&store, Review).id;
+        fs::write(meta_path(&store, &broken), b"{ torn").unwrap();
+        assert!(store.delete(&broken).is_err());
     }
 
     #[test]

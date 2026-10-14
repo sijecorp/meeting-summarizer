@@ -1,20 +1,30 @@
 // `async` keeps file and keychain I/O off the main (UI) thread.
 use crate::QUIT_CONFIRMED;
 use crate::audio::{self, AudioDevices, Recorder, RecordingState};
+use crate::queue::{Progress, Queue};
 use crate::settings::{self, LoadedSettings, SecretKind, Settings, SettingsStore};
 use crate::store::{Meta, Status, Store};
+use crate::transcribe::model::{self, ModelState, Models};
 use serde::Serialize;
+use std::path::Path;
 use std::sync::atomic::Ordering;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 
 #[tauri::command(async)]
 pub fn get_settings(settings: State<'_, SettingsStore>) -> Result<LoadedSettings, String> {
     settings.load()
 }
 
+/// A new model or backend may let a waiting meeting start.
 #[tauri::command(async)]
-pub fn save_settings(settings: State<'_, SettingsStore>, value: Settings) -> Result<(), String> {
-    settings.save(value)
+pub fn save_settings(
+    settings: State<'_, SettingsStore>,
+    queue: State<'_, Queue>,
+    value: Settings,
+) -> Result<(), String> {
+    settings.save(value)?;
+    queue.pump();
+    Ok(())
 }
 
 /// Backs up an unreadable settings.json and starts from defaults.
@@ -78,20 +88,39 @@ pub fn get_meeting(store: State<'_, Store>, id: String) -> Result<MeetingDetail,
 pub fn delete_meeting(
     store: State<'_, Store>,
     recorder: State<'_, Recorder>,
+    queue: State<'_, Queue>,
     id: String,
 ) -> Result<(), String> {
     // Delete step 2 (8.3): close the WAV files before the folder goes.
     recorder.stop(Some(&id));
-    store.delete(&id)
+    store.delete_with(&id, || queue.cancel(&id))
 }
 
-/// "처리 계속" for an interrupted recording. `transcribe_failed` retries come with the queue (M3).
+/// "처리 계속" for an interrupted recording, or another try after `transcribe_failed`. Either
+/// way the meeting joins the processing queue (TRN-01).
 #[tauri::command(async)]
-pub fn resume_meeting(store: State<'_, Store>, id: String) -> Result<Meta, String> {
-    store.continue_interrupted(&id)
+pub fn resume_meeting(
+    store: State<'_, Store>,
+    queue: State<'_, Queue>,
+    id: String,
+) -> Result<Meta, String> {
+    let meta = if store.is_interrupted(&id) {
+        store.continue_interrupted(&id)?
+    } else {
+        store.get(&id)?
+    };
+    if !matches!(
+        meta.status,
+        Status::Recorded | Status::Paused | Status::TranscribeFailed
+    ) {
+        return Err("다시 처리할 수 있는 회의가 아닙니다".into());
+    }
+    queue.enqueue(&id, meta.status);
+    Ok(meta)
 }
 
 /// Pinned devices come from settings; unreadable settings must not block a recording.
+/// Running transcriptions stop inside `Recorder::start` (TRN-09).
 #[tauri::command(async)]
 pub fn start_recording(
     app: AppHandle,
@@ -130,8 +159,11 @@ pub fn confirm_quit(
     app: AppHandle,
     store: State<'_, Store>,
     recorder: State<'_, Recorder>,
+    queue: State<'_, Queue>,
 ) -> Result<(), String> {
     QUIT_CONFIRMED.store(true, Ordering::SeqCst);
+    // Workers first: child processes would outlive the app.
+    queue.shutdown();
     // Closes the WAV files and writes `recorded` before anything else is paused.
     recorder.stop(None);
     store.pause_busy();
@@ -143,4 +175,60 @@ pub fn confirm_quit(
 #[tauri::command]
 pub fn request_quit(app: AppHandle) {
     app.exit(0);
+}
+
+/// Queued and running meetings, for the first render before `meeting://progress` arrives.
+#[tauri::command]
+pub fn queue_state(queue: State<'_, Queue>) -> Vec<Progress> {
+    queue.snapshot()
+}
+
+/// The chosen Whisper model and the VAD model: installed, partly downloaded, downloading.
+#[tauri::command(async)]
+pub fn model_status(
+    settings: State<'_, SettingsStore>,
+    models: State<'_, Models>,
+) -> Result<ModelState, String> {
+    let settings = settings.load().map(|l| l.settings).unwrap_or_default();
+    models.state(&settings.model)
+}
+
+/// ONB-01: downloads the missing model files from `model_base_url` (a mirror if set), sending
+/// `model://download`. Resumes a `.part` left by an earlier try. Queued meetings start after.
+#[tauri::command]
+pub async fn download_models(
+    app: AppHandle,
+    settings: State<'_, SettingsStore>,
+    models: State<'_, Models>,
+    queue: State<'_, Queue>,
+) -> Result<(), String> {
+    let settings = settings.load().map(|l| l.settings).unwrap_or_default();
+    let files = model::needed(&settings.model)?;
+    models
+        .download(&settings.model_base_url, files, move |progress| {
+            let _ = app.emit("model://download", progress);
+        })
+        .await?;
+    queue.pump();
+    Ok(())
+}
+
+/// Stops the download; what arrived stays for resuming.
+#[tauri::command]
+pub fn cancel_model_download(models: State<'_, Models>) {
+    models.cancel();
+}
+
+/// ONB-02: installs a model file the recorder picked, if its size and sha256 match.
+#[tauri::command(async)]
+pub fn import_model(
+    settings: State<'_, SettingsStore>,
+    models: State<'_, Models>,
+    queue: State<'_, Queue>,
+    path: String,
+) -> Result<ModelState, String> {
+    let settings = settings.load().map(|l| l.settings).unwrap_or_default();
+    models.import(Path::new(&path), &model::needed(&settings.model)?)?;
+    queue.pump();
+    models.state(&settings.model)
 }

@@ -1,7 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-// Mirrors src-tauri/src/store.rs, settings.rs, commands.rs and audio/mod.rs.
+// Mirrors src-tauri/src/store.rs, settings.rs, commands.rs, audio/mod.rs, queue.rs and
+// transcribe/model.rs.
 
 export const SCHEMA_VERSION = 1;
 export const NEWER_VERSION = "새 버전 앱에서 만든 데이터입니다";
@@ -113,7 +114,7 @@ export const listAudioDevices = () => invoke<AudioDevices>("list_audio_devices")
 export const listMeetings = () => invoke<MeetingItem[]>("list_meetings");
 export const getMeeting = (id: string) => invoke<MeetingDetail>("get_meeting", { id });
 export const deleteMeeting = (id: string) => invoke<void>("delete_meeting", { id });
-/** "처리 계속" for an interrupted recording. */
+/** "처리 계속" for an interrupted recording, or a retry after `transcribe_failed`: queues it. */
 export const resumeMeeting = (id: string) => invoke<Meta>("resume_meeting", { id });
 
 // Recording (architecture 4, 10.2).
@@ -153,3 +154,46 @@ export const requestQuit = () => invoke<void>("request_quit");
 /** Quit was requested while work is running; the UI must ask before `confirmQuit`. */
 export const onQuitRequested = (handler: () => void) =>
   listen("app://quit-requested", handler);
+
+// Transcription queue and models (architecture 5, 10.2).
+
+/**
+ * `meeting://progress`. Sent when a meeting joins the line, its place changes, it starts, a chunk
+ * moves, and when it ends (with its final status: `transcribed`, `transcribe_failed`, `paused`).
+ */
+export type Progress = {
+  id: string;
+  status: Status;
+  /** Chunks finished, of `chunks`. `chunks` is 0 until the chunk plan exists. */
+  chunk: number;
+  chunks: number;
+  /** While `chunks` is 0, the chunk planning's progress; then 0..100 over the whole recording. */
+  percent: number;
+  /** Remaining seconds, once this run has done enough to tell. */
+  eta_secs: number | null;
+  /** 1-based place in line while waiting; null while running. */
+  position: number | null;
+};
+/** Queued and running meetings, for the first render before progress events arrive. */
+export const queueState = () => invoke<Progress[]>("queue_state");
+export const onMeetingProgress = (handler: (progress: Progress) => void) =>
+  listen<Progress>("meeting://progress", (e) => handler(e.payload));
+/** The GPU crashed twice on one chunk; automatic mode now uses the CPU. */
+export const onGpuFailed = (handler: (notice: { message: string }) => void) =>
+  listen<{ message: string }>("transcribe://gpu-failed", (e) => handler(e.payload));
+
+/** `received`: bytes in the `.part` file kept for resuming. */
+export type ModelFileState = { file: string; size: number; installed: boolean; received: number };
+/** The chosen Whisper model and the VAD model. */
+export type ModelState = { files: ModelFileState[]; downloading: boolean };
+/** `model://download`, about once per percent. */
+export type ModelDownload = { file: string; received: number; total: number };
+export const modelStatus = () => invoke<ModelState>("model_status");
+/** Resolves when both files are installed and verified; rejects with the reason ("…취소했습니다" after a cancel). */
+export const downloadModels = () => invoke<void>("download_models");
+/** What arrived stays for resuming. */
+export const cancelModelDownload = () => invoke<void>("cancel_model_download");
+/** Installs a picked model file if its size and sha256 match (ONB-02). */
+export const importModel = (path: string) => invoke<ModelState>("import_model", { path });
+export const onModelDownload = (handler: (progress: ModelDownload) => void) =>
+  listen<ModelDownload>("model://download", (e) => handler(e.payload));

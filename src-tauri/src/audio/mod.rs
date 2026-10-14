@@ -5,8 +5,10 @@ mod capture;
 mod clock;
 #[cfg(target_os = "macos")]
 mod macos_tap;
+pub mod mix;
 mod writer;
 
+use crate::queue::Queue;
 use crate::store::Store;
 use serde::Serialize;
 use std::fs::File;
@@ -132,7 +134,8 @@ struct Active {
 pub struct Recorder {
     active: Mutex<Option<Active>>,
     /// Held by `stop` until the writer has finished, so a second stop (quit, delete) racing the
-    /// first waits for `recorded` instead of writing over a recording still being closed.
+    /// first waits for `recorded` instead of writing over a recording still being closed, and a
+    /// new `start` waits too.
     finishing: Mutex<()>,
 }
 
@@ -146,12 +149,21 @@ impl Recorder {
         input_device: Option<String>,
         output_device: Option<String>,
     ) -> Result<RecordingState, String> {
+        // Waits for a `stop` still closing the last recording: its writer tells the queue the
+        // recording is over, and that must come before this one says it has begun.
+        let _finishing = self.finishing.lock().unwrap();
         let mut active = self.active.lock().unwrap();
         if active
             .as_ref()
             .is_some_and(|a| !a.shared.stop.load(Ordering::SeqCst))
         {
             return Err("이미 녹음 중입니다".into());
+        }
+        // A recording that ended by itself (4 hours, disk, sleep): let its writer finish first.
+        if let Some(ended) = active.take()
+            && ended.writer.join().is_err()
+        {
+            eprintln!("녹음 기록 스레드가 비정상 종료했습니다 ({})", ended.id);
         }
         let id = store.create("")?.id;
         let dir = store.dir_for(&id)?;
@@ -198,6 +210,12 @@ impl Recorder {
             clock::now(),
         );
 
+        // TRN-09: running transcriptions stop now. The writer thread ends the pause when it
+        // finishes this recording.
+        let queue = app.try_state::<Queue>();
+        if let Some(queue) = &queue {
+            queue.recording_started();
+        }
         let handle = app.clone();
         let spawned = thread::Builder::new()
             .name("recording-writer".into())
@@ -212,6 +230,11 @@ impl Recorder {
                     .create()
                     .inspect_err(|e| eprintln!("절전 방지 실패: {e}"));
                 writer::run(writer, &handle.state::<Store>());
+                // TRN-01: the meeting is `recorded` now. Queue it, and let the transcriptions
+                // the recording stopped go on (TRN-09).
+                if let Some(queue) = handle.try_state::<Queue>() {
+                    queue.recording_finished();
+                }
             });
         // A meeting that never started recording is not kept.
         let writer = match spawned {
@@ -219,6 +242,9 @@ impl Recorder {
             Err(e) => {
                 // The unspawned closure dropped the WAV writers, so the files are closed.
                 let _ = store.delete(&id);
+                if let Some(queue) = &queue {
+                    queue.recording_finished();
+                }
                 return Err(format!("녹음을 시작할 수 없습니다: {e}"));
             }
         };
