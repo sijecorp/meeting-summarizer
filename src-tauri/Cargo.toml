@@ -18,10 +18,18 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tauri-plugin-single-instance = "2.5.3"
+keyring = "4.2.0"
+time = "0.3"
+cpal = "0.18.2"
+hound = "3.5.1"
+rubato = "5.0.1"
+rtrb = "0.4.0"
+keepawake = "0.6.1"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
@@ -31,3 +39,23 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Same crate keyring 4 wraps: its attributes-only search lets `has_secret` skip decrypting (9.2).
+# Keep this in lockstep with the keyring-core version keyring depends on: both must resolve to one
+# crate so they share the default credential store (`cargo tree -d` must not list keyring-core).
+keyring-core = "1.0.1"
+# System audio through our own Core Audio tap (architecture 4.3); clocks and disk space via libc.
+# Same versions cpal resolves to, so nothing is duplicated.
+libc = "0.2.190"
+objc2 = "0.6.5"
+objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware", "objc2", "objc2-foundation"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFDictionary", "CFNumber", "CFString"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSString", "NSUUID", "NSValue"] }
+
+[target."cfg(windows)".dependencies]
+# Reference clocks and disk space (architecture 4.2, 4.6). Same version tauri already pulls in.
+windows-sys = { version = "0.61.2", features = ["Win32_System_WindowsProgramming", "Win32_System_SystemInformation", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
