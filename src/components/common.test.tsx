@@ -1,8 +1,8 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, expect, test } from "vitest";
-import type { LlmConnection, SummaryRoute } from "../lib/ipc";
-import { RouteNotice } from "./common";
+import type { LlmConnection, Meta, Progress, SummaryRoute } from "../lib/ipc";
+import { phase, RouteNotice } from "./common";
 
 afterEach(() => {
   cleanup();
@@ -125,4 +125,29 @@ test("once locked: where it is being summarized while summarizing, never the swi
 
   rerender(<RouteNotice id="b" status="summarize_failed" />);
   await waitFor(() => expect(container.textContent).toBe(""));
+});
+
+// Between transcribing and summarizing the list can read `transcribed` while the last event still
+// says transcribing: the dock must not drop the meeting for that moment (APP-07).
+test("phase: an event saying it runs wins over the list's status", () => {
+  const meta = { schema_version: 1, status: "transcribed" } as Meta;
+  const event = (patch: Partial<Progress>): Progress => ({
+    id: "a",
+    status: "transcribing",
+    chunk: 4,
+    chunks: 5,
+    percent: 98,
+    eta_secs: null,
+    position: null,
+    ...patch,
+  });
+  // No place in line and no event: it stopped for want of an LLM connection.
+  expect(phase(meta, undefined)).toBeNull();
+  expect(phase(meta, event({}))).toBe("running");
+  expect(phase(meta, event({ status: "summarizing", chunk: 0, chunks: 0, percent: 0 }))).toBe("running");
+  // Its last event is the end: nothing runs.
+  expect(phase(meta, event({ status: "transcribed" }))).toBeNull();
+  expect(phase(meta, event({ status: "transcribed", position: 1 }))).toBe("waiting");
+  // A newer app's meeting never runs here.
+  expect(phase({ ...meta, schema_version: 2 }, event({}))).toBeNull();
 });

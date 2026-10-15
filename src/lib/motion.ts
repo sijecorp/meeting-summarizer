@@ -55,6 +55,31 @@ export const rowVariants: Variants = {
   show: { opacity: 1, y: 0, transition: { duration: dur.small, ease: ease.out } },
 };
 
+/** The summary arriving in its document (design-system 6.6): section by section, 40ms apart with
+ * the list's cap, once. A textarea cannot move its text, so a read-only layer does it. */
+export const revealVariants: Variants = {
+  hidden: {},
+  show: { transition: { delayChildren: (i: number) => Math.min(i, 8) * 0.04 } },
+};
+export const sectionVariants: Variants = {
+  hidden: { opacity: 0, y: 4 },
+  show: { opacity: 1, y: 0, transition: { duration: dur.small, ease: ease.out } },
+};
+
+/** A meeting's title gliding between its Home row and its document (design-system 6.1). A tween,
+ * not `spring.gentle`: daily screens keep UI motion within 300ms. */
+export const titleMove = { duration: 0.3, ease: ease.out };
+/** How long after a screen change a title may glide: the glide and some slack. Later moves of the
+ * same title (a row changing group, a meta line wrapping) are not a glide. */
+export const TITLE_GLIDE_MS = 600;
+
+/** The summary's document and its editor taking each other's place (design-system 6.6): a 150ms
+ * crossfade, or none when a key did it (`custom`). */
+export const swapVariants: Variants = {
+  out: (instant: boolean) => ({ opacity: 0, transition: instant ? now : { duration: 0.15 } }),
+  in: (instant: boolean) => ({ opacity: 1, transition: instant ? now : { duration: 0.15 } }),
+};
+
 /** App banners: they fade in place while `layout` moves what is around them. */
 export const bannerVariants: Variants = {
   enter: { opacity: 0, y: -4 },

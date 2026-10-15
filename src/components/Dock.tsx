@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Square } from "lucide-react";
-import { AnimatePresence, motion, useReducedMotion, useSpring, useTransform } from "motion/react";
-import { clock, hhmm, Kbd, phase, Present, RollingTime, SHORTCUT, sinceStart } from "@/components/common";
+import { AnimatePresence, motion, useTransform } from "motion/react";
+import { clock, hhmm, Kbd, phase, Present, RollingTime, SHORTCUT, sinceStart, useFollow } from "@/components/common";
 import { onRecordingLevel, type MeetingItem, type Progress } from "@/lib/ipc";
 import { dur, spring } from "@/lib/motion";
 
@@ -20,7 +20,8 @@ function Recording({
   onStop,
 }: {
   startedAt: string;
-  onOpen: () => void;
+  /** `keyboard`: a key pressed it, so the screen change does not move (design-system 5). */
+  onOpen: (keyboard: boolean) => void;
   onStop: () => void;
 }) {
   const bars = useRef<HTMLSpanElement>(null);
@@ -48,7 +49,7 @@ function Recording({
       <button
         aria-label={`녹음 중 ${time}`}
         className={`${PART} gap-3 pr-3 pl-4 hover:bg-white/10`}
-        onClick={onOpen}
+        onClick={(e) => onOpen(e.detail === 0)}
       >
         <span aria-hidden className="size-2.5 rounded-full bg-rec motion-safe:animate-breathe" />
         <span ref={bars} aria-hidden className="flex h-5 items-center gap-[2px]">
@@ -99,13 +100,7 @@ const ARC = { cx: 12, cy: 12, r: 9, fill: "none", strokeWidth: 2.5 };
  * the percent, rendered from the MotionValue without a re-render per frame. Keyed by meeting, so a
  * new one starts from its own value. */
 function Processing({ count, job }: { count: number; job: ReturnType<typeof jobOf> }) {
-  const reduce = useReducedMotion();
-  const value = useSpring(job.percent ?? 0, { stiffness: 140, damping: 24 });
-  useEffect(() => {
-    if (job.percent == null) return;
-    if (reduce) value.jump(job.percent);
-    else value.set(job.percent);
-  }, [job.percent, reduce]);
+  const value = useFollow(job.percent ?? 0);
   const length = useTransform(value, (v) => v / 100);
   const text = useTransform(value, (v) => `${Math.round(v)}%`);
   const turning = job.running && job.percent == null;
@@ -163,9 +158,10 @@ export default function Dock({
   progress: Record<string, Progress>;
   /** The recording screen shows all of this itself. */
   hidden: boolean;
-  onRecording: () => void;
+  /** `keyboard`: a key pressed it, so the screen change does not move (design-system 5). */
+  onRecording: (keyboard: boolean) => void;
   onStop: () => void;
-  onOpen: (meeting: MeetingItem) => void;
+  onOpen: (meeting: MeetingItem, keyboard: boolean) => void;
 }) {
   // Recording stops every worker (TRN-09), so processing waits behind it.
   const mode: Mode = live ? "recording" : queue.length ? "processing" : "idle";
@@ -198,16 +194,16 @@ export default function Dock({
           <button
             aria-label={[`처리 중 ${queue.length}`, job.name, job.shown ? `${job.step} ${job.percent}%` : job.step].join(" · ")}
             className={`${PART} min-w-0 gap-3 pr-5 pl-3 hover:bg-white/10`}
-            onClick={() => onOpen(head)}
+            onClick={(e) => onOpen(head, e.detail === 0)}
           >
             <Processing key={head.id} count={queue.length} job={job} />
           </button>
         ),
       };
 
+  // In App's bottom stack, under a meeting's send bar.
   return (
-    // A fixed container needs `layoutRoot` for the pill's layout animation to measure right.
-    <motion.div layoutRoot className="pointer-events-none fixed inset-x-0 bottom-6 z-20 flex justify-center px-4">
+    <>
       <AnimatePresence>
         {content && !hidden && (
           <motion.div
@@ -244,6 +240,6 @@ export default function Dock({
       <p role="status" className="sr-only">
         {said}
       </p>
-    </motion.div>
+    </>
   );
 }

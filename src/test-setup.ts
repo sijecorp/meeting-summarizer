@@ -9,6 +9,8 @@ globalThis.ResizeObserver ??= class {
 Element.prototype.hasPointerCapture ??= () => false;
 Element.prototype.releasePointerCapture ??= () => {};
 Element.prototype.scrollIntoView ??= () => {};
+// No layout: a range has no box (the meeting document reads the caret's off the editor's mirror).
+Range.prototype.getBoundingClientRect ??= () => new DOMRect();
 
 // Motion finishes every animation at once, so tests see the end state and exits leave at once.
 MotionGlobalConfig.skipAnimations = true;

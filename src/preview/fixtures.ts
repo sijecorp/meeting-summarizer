@@ -116,6 +116,26 @@ const SUMMARY = `## 결정사항
 ## 미해결 질문
 - 녹음 파일을 며칠 동안 보관할지 정하지 못했다`;
 
+// A long review: about 95% of Slack's 12,000, so the length ring shows its warning; a little more
+// typing takes it past the limit.
+const TOPICS = ["온보딩 흐름", "녹음 권한 안내", "전사 속도", "요약 품질", "Slack 메시지 형식", "설정 화면", "오류 문구"];
+const POINTS = [
+  "사용자 인터뷰에서 가장 자주 나온 불편이었다",
+  "다음 스프린트에서 먼저 손보기로 했다",
+  "지표를 먼저 모은 뒤에 판단하기로 했다",
+  "시안 두 가지를 나란히 놓고 비교해 보기로 했다",
+  "지금 방식을 유지하되 문구만 다듬기로 했다",
+];
+const LONG_SUMMARY = (() => {
+  const lines = SUMMARY.split("\n");
+  const at = lines.indexOf("## 미해결 질문");
+  const more: string[] = [];
+  for (let i = 0; [...[...lines, ...more].join("\n")].length < 11_300; i++) {
+    more.push(`- ${TOPICS[i % TOPICS.length]}: ${POINTS[i % POINTS.length]} (${Math.floor(i / 7) + 1}차 논의)`);
+  }
+  return [...lines.slice(0, at), ...more, ...lines.slice(at)].join("\n");
+})();
+
 const pad = (n: number) => String(n).padStart(2, "0");
 /** Today minus `daysAgo`, at hh:mm local time. */
 const at = (daysAgo: number, hour: number, minute: number) => {
@@ -258,6 +278,11 @@ export function reset(scenario: Scenario) {
       queued,
       paused,
       summarized("주간 제품 회의", "review", at(0, 10, 0)),
+      {
+        ...summarized("분기 계획 회의", "review", at(0, 12, 30), { duration_ms: 95 * 60_000 }),
+        summary: LONG_SUMMARY,
+        generated: LONG_SUMMARY,
+      },
       summarized("채용 인터뷰 디브리프", "sent", at(0, 8, 30), {
         duration_ms: 24 * 60_000,
         sent: { channel: "#채용", at: at(0, 9, 5).toISOString(), edit_count: 1 },
@@ -277,6 +302,9 @@ export function reset(scenario: Scenario) {
         sent: { channel: "#회의록", at: at(1, 16, 52).toISOString(), edit_count: 3 },
       }),
       summarized("1:1 미팅", "archived", at(2, 11, 0), { duration_ms: 28 * 60_000 }),
+      // ponytail: stopped for want of an LLM connection, though this scenario has two; the real app
+      // would queue it at start (architecture 8.4). Kept so its document can be seen.
+      stored("transcribed", at(1, 9, 0), { backend: "cpu", chunks_done: 3 }, { transcript: TRANSCRIPT }),
       stored("transcribe_failed", at(1, 14, 0), {
         duration_ms: 36 * 60_000,
         backend: "cpu",
@@ -385,7 +413,8 @@ function advance(p: Progress) {
       Object.assign(p, { status: "summarizing", chunk: 0, chunks: 3, percent: 0, eta_secs: null });
     }
   } else {
-    p.percent = Math.min(100, p.percent + 2);
+    // Quick, so a summary arriving in its open document is seen within seconds.
+    p.percent = Math.min(100, p.percent + 5);
     p.chunk = Math.floor((p.percent / 100) * p.chunks);
     if (p.percent === 100) {
       Object.assign(m, { summary: SUMMARY, generated: SUMMARY });

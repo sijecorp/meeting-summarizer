@@ -250,8 +250,9 @@ test("only waiting: the dock names the head of the line and opens it", async () 
   render(<App />);
 
   fireEvent.click(await screen.findByRole("button", { name: "처리 중 1 · a · 대기 중" }));
-  expect(await screen.findByRole("heading", { level: 1, name: "처리 중" })).toBeTruthy();
-  expect(await screen.findByRole("heading", { level: 2, name: "a" })).toBeTruthy();
+  // Its document, still being written.
+  expect(await screen.findByRole("heading", { level: 1, name: "a" })).toBeTruthy();
+  expect(await screen.findByText("대기 중")).toBeTruthy();
 });
 
 test("a recording stop turns the dock from recording to processing, said once", async () => {
@@ -374,8 +375,8 @@ test("the dock follows progress events and opens the meeting at the head of the 
   fireEvent.click(screen.getByRole("button", { name: "설정" }));
   expect(await screen.findByRole("heading", { level: 1, name: "설정" })).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "처리 중 3 · a · 전사 57%" }));
-  expect(await screen.findByRole("heading", { level: 1, name: "처리 중" })).toBeTruthy();
-  expect(await screen.findByRole("heading", { level: 2, name: "a" })).toBeTruthy();
+  expect(await screen.findByRole("heading", { level: 1, name: "a" })).toBeTruthy();
+  expect(await screen.findByRole("progressbar", { name: "전사 진행률" })).toBeTruthy();
 });
 
 // Design-system 6.1: the logo's bars move only while something is transcribed or summarized.
@@ -475,8 +476,8 @@ test("a GPU fallback shows a dismissible warning", async () => {
   await waitFor(() => expect(screen.queryByText(message)).toBeNull());
 });
 
-// APP-03: the meeting as it is now decides the screen; it may have moved on since the notification.
-test("a notification click opens its meeting: review when ready, processing when it failed", async () => {
+// APP-03: a notification click opens its meeting's document, as it is now: it may have moved on.
+test("a notification click opens its meeting: the summary when ready, the retry when it failed", async () => {
   mock((cmd, args) => {
     if (cmd === "list_meetings") return [];
     if (cmd !== "get_meeting") return;
@@ -489,18 +490,20 @@ test("a notification click opens its meeting: review when ready, processing when
   expect(await first()).toBeTruthy();
 
   await act(() => emit("app://open-meeting", "a"));
-  expect(await screen.findByRole("heading", { level: 1, name: "검토" })).toBeTruthy();
-  expect(await screen.findByDisplayValue("요약")).toBeTruthy();
+  // The summary, as a document ready to edit.
+  expect(await screen.findByRole("button", { name: "고치기" })).toBeTruthy();
+  expect(screen.getByText("요약")).toBeTruthy();
 
   await act(() => emit("app://open-meeting", "b"));
-  expect(await screen.findByRole("heading", { level: 1, name: "처리 중" })).toBeTruthy();
+  expect(await screen.findByRole("heading", { level: 1, name: "b" })).toBeTruthy();
+  expect(await screen.findByRole("button", { name: "요약 다시 실행" })).toBeTruthy();
 
   await act(() => emit("app://open-meeting", "gone"));
   expect(await screen.findByText("회의를 열지 못했습니다: Error: 회의를 찾을 수 없습니다: gone")).toBeTruthy();
 });
 
-// A leaving screen stays mounted for its exit. Processing's read that lands then (here as
-// `review`) must not take the recorder from Home to 검토.
+// A leaving screen stays mounted for its exit. The document's read that lands then (here as
+// `review`) must not move the recorder from Home.
 test("a screen on its way out cannot move the app", async () => {
   MotionGlobalConfig.skipAnimations = false;
   try {
@@ -519,7 +522,7 @@ test("a screen on its way out cannot move the app", async () => {
 
     render(<App />);
     fireEvent.click(await screen.findByText("느린 회의"));
-    expect(await screen.findByRole("heading", { level: 1, name: "처리 중" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { level: 1, name: "느린 회의" })).toBeTruthy();
     hold = true;
     await act(() => emit("meeting://progress", progress("느린 회의", { status: "summarizing", eta_secs: null })));
     await waitFor(() => expect(held.length).toBe(1));
@@ -537,6 +540,26 @@ test("a screen on its way out cannot move the app", async () => {
   } finally {
     MotionGlobalConfig.skipAnimations = true;
   }
+});
+
+// Design-system 6.2: one stack at the bottom, the send bar over the dock.
+test("a meeting's send bar sits in the bottom stack above the dock, and leaves with its document", async () => {
+  mock((cmd, args) => {
+    if (cmd === "list_meetings") return [live("지금 회의"), meeting("a", "review")];
+    if (cmd === "get_meeting") return { meta: meeting(args.id as string, "review"), summary: "요약", sending: false };
+  });
+
+  render(<App />);
+  fireEvent.click(await screen.findByText("a"));
+
+  const send = await screen.findByRole("button", { name: "#회의록으로 보내기" });
+  const dock = screen.getByRole("button", { name: LIVE });
+  expect(send.closest(".fixed")).toBe(dock.closest(".fixed"));
+  expect(send.compareDocumentPosition(dock) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "홈으로" }));
+  await waitFor(() => expect(screen.queryByRole("button", { name: /보내기$/ })).toBeNull());
+  expect(screen.getByRole("button", { name: LIVE })).toBeTruthy();
 });
 
 // ⌘R / ⌘. on macOS, Ctrl elsewhere: both modifiers are set so the test holds on either.
@@ -588,7 +611,7 @@ test("⌘R starts a recording from any screen, never while typing, in a dialog o
   expect(starts()).toBe(1);
 
   expect(press(document.body, "Period")).toBe(false);
-  expect(await screen.findByRole("heading", { level: 1, name: "처리 중" })).toBeTruthy();
+  expect(await screen.findByRole("heading", { level: 1, name: "새 회의" })).toBeTruthy();
   expect(calls.filter((c) => c === "stop_recording")).toHaveLength(1);
 });
 
@@ -612,7 +635,7 @@ test("a start the list never showed ends with its recording://stopped; recording
   expect(starts()).toBe(1);
 
   await act(() => emit("recording://stopped", { id: "짧은 회의", message: "디스크 공간이 부족해 녹음을 멈췄습니다" }));
-  expect(await screen.findByRole("heading", { level: 1, name: "처리 중" })).toBeTruthy();
+  expect(await screen.findByRole("heading", { level: 1, name: "짧은 회의" })).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "홈으로" }));
   expect(((await screen.findByRole("button", { name: "녹음 시작" })) as HTMLButtonElement).disabled).toBe(false);
   press(document.body, "KeyR");

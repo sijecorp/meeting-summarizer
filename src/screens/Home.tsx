@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import { Check, CircleAlert, TriangleAlert } from "lucide-react";
 import { motion } from "motion/react";
 import {
@@ -8,6 +8,7 @@ import {
   Dots,
   hhmm,
   Kbd,
+  lengthText,
   phase,
   progressText,
   ro,
@@ -32,7 +33,7 @@ import {
   type Progress,
   type Status,
 } from "@/lib/ipc";
-import { listVariants, rowVariants } from "@/lib/motion";
+import { listVariants, rowVariants, TITLE_GLIDE_MS, titleMove } from "@/lib/motion";
 import type { SettingsTab } from "@/screens/Settings";
 
 /** Something transcribing, summarizing or sending needs, and the settings tab that fixes it. */
@@ -47,10 +48,7 @@ const ITEM = "flex items-center gap-1 not-first:before:mr-1 not-first:before:tex
 function nameOf(m: MeetingItem) {
   if (m.title) return m.title;
   if (m.status === "recording" && !m.interrupted) return "녹음 중인 회의";
-  if (!m.duration_ms) return "제목 없는 녹음";
-  const min = Math.floor(m.duration_ms / 60_000);
-  const length = min >= 60 ? `${Math.floor(min / 60)}시간${min % 60 ? ` ${min % 60}분` : ""}` : min ? `${min}분` : "1분 미만";
-  return `${length} 녹음`;
+  return m.duration_ms ? `${lengthText(m.duration_ms)} 녹음` : "제목 없는 녹음";
 }
 
 /** "지금 할 일" (design-system 6.4): recording, in line, ready for review, failed, or left behind by
@@ -143,7 +141,7 @@ function stateOf(m: MeetingItem, p: Progress | undefined, name: string): State {
     return {
       mark: <CircleAlert aria-hidden className="size-4 text-danger-line" />,
       text: STATUS_LABEL[m.status],
-      // The full error is on the processing screen.
+      // The full error is in the meeting's document.
       note: m.error ?? (m.status === "transcribe_failed" ? "전사하지 못했습니다" : "요약하지 못했습니다"),
     };
   }
@@ -155,6 +153,8 @@ function Row({
   progress: p,
   day,
   action,
+  morph,
+  onPress,
   onOpen,
   children,
 }: {
@@ -162,9 +162,14 @@ function Row({
   progress?: Progress;
   /** Set in "지금 할 일" for a meeting from another day. */
   day: string | null;
-  action: { label: string; run: () => void } | null;
+  /** `opens`: it opens the meeting, so pressing it may start the title's glide. */
+  action: { label: string; run: (e: MouseEvent) => void; opens?: boolean } | null;
+  /** Its title glides to or from its document (design-system 6.1). */
+  morph: boolean;
+  /** A pointer went down on something that opens it. */
+  onPress: () => void;
   /** Opens the meeting; an interrupted recording has nothing to open. */
-  onOpen?: () => void;
+  onOpen?: (e: MouseEvent) => void;
   /** More buttons after the action (an interrupted recording's 삭제). */
   children?: ReactNode;
 }) {
@@ -178,12 +183,17 @@ function Row({
         {day && <span className="block text-caption text-ink-2">{day}</span>}
       </span>
       <span className="min-w-0 flex-1">
-        {/* Its own element, so the shared title morph (phase 2) can wrap it in a `layoutId`. */}
-        <span
+        {/* Its own box, gliding by position only, so the glyphs never stretch. Motion reads
+            `layoutId` once, when the element is made, so a new one is made when it changes. */}
+        <motion.span
+          key={String(morph)}
+          layoutId={morph ? `title-${m.id}` : undefined}
+          layout={morph ? "position" : undefined}
+          transition={titleMove}
           className={`block truncate font-display text-[1.125rem] leading-snug font-medium ${m.title ? "" : "text-ink-2"}`}
         >
           {name}
-        </span>
+        </motion.span>
         {state.note && <span className="block truncate text-label text-ink-2">{state.note}</span>}
       </span>
       <span className="flex shrink-0 items-center gap-2 text-label text-ink-2 tabular-nums">
@@ -200,6 +210,7 @@ function Row({
         // note open the meeting too, without nesting the action in the button.
         <button
           className="flex min-w-0 flex-1 items-center gap-4 py-2.5 text-left outline-hidden after:absolute after:inset-0 focus-visible:after:ring-2 focus-visible:after:ring-ring focus-visible:after:ring-inset"
+          onPointerDown={onPress}
           onClick={onOpen}
         >
           {body}
@@ -213,6 +224,7 @@ function Row({
           size="sm"
           className="relative"
           aria-label={`${action.label} (${name})`}
+          onPointerDown={action.opens ? onPress : undefined}
           onClick={action.run}
         >
           {action.label}
@@ -233,6 +245,7 @@ export default function Home({
   progress,
   recording,
   starting,
+  morphFrom,
   onChanged,
   onOpen,
   onRecord,
@@ -247,8 +260,11 @@ export default function Home({
   recording: boolean;
   /** A start was asked and the list does not show the recording yet. */
   starting: boolean;
+  /** The meeting just left by a click: its title glides back into its row. */
+  morphFrom?: string | null;
   onChanged: () => void;
-  onOpen: (meeting: MeetingItem) => void;
+  /** `keyboard`: a key pressed the button, so nothing moves (design-system 5). */
+  onOpen: (meeting: MeetingItem, keyboard: boolean) => void;
   /** To the recording screen. */
   onRecord: () => void;
   /** Starts a recording (App.tsx, which also listens for ⌘R). */
@@ -269,6 +285,21 @@ export default function Home({
   useEffect(() => {
     opened = true;
   }, []);
+  // The one row whose title shares its document's `layoutId`: the one pressed (a key never presses
+  // one), or the meeting come back from. Only on an unscrolled page: App scrolls a new screen to
+  // its top, and the title would fly from where the row no longer is.
+  const [morph, setMorph] = useState(morphFrom ?? null);
+  // A Home coming back while still on its way out keeps its state: the meeting come back from takes
+  // the row, and the window starts again.
+  useEffect(() => {
+    if (morphFrom) setMorph(morphFrom);
+  }, [morphFrom]);
+  useEffect(() => {
+    if (!morph) return;
+    // ponytail: let go after the glide, so the row never glides again when it moves to another group.
+    const t = window.setTimeout(() => setMorph(null), TITLE_GLIDE_MS);
+    return () => window.clearTimeout(t);
+  }, [morph, morphFrom]);
 
   const checkModel = () =>
     modelStatus()
@@ -419,10 +450,14 @@ export default function Home({
     if (m.status === "recording") return { label: "녹음 화면으로", run: onRecord };
     // In line or running: it needs nothing from the recorder. A retried failure waits too.
     if (phase(m, p)) return null;
-    if (m.status === "review") return { label: "검토하기", run: () => onOpen(m) };
+    if (m.status === "review") {
+      return { label: "검토하기", run: (e: MouseEvent) => onOpen(m, e.detail === 0), opens: true };
+    }
     if (m.status === "transcribe_failed") return { label: "다시 시도", run: () => resume(m.id) };
-    // 요약 다시 실행 picks a connection (SUM-07), so it opens the processing screen.
-    if (m.status === "summarize_failed") return { label: "요약 다시 실행", run: () => onOpen(m) };
+    // 요약 다시 실행 picks a connection (SUM-07), so it opens the meeting's document.
+    if (m.status === "summarize_failed") {
+      return { label: "요약 다시 실행", run: (e: MouseEvent) => onOpen(m, e.detail === 0), opens: true };
+    }
     return null;
   };
   const row = (m: MeetingItem, now: boolean) => (
@@ -432,7 +467,9 @@ export default function Home({
       progress={progress[m.id]}
       day={now ? shortDay(new Date(m.created_at), today) : null}
       action={actionOf(m, progress[m.id])}
-      onOpen={m.interrupted ? undefined : () => onOpen(m)}
+      morph={morph === m.id}
+      onPress={() => !m.interrupted && !window.scrollY && setMorph(m.id)}
+      onOpen={m.interrupted ? undefined : (e) => onOpen(m, e.detail === 0)}
     >
       {m.interrupted && (
         <DeleteButton

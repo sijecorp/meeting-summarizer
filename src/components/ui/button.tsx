@@ -4,8 +4,9 @@ import { cn } from "@/lib/utils"
 import { Slot } from "radix-ui"
 
 const buttonVariants = cva(
-  // Focus: the global 2px ring (theme.css). Press: a 120ms shrink, transform only.
-  "group/button inline-flex shrink-0 items-center justify-center rounded-control border border-transparent bg-clip-padding text-body font-semibold whitespace-nowrap select-none motion-safe:transition-transform motion-safe:duration-120 motion-safe:ease-out motion-safe:active:not-aria-[haspopup]:scale-[0.97] disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+  // Focus: the global 2px ring (theme.css). Press: a 120ms shrink, transform only, never on a
+  // button that cannot be pressed (`aria-disabled`, which keeps focus where `disabled` drops it).
+  "group/button inline-flex shrink-0 items-center justify-center rounded-control border border-transparent bg-clip-padding text-body font-semibold whitespace-nowrap select-none motion-safe:transition-transform motion-safe:duration-120 motion-safe:ease-out motion-safe:active:not-aria-[haspopup]:not-aria-disabled:scale-[0.97] disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
   {
     variants: {
       variant: {

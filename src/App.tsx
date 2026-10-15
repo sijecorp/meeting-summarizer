@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent } from "react";
 import { Settings as SettingsIcon } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { Banner, Bars, phase, Present, WIDTH, withModifier } from "@/components/common";
@@ -36,23 +36,20 @@ import {
   type Status,
 } from "@/lib/ipc";
 import Home from "@/screens/Home";
-import Processing from "@/screens/Processing";
+import Meeting from "@/screens/Meeting";
 import Recording from "@/screens/Recording";
-import Review from "@/screens/Review";
 import Settings, { type SettingsTab } from "@/screens/Settings";
 
-// Five screens, no router: one piece of state (architecture 3, 10.1). Always opens on Home.
+// Four screens, no router: one piece of state (architecture 3, 10.1). Always opens on Home.
+// `glided`: the meeting's title glided in from its Home row, so it may glide back (design-system 6.1).
 type Screen =
   | { name: "home" | "recording" }
   | { name: "settings"; tab?: SettingsTab }
-  | { name: "processing" | "review"; id: string };
+  | { name: "meeting"; id: string; glided?: boolean };
 
-const REVIEWABLE: Status[] = ["review", "sent", "archived"];
-/** A meeting's own screen, from where it is now. */
-const screenOf = (m: Meta): Screen =>
-  m.status === "recording"
-    ? { name: "recording" }
-    : { name: REVIEWABLE.includes(m.status) ? "review" : "processing", id: m.id };
+/** A meeting's own screen: the recording one while it records, else its document. */
+const screenOf = (m: Meta, glided = false): Screen =>
+  m.status === "recording" ? { name: "recording" } : { name: "meeting", id: m.id, glided };
 // Every app banner enters, shows and leaves alike.
 const BANNER = { variants: bannerVariants, initial: "enter", animate: "show", exit: "exit" };
 // Where a shortcut never fires: typing, or a dialog asking something.
@@ -65,9 +62,13 @@ export default function App() {
   // change comes first takes it: a stop's own reply or its `recording://stopped`.
   const byKey = useRef(false);
   const [instant, setInstant] = useState(false);
-  const go = (next: Screen | ((s: Screen) => Screen)) => {
-    setInstant(byKey.current);
+  // The meeting whose title glides back into its Home row (design-system 6.1).
+  const [from, setFrom] = useState<string | null>(null);
+  /** `keyboard`: a key pressed a button for it, which does not move either. */
+  const go = (next: Screen | ((s: Screen) => Screen), keyboard = false, back: string | null = null) => {
+    setInstant(byKey.current || keyboard);
     byKey.current = false;
+    setFrom(back);
     setScreen(next);
   };
   // Shared by the dock and Home, so both show the same list.
@@ -92,7 +93,17 @@ export default function App() {
     stopAsked.current = false;
     setStopping(false);
   };
-  const home = () => go({ name: "home" });
+  const home = (e?: MouseEvent) => go({ name: "home" }, e?.detail === 0);
+  /** Back from a meeting is always Home, and only while it is on screen: a meeting on its way out
+   * (an archive or delete that ends late) never moves the app. A click on an unscrolled page lets
+   * its title glide back into the row it came from; a scrolled one jumps to the top first, and a
+   * row it did not come from may be below the fold, so neither does. */
+  const leave = (id: string, e?: MouseEvent) =>
+    go(
+      (s) => (s.name === "meeting" && s.id === id ? { name: "home" } : s),
+      e?.detail === 0,
+      e && e.detail > 0 && !window.scrollY && screen.name === "meeting" && screen.glided ? id : null,
+    );
   const quitFailed = (e: unknown) => setQuitError(`종료하지 못했습니다: ${e}`);
 
   // Only the latest request may set the list: an older one can resolve after a newer one.
@@ -156,7 +167,7 @@ export default function App() {
       setStarting(false);
       setEnded(id);
       refresh();
-      go((s) => (s.name === "recording" ? { name: "processing", id } : s));
+      go((s) => (s.name === "recording" ? { name: "meeting", id } : s));
     });
     unlisten.catch((e) => setQuitError(`녹음 종료 알림을 준비하지 못했습니다: ${e}`));
     return () => {
@@ -213,10 +224,11 @@ export default function App() {
     .filter((m) => phase(m, progress[m.id]) === "waiting")
     .sort((a, b) => place(a) - place(b));
 
-  // Starting and stopping last until the list shows it, so the dock and Home never flick back.
+  // Starting and stopping last until the list shows it, so the dock and Home never flick back. A
+  // stop only ends with the recording: a list showing it start must not let a second click through.
   useEffect(() => {
     setStarting(false);
-    stopDone();
+    if (!recording) stopDone();
   }, [recording]);
   const start = () => {
     setStarting(true);
@@ -245,7 +257,7 @@ export default function App() {
         setStarting(false);
         // Nothing for the list to show: the recording had already ended.
         if (!id || !recording) stopDone();
-        go((s) => (s.name === "recording" ? (id ? { name: "processing", id } : { name: "home" }) : s));
+        go((s) => (s.name === "recording" ? (id ? { name: "meeting", id } : { name: "home" }) : s));
       },
       (e) => {
         byKey.current = false;
@@ -272,15 +284,26 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [recording, starting, ending]);
 
+  // Every screen opens at its top: a document opened from a scrolled Home starts with its title.
+  const key = "id" in screen ? `${screen.name}:${screen.id}` : screen.name;
+  useLayoutEffect(() => {
+    if (window.scrollY) window.scrollTo(0, 0);
+  }, [key]);
+  // The meeting's send bar goes here, above the dock.
+  const [barSlot, setBarSlot] = useState<HTMLElement | null>(null);
+
   const banners = [quitError, listError].filter(Boolean);
-  const width = WIDTH[screen.name === "settings" ? "wide" : screen.name === "review" ? "doc" : "home"];
+  const width = WIDTH[screen.name === "settings" ? "wide" : screen.name === "meeting" ? "doc" : "home"];
   // Forward from Home rises, back to Home sinks (design-system 6.1). Back always goes Home.
   const move: ScreenMove = { dir: screen.name === "home" ? -1 : 1, instant };
 
   return (
     <div className="min-h-screen">
       <header className="sticky top-0 z-10 flex h-12 items-center justify-between gap-4 border-b border-line bg-paper/92 px-6 backdrop-blur-md">
-        <button className="flex items-center gap-2 rounded-md font-display text-title" onClick={home}>
+        <button
+          className="flex items-center gap-2 rounded-md font-display text-title"
+          onClick={(e) => (screen.name === "meeting" ? leave(screen.id, e) : home(e))}
+        >
           {/* Still unless something is being transcribed or summarized. */}
           <Bars live={running.length > 0} className="h-3.5 text-brand" />
           회의 요약
@@ -318,7 +341,7 @@ export default function App() {
       <div className="relative pb-24">
         <AnimatePresence initial={false} mode="popLayout" custom={move}>
           <motion.div
-            key={"id" in screen ? `${screen.name}:${screen.id}` : screen.name}
+            key={key}
             layout="position"
             custom={move}
             variants={screenVariants}
@@ -335,8 +358,10 @@ export default function App() {
                   progress={progress}
                   recording={recording}
                   starting={starting}
+                  morphFrom={from}
                   onChanged={refresh}
-                  onOpen={(m) => go(screenOf(m))}
+                  // Home presses a row's title into its glide only by pointer on an unscrolled page.
+                  onOpen={(m, keyboard) => go(screenOf(m, !keyboard && !window.scrollY), keyboard)}
                   onRecord={() => go({ name: "recording" })}
                   onStart={start}
                   onSetup={(tab) => go({ name: "settings", tab })}
@@ -345,24 +370,14 @@ export default function App() {
               {screen.name === "recording" && (
                 <Recording startedAt={live?.created_at} stopping={ending} onHome={home} onStop={stop} />
               )}
-              {screen.name === "processing" && (
-                <Processing
+              {screen.name === "meeting" && (
+                <Meeting
                   key={screen.id}
                   id={screen.id}
+                  listed={meetings?.find((m) => m.id === screen.id)}
                   progress={progress[screen.id]}
-                  onHome={home}
-                  // Only from its own screen: one on its way out may still finish a read.
-                  onReview={(id) =>
-                    go((s) => (s.name === "processing" && s.id === id ? { name: "review", id } : s))
-                  }
-                  onSetup={(tab) => go({ name: "settings", tab })}
-                />
-              )}
-              {screen.name === "review" && (
-                <Review
-                  key={screen.id}
-                  id={screen.id}
-                  onHome={home}
+                  barSlot={barSlot}
+                  onHome={(e) => leave(screen.id, e)}
                   onNotice={setNotice}
                   onSetup={(tab) => go({ name: "settings", tab })}
                 />
@@ -373,19 +388,27 @@ export default function App() {
         </AnimatePresence>
       </div>
 
-      {/* From the first list on: the dock only says what changed after that. */}
-      {meetings && (
-        <Dock
-          live={live}
-          stopping={ending}
-          queue={[...running, ...waiting]}
-          progress={progress}
-          hidden={screen.name === "recording"}
-          onRecording={() => go({ name: "recording" })}
-          onStop={stop}
-          onOpen={(m) => go(screenOf(m))}
-        />
-      )}
+      {/* One stack at the bottom (design-system 6.2): a meeting's send bar, then the dock. A fixed
+          container needs `layoutRoot` for the layout animations in it to measure right. */}
+      <motion.div
+        layoutRoot
+        className="pointer-events-none fixed inset-x-0 bottom-6 z-20 flex flex-col items-center gap-3 px-4"
+      >
+        <div ref={setBarSlot} className="contents" />
+        {/* From the first list on: the dock only says what changed after that. */}
+        {meetings && (
+          <Dock
+            live={live}
+            stopping={ending}
+            queue={[...running, ...waiting]}
+            progress={progress}
+            hidden={screen.name === "recording"}
+            onRecording={(keyboard) => go({ name: "recording" }, keyboard)}
+            onStop={stop}
+            onOpen={(m, keyboard) => go(screenOf(m), keyboard)}
+          />
+        )}
+      </motion.div>
 
       <AlertDialog open={quitAsked} onOpenChange={setQuitAsked}>
         <AlertDialogContent>

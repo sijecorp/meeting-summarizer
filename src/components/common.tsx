@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowLeft, CircleAlert, Info, Trash2, TriangleAlert, X } from "lucide-react";
-import { AnimatePresence, motion, useIsPresent } from "motion/react";
+import { AnimatePresence, motion, useIsPresent, useReducedMotion, useSpring } from "motion/react";
 import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -13,9 +13,7 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Progress as ProgressBar } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -98,9 +96,6 @@ export function Bars({ live, className = "" }: { live: boolean; className?: stri
   );
 }
 
-/** What a badge shows moving (design-system 6.4). */
-export type BadgeKind = "recording" | "transcribing" | "summarizing" | "waiting";
-
 /** Three dots taking turns: waiting in line. */
 export function Dots() {
   return (
@@ -121,53 +116,47 @@ export function Dots() {
 export const SHIMMER =
   "relative isolate overflow-hidden after:pointer-events-none after:absolute after:inset-0 after:-z-10 after:-translate-x-full after:bg-linear-to-r after:from-transparent after:via-surface/70 after:to-transparent motion-safe:after:animate-shimmer";
 
-/** One look for a status in the meeting list, on the processing screen and in the app header. A
- * state that is happening moves, and its words always say it too: never color or motion alone. */
-export function StatusBadge({ kind, children }: { kind?: BadgeKind; children: ReactNode }) {
-  return (
-    <Badge variant="secondary" className={kind === "summarizing" ? SHIMMER : undefined}>
-      {kind === "recording" && <span aria-hidden className="size-2 rounded-full bg-rec motion-safe:animate-breathe" />}
-      {kind === "transcribing" && <Bars live className="h-3 text-brand" />}
-      {kind === "waiting" && <Dots />}
-      {children}
-    </Badge>
-  );
-}
-
 const RUNNING: Status[] = ["transcribing", "summarizing"];
 // A meeting also waits while it has a place in line: a retried `transcribe_failed` or
 // `summarize_failed` one, and a `transcribed` one waiting for its summary (APP-07). Without a place,
 // `transcribed` is where a meeting stops when there is no LLM connection.
 const WAITING: Status[] = ["recorded", "paused"];
 
-/** Running, waiting or neither. The header chip, Home and the processing screen all ask this, so
- * the chip's "처리 중 N · 대기 M" always matches the badges. */
+/** Running, waiting or neither. The dock, Home and the meeting document all ask this, so the dock's
+ * "처리 중 N" always matches the rows. */
 export function phase(meta: Meta, progress: Progress | undefined) {
   // A meeting from a newer app version is read-only and never runs here (like `busy_ids`).
   if (meta.schema_version > SCHEMA_VERSION) return null;
-  if (RUNNING.includes(meta.status)) return "running";
+  // An event saying it runs wins over the list: between transcribing and summarizing the list can
+  // read `transcribed`, and the dock must not drop the meeting for that moment.
+  if (RUNNING.includes(meta.status) || (progress && RUNNING.includes(progress.status))) return "running";
   if (progress?.position != null || WAITING.includes(meta.status)) return "waiting";
   return null;
-}
-
-/** A meeting's badge, by the same reading as `phase`. */
-export function badgeKind(meta: Meta, progress: Progress | undefined): BadgeKind | undefined {
-  const now = phase(meta, progress);
-  return meta.status === "recording"
-    ? "recording"
-    : now === "waiting"
-      ? "waiting"
-      : now === "running"
-        ? meta.status === "summarizing"
-          ? "summarizing"
-          : "transcribing"
-        : undefined;
 }
 
 /** A waiting meeting shows its place in line instead of its stored status. */
 export function statusLabel(meta: Meta, progress: Progress | undefined) {
   if (phase(meta, progress) !== "waiting") return STATUS_LABEL[meta.status] ?? meta.status;
   return progress?.position ? `대기 중 · ${progress.position}번째` : "대기 중";
+}
+
+/** A spring following `target` that is drawn straight from its MotionValue, never a render per
+ * frame. Reduce Motion does not slow a MotionValue by itself, so it jumps then. */
+export function useFollow(target: number) {
+  const reduce = useReducedMotion();
+  const value = useSpring(target, { stiffness: 140, damping: 24 });
+  useEffect(() => {
+    if (reduce) value.jump(target);
+    else value.set(target);
+  }, [target, reduce]);
+  return value;
+}
+
+/** A recording's length: "42분", "1시간 15분", "1분 미만". */
+export function lengthText(ms: number) {
+  const min = Math.floor(ms / 60_000);
+  if (min >= 60) return `${Math.floor(min / 60)}시간${min % 60 ? ` ${min % 60}분` : ""}`;
+  return min ? `${min}분` : "1분 미만";
 }
 
 const pad = (n: number) => String(n).padStart(2, "0");
@@ -244,7 +233,8 @@ export function Kbd({ children, className = "" }: { children: string; className?
   );
 }
 
-function remaining(secs: number) {
+/** "약 3분 남음", "약 1시간 5분 남음". */
+export function remaining(secs: number) {
   const min = Math.max(1, Math.round(secs / 60));
   const parts = [min >= 60 && `${Math.floor(min / 60)}시간`, min % 60 && `${min % 60}분`];
   return `약 ${parts.filter(Boolean).join(" ")} 남음`;
@@ -252,9 +242,9 @@ function remaining(secs: number) {
 
 /** A running meeting's words and bar (TRN-01, APP-07), or null when its last event (its final
  * status, with the last step's counts) came before the meeting was read again: nothing runs then.
- * `detailed` adds "구간 2/5" while transcribing; a summary of more than one LLM request shows
- * "요청 2/5". `bar` is false when there is no value to show. */
-export function progressText(p: Progress, detailed?: boolean) {
+ * A summary of more than one LLM request shows "요청 2/5". `bar` is false when there is no value
+ * to show. */
+export function progressText(p: Progress) {
   if (p.status !== "transcribing" && p.status !== "summarizing") return null;
   // Until the chunk plan exists, `percent` is the planning's own; then it starts again from 0. A
   // summary plans nothing: with a single LLM request there is nothing to count, so no bar.
@@ -266,28 +256,9 @@ export function progressText(p: Progress, detailed?: boolean) {
         .join(" · ")
     : planning
       ? "구간 나누는 중"
-      : [
-          detailed && `구간 ${Math.min(p.chunk + 1, p.chunks)}/${p.chunks}`,
-          `${p.percent}%`,
-          p.eta_secs != null && remaining(p.eta_secs),
-        ]
-          .filter(Boolean)
-          .join(" · ");
+      : [`${p.percent}%`, p.eta_secs != null && remaining(p.eta_secs)].filter(Boolean).join(" · ");
   const label = summarizing ? "요약 진행률" : planning ? "구간 나누기 진행률" : "전사 진행률";
   return { text, label, bar: !summarizing || p.chunks > 1 };
-}
-
-/** A running meeting's line with its bar. Plain text and no live region, so a screen reader is not
- * told every tick. */
-export function ProcessProgress({ progress: p, detailed }: { progress: Progress; detailed?: boolean }) {
-  const line = progressText(p, detailed);
-  if (!line) return null;
-  return (
-    <div className="grid gap-1.5">
-      {line.bar && <ProgressBar value={p.percent} aria-label={line.label} />}
-      <span className="text-sm text-muted-foreground tabular-nums">{line.text}</span>
-    </div>
-  );
 }
 
 /** A transcript with `mm:ss` times. Plain text nodes only (architecture 10.4). */
@@ -313,7 +284,7 @@ export const host = (url: string) => (URL.canParse(url) ? new URL(url).host : ur
 
 /** SUM-07 where the transcript goes for its summary, and SUM-08 "로컬로 요약" until summarizing
  * starts (`locked`). Read again when `status` changes. Once locked it shows only while
- * `summarizing`; then the review screen says where the transcript went. */
+ * `summarizing`; then the meeting document's meta line says where the transcript went. */
 export function RouteNotice({ id, status, center }: { id: string; status?: Status; center?: boolean }) {
   const [route, setRoute] = useState<SummaryRoute | null>(null);
   const [busy, setBusy] = useState(false);
@@ -447,32 +418,29 @@ export function SelectField({
   );
 }
 
-/** Confirmed in a dialog so a single misclick never removes a meeting (REV-04). */
-export function DeleteButton({
+/** REV-04's confirmation, opened by its `children` (a trigger) or by `open`, e.g. from a menu. */
+export function DeleteDialog({
   id,
-  disabled,
-  size,
-  label,
+  open,
+  onOpenChange,
+  onCloseAutoFocus,
   onDeleted,
   onError,
+  children,
 }: {
   id: string;
-  disabled?: boolean;
-  size?: "sm";
-  /** The name when "삭제" alone would not say which meeting. */
-  label?: string;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  /** Where focus goes back when it was opened without a trigger. */
+  onCloseAutoFocus?: (event: Event) => void;
   onDeleted: () => void;
   onError: (message: string) => void;
+  children?: ReactNode;
 }) {
   return (
-    <AlertDialog>
-      <AlertDialogTrigger asChild>
-        <Button variant="outline" size={size} disabled={disabled} aria-label={label}>
-          <Trash2 aria-hidden />
-          삭제
-        </Button>
-      </AlertDialogTrigger>
-      <AlertDialogContent>
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
+      {children && <AlertDialogTrigger asChild>{children}</AlertDialogTrigger>}
+      <AlertDialogContent onCloseAutoFocus={onCloseAutoFocus}>
         <AlertDialogHeader>
           <AlertDialogTitle>회의를 삭제할까요?</AlertDialogTitle>
           <AlertDialogDescription>녹음과 결과를 모두 지웁니다. 되돌릴 수 없습니다.</AlertDialogDescription>
@@ -492,5 +460,32 @@ export function DeleteButton({
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
+  );
+}
+
+/** Confirmed in a dialog so a single misclick never removes a meeting (REV-04). */
+export function DeleteButton({
+  id,
+  disabled,
+  size,
+  label,
+  onDeleted,
+  onError,
+}: {
+  id: string;
+  disabled?: boolean;
+  size?: "sm";
+  /** The name when "삭제" alone would not say which meeting. */
+  label?: string;
+  onDeleted: () => void;
+  onError: (message: string) => void;
+}) {
+  return (
+    <DeleteDialog id={id} onDeleted={onDeleted} onError={onError}>
+      <Button variant="outline" size={size} disabled={disabled} aria-label={label}>
+        <Trash2 aria-hidden />
+        삭제
+      </Button>
+    </DeleteDialog>
   );
 }
