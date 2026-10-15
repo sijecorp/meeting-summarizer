@@ -23,19 +23,36 @@ export const ease = {
 /** An exit takes 65% of its entrance. */
 export const exitDur = (enter: number) => enter * 0.65;
 
-/** Between list rows appearing. */
-export const stagger = 0.035;
+/** A screen change: `dir` 1 forward from Home (the new screen rises from 8px below, the old one
+ * drifts up), -1 back to Home (the reverse). `instant` when a shortcut caused it: actions from the
+ * keyboard do not move (design-system 5). */
+export type ScreenMove = { dir: 1 | -1; instant: boolean };
+const now = { duration: 0 };
 
-/** Screens. `custom` is the direction: 1 forward (a new screen rises from 8px below, the old one
- * drifts up), -1 back to Home (the reverse). */
+/** Screens, with a `ScreenMove` as `custom`. */
 export const screenVariants: Variants = {
-  enter: (dir: number) => ({ opacity: 0, y: 8 * dir }),
-  show: { opacity: 1, y: 0, transition: { duration: dur.medium, ease: ease.out } },
-  exit: (dir: number) => ({
+  enter: ({ dir }: ScreenMove) => ({ opacity: 0, y: 8 * dir }),
+  show: ({ instant }: ScreenMove) => ({
+    opacity: 1,
+    y: 0,
+    transition: instant ? now : { duration: dur.medium, ease: ease.out },
+  }),
+  exit: ({ dir, instant }: ScreenMove) => ({
     opacity: 0,
     y: -8 * dir,
-    transition: { duration: exitDur(dur.medium), ease: ease.in },
+    transition: instant ? now : { duration: exitDur(dur.medium), ease: ease.in },
   }),
+};
+
+/** A list whose rows rise in one after another, 35ms apart. Only the first eight wait their turn
+ * (280ms): a long list must not keep its last rows out for seconds (300ms on daily screens). */
+export const listVariants: Variants = {
+  hidden: {},
+  show: { transition: { delayChildren: (i: number) => Math.min(i, 8) * 0.035 } },
+};
+export const rowVariants: Variants = {
+  hidden: { opacity: 0, y: 6 },
+  show: { opacity: 1, y: 0, transition: { duration: dur.small, ease: ease.out } },
 };
 
 /** App banners: they fade in place while `layout` moves what is around them. */

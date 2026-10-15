@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowLeft, CircleAlert, Info, Trash2, TriangleAlert, X } from "lucide-react";
+import { AnimatePresence, motion, useIsPresent } from "motion/react";
 import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -29,6 +30,18 @@ import {
   type Status,
   type SummaryRoute,
 } from "@/lib/ipc";
+import { dur, ease } from "@/lib/motion";
+import { josa } from "@/lib/utils";
+
+/** Something on its way out (a screen, a banner, the dock's last shape) stays mounted for its exit:
+ * out of the tab order, the accessibility tree and hit-testing meanwhile. */
+export function Present({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <div inert={!useIsPresent()} className={className}>
+      {children}
+    </div>
+  );
+}
 
 /** Body widths (design-system 4): the review document, Home's timeline (and the screens without
  * their own), settings. With `box-content` the side padding sits outside, so text gets all of it. */
@@ -88,10 +101,25 @@ export function Bars({ live, className = "" }: { live: boolean; className?: stri
 /** What a badge shows moving (design-system 6.4). */
 export type BadgeKind = "recording" | "transcribing" | "summarizing" | "waiting";
 
+/** Three dots taking turns: waiting in line. */
+export function Dots() {
+  return (
+    <span aria-hidden className="flex gap-[3px]">
+      {[0, 1, 2].map((i) => (
+        <span
+          key={i}
+          className="size-1 rounded-full bg-ink-2 motion-safe:animate-dot"
+          style={{ animationDelay: `${i * 0.2}s` }}
+        />
+      ))}
+    </span>
+  );
+}
+
 // The sweep starts out of sight and only moves without Reduce Motion. It passes under the text
-// (`isolate` + `-z-10`), so the words keep their contrast.
-const SHIMMER =
-  "relative isolate after:pointer-events-none after:absolute after:inset-0 after:-z-10 after:-translate-x-full after:bg-linear-to-r after:from-transparent after:via-surface/70 after:to-transparent motion-safe:after:animate-shimmer";
+// (`isolate` + `-z-10`), so the words keep their contrast, and never past their box (`overflow-hidden`).
+export const SHIMMER =
+  "relative isolate overflow-hidden after:pointer-events-none after:absolute after:inset-0 after:-z-10 after:-translate-x-full after:bg-linear-to-r after:from-transparent after:via-surface/70 after:to-transparent motion-safe:after:animate-shimmer";
 
 /** One look for a status in the meeting list, on the processing screen and in the app header. A
  * state that is happening moves, and its words always say it too: never color or motion alone. */
@@ -100,17 +128,7 @@ export function StatusBadge({ kind, children }: { kind?: BadgeKind; children: Re
     <Badge variant="secondary" className={kind === "summarizing" ? SHIMMER : undefined}>
       {kind === "recording" && <span aria-hidden className="size-2 rounded-full bg-rec motion-safe:animate-breathe" />}
       {kind === "transcribing" && <Bars live className="h-3 text-brand" />}
-      {kind === "waiting" && (
-        <span aria-hidden className="flex gap-[3px]">
-          {[0, 1, 2].map((i) => (
-            <span
-              key={i}
-              className="size-1 rounded-full bg-ink-2 motion-safe:animate-dot"
-              style={{ animationDelay: `${i * 0.2}s` }}
-            />
-          ))}
-        </span>
-      )}
+      {kind === "waiting" && <Dots />}
       {children}
     </Badge>
   );
@@ -158,6 +176,73 @@ export const mmss = (ms: number) => {
   const s = Math.floor(ms / 1000);
   return `${pad(Math.floor(s / 60))}:${pad(s % 60)}`;
 };
+/** A running time: 12:43 under an hour, then 1:02:03. */
+export const clock = (s: number) =>
+  s < 3600
+    ? `${pad(Math.floor(s / 60))}:${pad(s % 60)}`
+    : `${Math.floor(s / 3600)}:${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}`;
+
+/** The local wall-clock time of a stored timestamp, "14:05". */
+export const hhmm = (iso: string) => {
+  const d = new Date(iso);
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
+
+/** Seconds since a recording started, read from its meeting until the first level event says. */
+export const sinceStart = (iso?: string) =>
+  iso ? Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 1000)) : 0;
+
+/** A time whose digits roll as they change (design-system 6.3): 200ms, `ease.out`. Screen readers
+ * get the plain text, never the digits on their way out. Pretendard's fixed-width digits, so nothing
+ * beside it shifts. */
+export function RollingTime({ text, className = "" }: { text: string; className?: string }) {
+  return (
+    <span className={`tabular-nums ${className}`}>
+      <span className="sr-only">{text}</span>
+      <span aria-hidden className="inline-flex">
+        {[...text].map((c, i) =>
+          /\d/.test(c) ? (
+            <span key={i} className="relative inline-block overflow-hidden">
+              <AnimatePresence mode="popLayout" initial={false}>
+                <motion.span
+                  key={c}
+                  className="inline-block"
+                  initial={{ y: "-60%", opacity: 0 }}
+                  animate={{ y: 0, opacity: 1 }}
+                  exit={{ y: "60%", opacity: 0 }}
+                  transition={{ duration: dur.small, ease: ease.out }}
+                >
+                  {c}
+                </motion.span>
+              </AnimatePresence>
+            </span>
+          ) : (
+            <span key={i}>{c}</span>
+          ),
+        )}
+      </span>
+    </span>
+  );
+}
+
+const MAC = navigator.userAgent.includes("Mac");
+/** The modifier shortcuts use here: ⌘ on macOS, Ctrl elsewhere. */
+export const withModifier = (e: KeyboardEvent) => (MAC ? e.metaKey : e.ctrlKey);
+const shortcut = (key: string) => ({
+  label: MAC ? `⌘${key}` : `Ctrl+${key}`,
+  aria: `${MAC ? "Meta" : "Control"}+${key}`,
+});
+/** Recording's two shortcuts (App.tsx listens), as each button shows and names them. */
+export const SHORTCUT = { start: shortcut("R"), stop: shortcut(".") };
+
+/** A shortcut hint on a button. Hidden from screen readers: the button's `aria-keyshortcuts` says it. */
+export function Kbd({ children, className = "" }: { children: string; className?: string }) {
+  return (
+    <kbd aria-hidden className={`font-sans text-caption tracking-normal opacity-70 ${className}`}>
+      {children}
+    </kbd>
+  );
+}
 
 function remaining(secs: number) {
   const min = Math.max(1, Math.round(secs / 60));
@@ -165,21 +250,11 @@ function remaining(secs: number) {
   return `약 ${parts.filter(Boolean).join(" ")} 남음`;
 }
 
-/** A running meeting's line, with its bar when there is a value to show (TRN-01, APP-07).
+/** A running meeting's words and bar (TRN-01, APP-07), or null when its last event (its final
+ * status, with the last step's counts) came before the meeting was read again: nothing runs then.
  * `detailed` adds "구간 2/5" while transcribing; a summary of more than one LLM request shows
- * "요청 2/5". `name` tells one bar from another in a list. Plain text and no live region, so a
- * screen reader is not told every tick. */
-export function ProcessProgress({
-  progress: p,
-  detailed,
-  name,
-}: {
-  progress: Progress;
-  detailed?: boolean;
-  name?: string;
-}) {
-  // A meeting's last event (its final status, with the last step's counts) can come before the
-  // meeting is read again: there is nothing running to show for it.
+ * "요청 2/5". `bar` is false when there is no value to show. */
+export function progressText(p: Progress, detailed?: boolean) {
   if (p.status !== "transcribing" && p.status !== "summarizing") return null;
   // Until the chunk plan exists, `percent` is the planning's own; then it starts again from 0. A
   // summary plans nothing: with a single LLM request there is nothing to count, so no bar.
@@ -199,12 +274,18 @@ export function ProcessProgress({
           .filter(Boolean)
           .join(" · ");
   const label = summarizing ? "요약 진행률" : planning ? "구간 나누기 진행률" : "전사 진행률";
+  return { text, label, bar: !summarizing || p.chunks > 1 };
+}
+
+/** A running meeting's line with its bar. Plain text and no live region, so a screen reader is not
+ * told every tick. */
+export function ProcessProgress({ progress: p, detailed }: { progress: Progress; detailed?: boolean }) {
+  const line = progressText(p, detailed);
+  if (!line) return null;
   return (
     <div className="grid gap-1.5">
-      {(!summarizing || p.chunks > 1) && (
-        <ProgressBar value={p.percent} aria-label={`${label}${name ? ` (${name})` : ""}`} />
-      )}
-      <span className="text-sm text-muted-foreground tabular-nums">{text}</span>
+      {line.bar && <ProgressBar value={p.percent} aria-label={line.label} />}
+      <span className="text-sm text-muted-foreground tabular-nums">{line.text}</span>
     </div>
   );
 }
@@ -224,13 +305,16 @@ export function TranscriptList({ segments }: { segments: Segment[] }) {
   );
 }
 
+/** "으로" or "로" after a name: the particle follows the name, never a "(host)" after it. */
+export const ro = (word: string) => josa(word, "으로", "로");
+
 /** The host a connection sends to, for SUM-07 notices. */
 export const host = (url: string) => (URL.canParse(url) ? new URL(url).host : url);
 
 /** SUM-07 where the transcript goes for its summary, and SUM-08 "로컬로 요약" until summarizing
  * starts (`locked`). Read again when `status` changes. Once locked it shows only while
  * `summarizing`; then the review screen says where the transcript went. */
-export function RouteNotice({ id, status }: { id: string; status?: Status }) {
+export function RouteNotice({ id, status, center }: { id: string; status?: Status; center?: boolean }) {
   const [route, setRoute] = useState<SummaryRoute | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -262,19 +346,19 @@ export function RouteNotice({ id, status }: { id: string; status?: Status }) {
   const text = route.locked
     ? status === "summarizing" && c
       ? c.is_local
-        ? `이 PC의 ${c.name}(으)로 요약하고 있습니다`
-        : `전사본을 ${c.name}(${host(c.base_url)})(으)로 보내 요약하고 있습니다`
+        ? `이 PC의 ${c.name}${ro(c.name)} 요약하고 있습니다`
+        : `전사본을 ${c.name}(${host(c.base_url)})${ro(c.name)} 보내 요약하고 있습니다`
       : ""
     : c
       ? c.is_local
-        ? `이 PC의 ${c.name}(으)로 요약합니다. 전사본은 밖으로 나가지 않습니다`
-        : `요약할 때 전사본이 ${c.name}(${host(c.base_url)})(으)로 전송됩니다`
+        ? `이 PC의 ${c.name}${ro(c.name)} 요약합니다. 전사본은 밖으로 나가지 않습니다`
+        : `요약할 때 전사본이 ${c.name}(${host(c.base_url)})${ro(c.name)} 전송됩니다`
       : route.local
         ? "로컬 LLM 연결이 없습니다"
         : "LLM 연결이 없어 전사까지만 합니다";
   if (!text) return null;
   return (
-    <div className="space-y-2">
+    <div className={center ? "flex flex-col items-center gap-2 text-center" : "space-y-2"}>
       <p className="flex gap-2 text-sm text-muted-foreground">
         <Info aria-hidden className="mt-0.5 size-4 shrink-0" />
         {text}
@@ -367,18 +451,23 @@ export function SelectField({
 export function DeleteButton({
   id,
   disabled,
+  size,
+  label,
   onDeleted,
   onError,
 }: {
   id: string;
   disabled?: boolean;
+  size?: "sm";
+  /** The name when "삭제" alone would not say which meeting. */
+  label?: string;
   onDeleted: () => void;
   onError: (message: string) => void;
 }) {
   return (
     <AlertDialog>
       <AlertDialogTrigger asChild>
-        <Button variant="outline" disabled={disabled}>
+        <Button variant="outline" size={size} disabled={disabled} aria-label={label}>
           <Trash2 aria-hidden />
           삭제
         </Button>

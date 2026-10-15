@@ -1,17 +1,22 @@
-import { useEffect, useState } from "react";
-import { Mic } from "lucide-react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Check, CircleAlert, TriangleAlert } from "lucide-react";
+import { motion } from "motion/react";
 import {
-  badgeKind,
   Banner,
+  Bars,
   DeleteButton,
-  Page,
+  Dots,
+  hhmm,
+  Kbd,
   phase,
-  ProcessProgress,
-  StatusBadge,
+  progressText,
+  ro,
+  SHIMMER,
+  SHORTCUT,
   statusLabel,
 } from "@/components/common";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Progress as ProgressBar } from "@/components/ui/progress";
 import {
   getSettings,
   modelDownload,
@@ -19,55 +24,251 @@ import {
   modelStatus,
   onModelDownload,
   resumeMeeting,
+  SCHEMA_VERSION,
   startModelDownload,
-  startRecording,
+  STATUS_LABEL,
   type MeetingItem,
   type ModelDownload,
   type Progress,
+  type Status,
 } from "@/lib/ipc";
+import { listVariants, rowVariants } from "@/lib/motion";
 import type { SettingsTab } from "@/screens/Settings";
 
 /** Something transcribing, summarizing or sending needs, and the settings tab that fixes it. */
-type SetupItem = { text: string; action: string; tab: SettingsTab };
+type SetupItem = { text?: string; action: string; tab: SettingsTab };
 
-function Title({ meeting }: { meeting: MeetingItem }) {
-  return (
-    <span>
-      <span className="block font-medium">{meeting.title || "제목 없음"}</span>
-      <span className="text-muted-foreground">
-        {new Date(meeting.created_at).toLocaleString("ko-KR")}
+const FAILED: Status[] = ["transcribe_failed", "summarize_failed"];
+// A setup line item, after a dot when it is not the first.
+const ITEM = "flex items-center gap-1 not-first:before:mr-1 not-first:before:text-ink-2 not-first:before:content-['·']";
+
+/** A row's name: its title, or until the summary gives one, what it is ("42분 녹음"): a column of
+ * "제목 없음" says nothing. */
+function nameOf(m: MeetingItem) {
+  if (m.title) return m.title;
+  if (m.status === "recording" && !m.interrupted) return "녹음 중인 회의";
+  if (!m.duration_ms) return "제목 없는 녹음";
+  const min = Math.floor(m.duration_ms / 60_000);
+  const length = min >= 60 ? `${Math.floor(min / 60)}시간${min % 60 ? ` ${min % 60}분` : ""}` : min ? `${min}분` : "1분 미만";
+  return `${length} 녹음`;
+}
+
+/** "지금 할 일" (design-system 6.4): recording, in line, ready for review, failed, or left behind by
+ * a crash. A meeting from a newer app version is read-only here, so never. */
+const needsYou = (m: MeetingItem, p: Progress | undefined) =>
+  m.interrupted ||
+  (m.schema_version <= SCHEMA_VERSION &&
+    (m.status === "recording" || phase(m, p) !== null || m.status === "review" || FAILED.includes(m.status)));
+
+const sameDay = (a: Date, b: Date) => a.toDateString() === b.toDateString();
+const yesterdayOf = (today: Date) => new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+/** A date group's name: 오늘, 어제, else "10월 12일 일요일" (with the year when it is not this one). */
+function dayGroup(d: Date, today: Date) {
+  if (sameDay(d, today)) return "오늘";
+  if (sameDay(d, yesterdayOf(today))) return "어제";
+  return d.toLocaleDateString("ko-KR", {
+    year: d.getFullYear() === today.getFullYear() ? undefined : "numeric",
+    month: "long",
+    day: "numeric",
+    weekday: "long",
+  });
+}
+/** The day under a "지금 할 일" row's time when it is not today. */
+function shortDay(d: Date, today: Date) {
+  if (sameDay(d, today)) return null;
+  if (sameDay(d, yesterdayOf(today))) return "어제";
+  return `${d.getMonth() + 1}월 ${d.getDate()}일`;
+}
+
+/** The right side of a row: a mark that moves while something happens, and words that always say
+ * it too (never color or motion alone). `note` is one line under the title; `bar` a 1px line under
+ * the row. */
+type State = {
+  mark?: ReactNode;
+  text: string;
+  /** Before `text`, e.g. "전사" before "42% · 약 3분 남음". */
+  lead?: string;
+  shimmer?: boolean;
+  note?: string;
+  bar?: ReactNode;
+};
+function stateOf(m: MeetingItem, p: Progress | undefined, name: string): State {
+  if (m.interrupted) {
+    return {
+      mark: <TriangleAlert aria-hidden className="size-4 text-warn-line" />,
+      text: "중단된 녹음",
+      // STO-03: the WAV files hold what the last 5 s flush wrote.
+      note: "녹음 중에 앱이 꺼졌습니다. 마지막으로 저장된 곳까지 처리하거나 삭제할 수 있습니다",
+    };
+  }
+  if (m.schema_version > SCHEMA_VERSION) return { text: "새 버전 앱의 회의" };
+  const now = phase(m, p);
+  if (m.status === "recording") {
+    return {
+      mark: <span aria-hidden className="size-2 rounded-full bg-rec motion-safe:animate-breathe" />,
+      text: STATUS_LABEL.recording,
+    };
+  }
+  if (now === "running") {
+    const line = p && progressText(p);
+    // Events come before the list is read again: a summary's first one can meet a list that still
+    // says transcribing.
+    const summarizing = (p?.status === "summarizing" ? p.status : m.status) === "summarizing";
+    return {
+      mark: summarizing ? undefined : <Bars live className="h-3 text-brand" />,
+      text: line?.text ?? STATUS_LABEL[m.status],
+      // "전사 42% · 약 3분 남음": the percent alone would not say what it counts.
+      lead: p?.status === "transcribing" && p.chunks > 0 ? "전사" : undefined,
+      shimmer: summarizing,
+      bar: p && line?.bar && (
+        <ProgressBar
+          value={p.percent}
+          aria-label={`${line.label} (${name})`}
+          className="absolute inset-x-0 bottom-0 h-px rounded-none"
+        />
+      ),
+    };
+  }
+  if (now === "waiting") return { mark: <Dots />, text: statusLabel(m, p) };
+  if (m.status === "review") {
+    return { mark: <span aria-hidden className="size-2 rounded-full bg-brand" />, text: STATUS_LABEL.review };
+  }
+  if (m.status === "sent") {
+    return {
+      mark: <Check aria-hidden className="size-4 text-ok-line" />,
+      text: m.sent ? `${m.sent.channel}${ro(m.sent.channel)} 보냄` : STATUS_LABEL.sent,
+    };
+  }
+  if (FAILED.includes(m.status)) {
+    return {
+      mark: <CircleAlert aria-hidden className="size-4 text-danger-line" />,
+      text: STATUS_LABEL[m.status],
+      // The full error is on the processing screen.
+      note: m.error ?? (m.status === "transcribe_failed" ? "전사하지 못했습니다" : "요약하지 못했습니다"),
+    };
+  }
+  return { text: STATUS_LABEL[m.status] ?? m.status };
+}
+
+function Row({
+  meeting: m,
+  progress: p,
+  day,
+  action,
+  onOpen,
+  children,
+}: {
+  meeting: MeetingItem;
+  progress?: Progress;
+  /** Set in "지금 할 일" for a meeting from another day. */
+  day: string | null;
+  action: { label: string; run: () => void } | null;
+  /** Opens the meeting; an interrupted recording has nothing to open. */
+  onOpen?: () => void;
+  /** More buttons after the action (an interrupted recording's 삭제). */
+  children?: ReactNode;
+}) {
+  const name = nameOf(m);
+  const state = stateOf(m, p, name);
+  const body = (
+    <>
+      <span className="w-16 shrink-0 leading-tight">
+        {/* A time that never changes: Instrument Serif's italic numerals. */}
+        <span className="block font-display text-title text-ink-2 italic">{hhmm(m.created_at)}</span>
+        {day && <span className="block text-caption text-ink-2">{day}</span>}
       </span>
-    </span>
+      <span className="min-w-0 flex-1">
+        {/* Its own element, so the shared title morph (phase 2) can wrap it in a `layoutId`. */}
+        <span
+          className={`block truncate font-display text-[1.125rem] leading-snug font-medium ${m.title ? "" : "text-ink-2"}`}
+        >
+          {name}
+        </span>
+        {state.note && <span className="block truncate text-label text-ink-2">{state.note}</span>}
+      </span>
+      <span className="flex shrink-0 items-center gap-2 text-label text-ink-2 tabular-nums">
+        {state.mark}
+        {state.lead && <span>{state.lead}</span>}
+        <span className={state.shimmer ? SHIMMER : undefined}>{state.text}</span>
+      </span>
+    </>
+  );
+  return (
+    <motion.li variants={rowVariants} className="relative flex min-h-14 items-center gap-3 px-3 hover:bg-sunken">
+      {onOpen ? (
+        // The button stretches over the whole row (after:inset-0), so the progress line and the
+        // note open the meeting too, without nesting the action in the button.
+        <button
+          className="flex min-w-0 flex-1 items-center gap-4 py-2.5 text-left outline-hidden after:absolute after:inset-0 focus-visible:after:ring-2 focus-visible:after:ring-ring focus-visible:after:ring-inset"
+          onClick={onOpen}
+        >
+          {body}
+        </button>
+      ) : (
+        <div className="flex min-w-0 flex-1 items-center gap-4 py-2.5">{body}</div>
+      )}
+      {action && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="relative"
+          aria-label={`${action.label} (${name})`}
+          onClick={action.run}
+        >
+          {action.label}
+        </Button>
+      )}
+      {children}
+      {state.bar}
+    </motion.li>
   );
 }
 
+// The first Home of the app's run lets its rows rise in; later ones (and re-renders) stand still.
+let opened = false;
+
 export default function Home({
   meetings,
+  listFailed,
   progress,
   recording,
+  starting,
   onChanged,
   onOpen,
   onRecord,
+  onStart,
   onSetup,
 }: {
   meetings: MeetingItem[] | null;
+  /** The list could not be read: Home still offers recording. */
+  listFailed: boolean;
   progress: Record<string, Progress>;
   /** A recording is running: the main button goes back to it instead of starting another. */
   recording: boolean;
+  /** A start was asked and the list does not show the recording yet. */
+  starting: boolean;
   onChanged: () => void;
   onOpen: (meeting: MeetingItem) => void;
+  /** To the recording screen. */
   onRecord: () => void;
+  /** Starts a recording (App.tsx, which also listens for ⌘R). */
+  onStart: () => void;
   onSetup: (tab: SettingsTab) => void;
 }) {
   const [setup, setSetup] = useState<SetupItem[]>([]);
-  // The model row: a file is missing (or the check failed; the 전사 tab says why), or the shared
+  // The model item: a file is missing (or the check failed; the 전사 tab says why), or the shared
   // download (ipc.ts) is running, with its last `model://download`.
   const [noModel, setNoModel] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [received, setReceived] = useState<ModelDownload | null>(null);
   const [downloadFailed, setDownloadFailed] = useState(() => !!modelDownloadFailure());
   const [error, setError] = useState("");
-  const [starting, setStarting] = useState(false);
+  const first = useRef(!opened);
+  // Rows mounted after the first rise (one moving to another group) just appear.
+  const [entering, setEntering] = useState(first.current);
+  useEffect(() => {
+    opened = true;
+  }, []);
 
   const checkModel = () =>
     modelStatus()
@@ -87,7 +288,7 @@ export default function Home({
   };
 
   // Recording works without any of these. The model comes first: nothing is transcribed without
-  // it, so its row downloads right away (ONB-01); the 전사 tab has cancel, import and the mirror.
+  // it, so its item downloads right away (ONB-01); the 전사 tab has cancel, import and the mirror.
   useEffect(() => {
     checkModel();
     const unlisten = onModelDownload(setReceived);
@@ -98,16 +299,8 @@ export default function Home({
       .then(({ settings }) =>
         setSetup(
           [
-            !settings.llm_connections.length && {
-              text: "LLM 연결이 없습니다",
-              action: "LLM 연결하기",
-              tab: "llm" as const,
-            },
-            !settings.webhooks.length && {
-              text: "Slack 웹훅이 없습니다",
-              action: "웹훅 추가하기",
-              tab: "slack" as const,
-            },
+            !settings.llm_connections.length && { action: "LLM 연결", tab: "llm" as const },
+            !settings.webhooks.length && { action: "Slack 채널 연결", tab: "slack" as const },
           ].filter((item) => item !== false),
         ),
       )
@@ -120,160 +313,202 @@ export default function Home({
 
   const resume = (id: string) => resumeMeeting(id).then(onChanged, (e) => setError(String(e)));
 
-  const start = () => {
-    setStarting(true);
-    startRecording().then(onRecord, (e) => {
-      setError(String(e));
-      setStarting(false);
-    });
-  };
+  // One short line instead of a card (design-system 6.4): what transcribing, summarizing and sending
+  // still need, each item its own way there. The model downloads in place; its tab (cancel, import,
+  // the mirror) shows up as a quieter link while that matters.
+  const download = () => follow(startModelDownload());
+  const setupLine = (align: string) =>
+    (noModel || downloading || setup.length > 0) && (
+      <div className={`flex flex-wrap items-center gap-x-2 gap-y-1 text-label ${align}`}>
+        <span className="text-ink-2">요약까지 하려면</span>
+        <ul aria-label="남은 설정" className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          {(noModel || downloading) && (
+            <li className={ITEM}>
+              {downloading ? (
+                <span className="tabular-nums">
+                  {`전사 모델 받는 중 ${received ? Math.floor((received.received / received.total) * 100) : 0}%`}
+                </span>
+              ) : downloadFailed ? (
+                <>
+                  <span>전사 모델을 받지 못했습니다</span>
+                  <Button variant="link" size="xs" onClick={download}>
+                    다시 받기
+                  </Button>
+                </>
+              ) : (
+                <Button variant="link" size="xs" onClick={download}>
+                  전사 모델 받기
+                </Button>
+              )}
+              {(downloading || downloadFailed) && (
+                <Button variant="link" size="xs" className="text-ink-2 underline" onClick={() => onSetup("transcription")}>
+                  전사 설정
+                </Button>
+              )}
+            </li>
+          )}
+          {setup.map((item) => (
+            <li key={item.tab} className={ITEM}>
+              {item.text && <span>{item.text}</span>}
+              <Button variant="link" size="xs" onClick={() => onSetup(item.tab)}>
+                {item.action}
+              </Button>
+            </li>
+          ))}
+        </ul>
+      </div>
+    );
+  const errorBanner = error && <Banner kind="error">{error}</Banner>;
 
-  const interrupted = meetings?.filter((m) => m.interrupted) ?? [];
-  const listed = meetings?.filter((m) => !m.interrupted);
+  // The first screen (design-system 6.5): no meetings yet. Seen once, so it carries one flourish,
+  // the ring around the record button. No tour, no checklist: recording needs no setup.
+  if (meetings?.length === 0) {
+    return (
+      // Centered in the window under the header, clear of the dock's room (App.tsx `pb-24`).
+      <main className="mx-auto box-content flex min-h-[calc(100dvh-9rem)] max-w-home flex-col items-center justify-center gap-12 px-8 py-10 text-center">
+        {errorBanner}
+        <div className="space-y-4">
+          <h1 className="font-display text-display-l">
+            <span className="block">회의가 끝나면,</span> <span className="block">기록은 이미 와 있어요.</span>
+          </h1>
+          <p className="text-ink-2">녹음만 하면 이 PC에서 전사하고, 요약을 검토해 Slack으로 보냅니다.</p>
+        </div>
+        <button
+          className="group flex flex-col items-center gap-5 rounded-float p-3 disabled:opacity-50"
+          disabled={starting}
+          aria-keyshortcuts={SHORTCUT.start.aria}
+          onClick={onStart}
+        >
+          <span aria-hidden className="relative grid size-24 place-items-center">
+            <span className="absolute inset-0 rounded-full border border-ink/30 motion-safe:animate-ring" />
+            <span className="absolute inset-0 rounded-full border border-ink/30 [animation-delay:-1.4s] motion-safe:animate-ring" />
+            <span className="relative grid size-24 place-items-center rounded-full bg-ink motion-safe:transition-transform motion-safe:duration-200 motion-safe:group-hover:scale-[1.03] motion-safe:group-active:scale-[0.97]">
+              <span className="size-7 rounded-full bg-rec" />
+            </span>
+          </span>
+          <span className="flex items-center gap-2 font-semibold">
+            첫 회의 녹음하기
+            <Kbd>{SHORTCUT.start.label}</Kbd>
+          </span>
+        </button>
+        <ol className="flex flex-wrap items-baseline justify-center gap-x-2 gap-y-1 text-label text-ink-2">
+          {["녹음", "이 PC에서 전사", "요약 검토", "Slack으로 보내기"].map((step, i) => (
+            <li key={step} className="flex items-baseline gap-1.5">
+              {i > 0 && (
+                <span aria-hidden className="mr-0.5">
+                  —
+                </span>
+              )}
+              <span className="font-display text-title text-ink italic">{i + 1}</span>
+              {step}
+            </li>
+          ))}
+        </ol>
+        {setupLine("justify-center")}
+      </main>
+    );
+  }
+
+  // Until the list arrives there is nothing to show yet, unless it failed: recording still works.
+  if (!meetings && !listFailed) return <main aria-busy className="min-h-40" />;
+
+  const today = new Date();
+  const actionOf = (m: MeetingItem, p: Progress | undefined) => {
+    if (m.schema_version > SCHEMA_VERSION) return null;
+    if (m.interrupted) return { label: "처리 계속", run: () => resume(m.id) };
+    if (m.status === "recording") return { label: "녹음 화면으로", run: onRecord };
+    // In line or running: it needs nothing from the recorder. A retried failure waits too.
+    if (phase(m, p)) return null;
+    if (m.status === "review") return { label: "검토하기", run: () => onOpen(m) };
+    if (m.status === "transcribe_failed") return { label: "다시 시도", run: () => resume(m.id) };
+    // 요약 다시 실행 picks a connection (SUM-07), so it opens the processing screen.
+    if (m.status === "summarize_failed") return { label: "요약 다시 실행", run: () => onOpen(m) };
+    return null;
+  };
+  const row = (m: MeetingItem, now: boolean) => (
+    <Row
+      key={m.id}
+      meeting={m}
+      progress={progress[m.id]}
+      day={now ? shortDay(new Date(m.created_at), today) : null}
+      action={actionOf(m, progress[m.id])}
+      onOpen={m.interrupted ? undefined : () => onOpen(m)}
+    >
+      {m.interrupted && (
+        <DeleteButton
+          id={m.id}
+          size="sm"
+          label={`삭제 (${nameOf(m)})`}
+          onDeleted={onChanged}
+          onError={setError}
+        />
+      )}
+    </Row>
+  );
+
+  // Each meeting once: "지금 할 일" first, the rest by day (the list comes newest first).
+  const now = meetings?.filter((m) => needsYou(m, progress[m.id])) ?? [];
+  const days = new Map<string, MeetingItem[]>();
+  for (const m of meetings ?? []) {
+    if (needsYou(m, progress[m.id])) continue;
+    const day = dayGroup(new Date(m.created_at), today);
+    days.set(day, [...(days.get(day) ?? []), m]);
+  }
+  const groups = [
+    ...(now.length ? [{ name: "지금 할 일", rows: now, now: true }] : []),
+    ...[...days].map(([name, rows]) => ({ name, rows, now: false })),
+  ];
 
   return (
-    <Page
-      title="회의"
-      action={
-        <Button
-          size="lg"
-          className="h-11 px-6 text-base"
-          disabled={starting}
-          onClick={recording ? onRecord : start}
+    <main className="mx-auto box-content max-w-home space-y-10 px-8 pt-10 pb-8">
+      <div className="space-y-4">
+        <header className="flex flex-wrap items-center justify-between gap-4">
+          <h1 className="font-display text-display-m">
+            {today.toLocaleDateString("ko-KR", { month: "long", day: "numeric" })}{" "}
+            <span className="font-display text-title text-ink-2">
+              {today.toLocaleDateString("ko-KR", { weekday: "long" })}
+            </span>
+          </h1>
+          <Button
+            variant="ink"
+            className="h-10 rounded-full pr-4 pl-3.5"
+            disabled={starting}
+            aria-keyshortcuts={recording ? undefined : SHORTCUT.start.aria}
+            onClick={recording ? onRecord : onStart}
+          >
+            <span aria-hidden className={`size-2 rounded-full bg-rec ${recording ? "motion-safe:animate-breathe" : ""}`} />
+            {recording ? "녹음 화면으로" : "녹음 시작"}
+            {!recording && <Kbd className="ml-1">{SHORTCUT.start.label}</Kbd>}
+          </Button>
+        </header>
+        {setupLine("justify-start")}
+        {errorBanner}
+      </div>
+
+      {meetings && (
+        <motion.div
+          variants={listVariants}
+          initial={entering ? "hidden" : false}
+          animate="show"
+          onAnimationComplete={() => setEntering(false)}
+          className="space-y-10"
         >
-          <Mic aria-hidden className="size-5" />
-          {recording ? "녹음 화면으로" : "녹음 시작"}
-        </Button>
-      }
-    >
-      {error && <Banner kind="error">{error}</Banner>}
-
-      {(noModel || downloading || setup.length > 0) && (
-        <Card className="gap-0 pb-0">
-          <CardHeader className="border-b">
-            <CardTitle>
-              <h2 className="font-bold">설정이 남아 있습니다</h2>
-            </CardTitle>
-            <CardDescription>
-              녹음은 지금 바로 할 수 있습니다. 전사하고 요약해 Slack으로 보내려면 아래 항목이
-              필요합니다.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="px-0">
-            <ul className="divide-y">
-              {(noModel || downloading) && (
-                <li className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-3">
-                  <span>
-                    {downloading
-                      ? `전사 모델을 받는 중 ${received ? Math.floor((received.received / received.total) * 100) : 0}%`
-                      : downloadFailed
-                        ? "전사 모델을 받지 못했습니다"
-                        : "전사 모델이 없습니다"}
-                  </span>
-                  <span className="flex items-center gap-2">
-                    <Button variant="link" onClick={() => onSetup("transcription")}>
-                      전사 설정
-                    </Button>
-                    {!downloading && (
-                      <Button variant="outline" onClick={() => follow(startModelDownload())}>
-                        모델 받기
-                      </Button>
-                    )}
-                  </span>
-                </li>
-              )}
-              {setup.map((item) => (
-                <li key={item.tab} className="flex items-center justify-between gap-4 px-4 py-3">
-                  <span>{item.text}</span>
-                  <Button variant="outline" onClick={() => onSetup(item.tab)}>
-                    {item.action}
-                  </Button>
-                </li>
-              ))}
-            </ul>
-          </CardContent>
-        </Card>
+          {groups.map((g) => (
+            <section key={g.name} aria-label={g.name}>
+              <motion.h2 variants={rowVariants} className="flex items-baseline gap-2 font-display text-title">
+                {g.name}
+                {g.now && (
+                  <>
+                    {" "}
+                    <span className="font-display text-ink-2 italic">{g.rows.length}</span>
+                  </>
+                )}
+              </motion.h2>
+              <ul className="-mx-3 mt-2 divide-y divide-line">{g.rows.map((m) => row(m, g.now))}</ul>
+            </section>
+          ))}
+        </motion.div>
       )}
-
-      {/* STO-03: left in `recording` by a crash. The WAV files hold what the last 5 s flush wrote. */}
-      {interrupted.length > 0 && (
-        <section className="space-y-2">
-          <h2 className="font-bold">중단된 녹음</h2>
-          <p className="text-muted-foreground">
-            녹음 중에 앱이 꺼졌습니다. 마지막으로 저장된 곳까지 처리하거나 삭제할 수 있습니다.
-          </p>
-          <Card className="gap-0 py-0">
-            <ul className="divide-y">
-              {interrupted.map((m) => (
-                <li key={m.id} className="flex items-center justify-between gap-4 px-4 py-3">
-                  <Title meeting={m} />
-                  <span className="flex gap-2">
-                    <Button variant="outline" onClick={() => resume(m.id)}>
-                      처리 계속
-                    </Button>
-                    <DeleteButton id={m.id} onDeleted={onChanged} onError={setError} />
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </Card>
-        </section>
-      )}
-
-      <section className="space-y-2">
-        <h2 className="font-bold">최근 회의</h2>
-        {listed?.length === 0 && <p className="text-muted-foreground">아직 회의가 없습니다</p>}
-        {!!listed?.length && (
-          <Card className="gap-0 py-0">
-            <ul className="divide-y">
-              {listed.map((m) => {
-                const p = progress[m.id];
-                const now = phase(m, p);
-                return (
-                  // The button stretches over the whole row (after:inset-0), so the progress and the
-                  // error below it open the meeting too, without nesting them in the button.
-                  <li key={m.id} className="relative hover:bg-accent">
-                    <button
-                      className="flex w-full items-center justify-between gap-4 px-4 py-3 text-left outline-hidden after:absolute after:inset-0 focus-visible:after:ring-2 focus-visible:after:ring-ring focus-visible:after:ring-inset"
-                      onClick={() => onOpen(m)}
-                    >
-                      <Title meeting={m} />
-                      <StatusBadge kind={badgeKind(m, p)}>{statusLabel(m, p)}</StatusBadge>
-                    </button>
-                    {now === "running" && p && (
-                      <div className="px-4 pb-3">
-                        <ProcessProgress progress={p} name={m.title || "제목 없음"} />
-                      </div>
-                    )}
-                    {now === null && m.status === "transcribe_failed" && (
-                      <div className="flex items-center justify-between gap-4 px-4 pb-3">
-                        {/* The full error is on the processing screen. */}
-                        <span className="min-w-0 truncate text-sm text-muted-foreground">
-                          {m.error ?? "전사하지 못했습니다"}
-                        </span>
-                        <Button
-                          variant="outline"
-                          className="relative"
-                          aria-label={`다시 시도 (${m.title || "제목 없음"})`}
-                          onClick={() => resume(m.id)}
-                        >
-                          다시 시도
-                        </Button>
-                      </div>
-                    )}
-                    {/* 요약 다시 실행 picks a connection, so it lives on the processing screen. */}
-                    {now === null && m.status === "summarize_failed" && (
-                      <p className="truncate px-4 pb-3 text-sm text-muted-foreground">
-                        {m.error ?? "요약하지 못했습니다"}
-                      </p>
-                    )}
-                  </li>
-                );
-              })}
-            </ul>
-          </Card>
-        )}
-      </section>
-    </Page>
+    </main>
   );
 }

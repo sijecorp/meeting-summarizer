@@ -23,24 +23,24 @@
      Serif KR. Neither has tabular figures (tnum): timers stay on Pretendard's. */
   --font-display: "Instrument Serif", "Noto Serif KR Variable", serif;
 
-  /* The weights are Noto Serif KR's: Instrument Serif has only 400 and is never made bold (html
-     below). */
+  /* The weights are Noto Serif KR's, kept near Instrument Serif's only 400 so mixed titles ("Q3
+     로드맵 리뷰") weigh alike. Instrument Serif is never made bold (html below). */
   --text-display-xl: 5rem;
   --text-display-xl--line-height: 1;
   --text-display-xl--letter-spacing: -0.02em;
-  --text-display-xl--font-weight: 500;
+  --text-display-xl--font-weight: 300;
   --text-display-l: 2.75rem;
   --text-display-l--line-height: 1.2;
-  --text-display-l--letter-spacing: -0.02em;
-  --text-display-l--font-weight: 600;
+  --text-display-l--letter-spacing: -0.015em;
+  --text-display-l--font-weight: 450;
   --text-display-m: 2rem;
   --text-display-m--line-height: 1.25;
-  --text-display-m--letter-spacing: -0.02em;
-  --text-display-m--font-weight: 600;
+  --text-display-m--letter-spacing: -0.015em;
+  --text-display-m--font-weight: 450;
   --text-title: 1.25rem;
   --text-title--line-height: 1.35;
   --text-title--letter-spacing: -0.01em;
-  --text-title--font-weight: 600;
+  --text-title--font-weight: 500;
   --text-body-doc: 1rem;
   --text-body-doc--line-height: 1.75;
   --text-body-doc--letter-spacing: 0;
@@ -102,6 +102,7 @@
   --animate-bar: bar 0.9s ease-in-out infinite;
   --animate-dot: dot 1.2s ease-in-out infinite;
   --animate-shimmer: shimmer 1.6s var(--ease-out) infinite;
+  --animate-ring: ring 2.8s var(--ease-out) infinite;
   @keyframes breathe {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.35; }
@@ -113,6 +114,11 @@
   @keyframes dot {
     0%, 100% { opacity: 0.25; }
     40% { opacity: 1; }
+  }
+  /* The first screen's record button: a ring spreading out and fading. */
+  @keyframes ring {
+    from { transform: scale(1); opacity: 0.45; }
+    to { transform: scale(1.9); opacity: 0; }
   }
   /* `translate`, not `transform`: it takes over the sweep's resting -translate-x-full. */
   @keyframes shimmer {
@@ -182,11 +188,19 @@
     outline: 2px solid var(--ring);
     outline-offset: 2px;
   }
-  /* No faux bold: Instrument Serif keeps its one weight beside a 600 Hangul title. Italic may still
-     be slanted, but only Instrument Serif's numerals are set in italic. */
+  /* No faux bold: Instrument Serif keeps its one weight beside a 450 Hangul title. Italic may still
+     be slanted, but only Instrument Serif's numerals are set in italic. Hangul breaks between words,
+     never inside one; a long URL or channel name still breaks anywhere (design-system 2). */
   html {
     @apply font-sans;
     font-synthesis: style;
+    word-break: keep-all;
+    overflow-wrap: break-word;
+  }
+  /* An extra where WebKit supports it. */
+  h1,
+  h2 {
+    text-wrap: balance;
   }
   /* Paper grain: fractal noise at 3%, decoration only. Stitched tiles, so no seams show. */
   body {

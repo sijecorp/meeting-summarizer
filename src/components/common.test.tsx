@@ -30,10 +30,10 @@ const route = (patch: Partial<SummaryRoute>): SummaryRoute => ({
 // SUM-07, SUM-08.
 test("says where the summary goes, and offers 로컬로 요약 only with a local connection", async () => {
   const cases: [SummaryRoute, string, boolean][] = [
-    [route({}), "요약할 때 전사본이 회사 클라우드(api.example.com)(으)로 전송됩니다", false],
+    [route({}), "요약할 때 전사본이 회사 클라우드(api.example.com)로 전송됩니다", false],
     [
       route({ connection: ollama, local: true, local_available: true }),
-      "이 PC의 Ollama(으)로 요약합니다. 전사본은 밖으로 나가지 않습니다",
+      "이 PC의 Ollama로 요약합니다. 전사본은 밖으로 나가지 않습니다",
       true,
     ],
     [route({ connection: null }), "LLM 연결이 없어 전사까지만 합니다", false],
@@ -114,13 +114,13 @@ test("once locked: where it is being summarized while summarizing, never the swi
   current = route({ local_available: true, locked: true });
   rerender(<RouteNotice id="a" status="summarizing" />);
   expect(
-    await screen.findByText("전사본을 회사 클라우드(api.example.com)(으)로 보내 요약하고 있습니다"),
+    await screen.findByText("전사본을 회사 클라우드(api.example.com)로 보내 요약하고 있습니다"),
   ).toBeTruthy();
   expect(screen.queryByRole("switch")).toBeNull();
 
   current = route({ connection: ollama, local: true, local_available: true, locked: true });
   rerender(<RouteNotice id="b" status="summarizing" />);
-  expect(await screen.findByText("이 PC의 Ollama(으)로 요약하고 있습니다")).toBeTruthy();
+  expect(await screen.findByText("이 PC의 Ollama로 요약하고 있습니다")).toBeTruthy();
   expect(screen.queryByRole("switch")).toBeNull();
 
   rerender(<RouteNotice id="b" status="summarize_failed" />);

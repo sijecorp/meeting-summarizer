@@ -1,0 +1,249 @@
+import { useEffect, useRef, useState } from "react";
+import { Square } from "lucide-react";
+import { AnimatePresence, motion, useReducedMotion, useSpring, useTransform } from "motion/react";
+import { clock, hhmm, Kbd, phase, Present, RollingTime, SHORTCUT, sinceStart } from "@/components/common";
+import { onRecordingLevel, type MeetingItem, type Progress } from "@/lib/ipc";
+import { dur, spring } from "@/lib/motion";
+
+// The dock (design-system 6.2): the app's one live element, an ink pill at the bottom. It records,
+// or it processes, or it is gone. White focus rings: the brand one is 3.2:1 on ink.
+const PART = "flex h-10 items-center rounded-full focus-visible:outline-white";
+
+/** 12 bars, the low bands in the middle: a voice swells from the center out. */
+const MIRROR = [5, 4, 3, 2, 1, 0, 0, 1, 2, 3, 4, 5];
+const QUIET = { transform: "scaleY(0.15)" };
+
+/** Recording: the breathing dot, a mini waveform, the time and the stop button. */
+function Recording({
+  startedAt,
+  onOpen,
+  onStop,
+}: {
+  startedAt: string;
+  onOpen: () => void;
+  onStop: () => void;
+}) {
+  const bars = useRef<HTMLSpanElement>(null);
+  // Seeded from the meeting, so coming back mid-recording does not roll every digit up from 0.
+  const [s, setSeconds] = useState(() => sinceStart(startedAt));
+  useEffect(() => {
+    const unlisten = onRecordingLevel((l) => {
+      // Whole seconds: an equal value lets React skip the other 24 events of each second.
+      setSeconds(Math.floor(l.elapsed_ms / 1000));
+      // 25 times a second, straight to the DOM: no React state, no CSS transition (design-system 5).
+      // Square ends, so scaleY never warps them.
+      const loud = (j: number) =>
+        Math.max(0, ...[0, 1, 2, 3].flatMap((k) => [l.mic_bands[4 * j + k] ?? 0, l.system_bands[4 * j + k] ?? 0]));
+      bars.current?.childNodes.forEach((bar, i) => {
+        (bar as HTMLElement).style.transform = `scaleY(${0.15 + 0.0085 * loud(MIRROR[i])})`;
+      });
+    });
+    return () => {
+      unlisten.then((stop) => stop(), () => {});
+    };
+  }, []);
+  const time = clock(s);
+  return (
+    <>
+      <button
+        aria-label={`녹음 중 ${time}`}
+        className={`${PART} gap-3 pr-3 pl-4 hover:bg-white/10`}
+        onClick={onOpen}
+      >
+        <span aria-hidden className="size-2.5 rounded-full bg-rec motion-safe:animate-breathe" />
+        <span ref={bars} aria-hidden className="flex h-5 items-center gap-[2px]">
+          {MIRROR.map((_, i) => (
+            <span key={i} className="h-full w-[2px] bg-rec" style={QUIET} />
+          ))}
+        </span>
+        <RollingTime text={time} className="text-label" />
+      </button>
+      <button
+        aria-label="녹음 종료"
+        aria-keyshortcuts={SHORTCUT.stop.aria}
+        className={`${PART} gap-2 bg-white/10 px-4 text-label hover:bg-white/15`}
+        onClick={onStop}
+      >
+        <Square aria-hidden className="size-3 fill-current text-rec" />
+        종료
+        <Kbd>{SHORTCUT.stop.label}</Kbd>
+      </button>
+    </>
+  );
+}
+
+/** What the meeting at the head of the line is doing, e.g. "주간 회의 · 요약 2/3". `percent` is set
+ * when there is a value to show; `shown` when the words carry it too ("전사 42%"). */
+function jobOf(m: MeetingItem, p: Progress | undefined) {
+  // Titles come from the summary: until then the meeting goes by its start.
+  const name = m.title || `${hhmm(m.created_at)} 회의`;
+  if (phase(m, p) === "waiting") {
+    return { name, step: "대기 중", percent: null, shown: false, running: false };
+  }
+  // Events come before the list is read again: a summary's first one can meet a list that still
+  // says transcribing.
+  if ((p?.status === "summarizing" ? p.status : m.status) === "summarizing") {
+    const n = p?.status === "summarizing" && p.chunks > 1 ? p : null;
+    const step = n ? `요약 ${Math.min(n.chunk + 1, n.chunks)}/${n.chunks}` : "요약 중";
+    return { name, step, percent: n?.percent ?? null, shown: false, running: true };
+  }
+  // Until the chunk plan exists, `percent` is the planning's own.
+  const counted = p?.status === "transcribing" && p.chunks > 0;
+  const step = counted ? "전사" : p?.status === "transcribing" ? "구간 나누는 중" : "전사 중";
+  return { name, step, percent: counted ? p.percent : null, shown: counted, running: true };
+}
+
+const ARC = { cx: 12, cy: 12, r: 9, fill: "none", strokeWidth: 2.5 };
+
+/** Processing: a ring and "처리 중 N" over the head of the line. One spring drives the ring and
+ * the percent, rendered from the MotionValue without a re-render per frame. Keyed by meeting, so a
+ * new one starts from its own value. */
+function Processing({ count, job }: { count: number; job: ReturnType<typeof jobOf> }) {
+  const reduce = useReducedMotion();
+  const value = useSpring(job.percent ?? 0, { stiffness: 140, damping: 24 });
+  useEffect(() => {
+    if (job.percent == null) return;
+    if (reduce) value.jump(job.percent);
+    else value.set(job.percent);
+  }, [job.percent, reduce]);
+  const length = useTransform(value, (v) => v / 100);
+  const text = useTransform(value, (v) => `${Math.round(v)}%`);
+  const turning = job.running && job.percent == null;
+  return (
+    <>
+      <svg aria-hidden viewBox="0 0 24 24" className={`size-6 shrink-0 -rotate-90 ${turning ? "motion-safe:animate-spin" : ""}`}>
+        <circle {...ARC} className="stroke-white/20" />
+        {job.percent != null ? (
+          <motion.circle {...ARC} className="stroke-white" style={{ pathLength: length }} />
+        ) : (
+          // Nothing to count yet: a quarter arc turning. Waiting shows the empty ring.
+          turning && <circle {...ARC} pathLength={1} strokeDasharray="0.25 1" className="stroke-white" />
+        )}
+      </svg>
+      <span className="grid min-w-0 text-left">
+        <span className="text-label">처리 중 {count}</span>
+        <span className="max-w-64 truncate text-caption text-dock-2">
+          {job.name} · {job.step}
+          {job.shown && (
+            <>
+              {" "}
+              <motion.span className="tabular-nums">{text}</motion.span>
+            </>
+          )}
+        </span>
+      </span>
+    </>
+  );
+}
+
+type Mode = "recording" | "processing" | "idle";
+/** Said once per change (politely), never per tick. */
+function announcement(was: Mode, now: Mode) {
+  if (now === "recording") return "녹음을 시작했습니다";
+  if (was === "recording") return now === "processing" ? "녹음을 마쳤습니다. 처리를 시작합니다" : "녹음을 마쳤습니다";
+  return now === "processing" ? "처리를 시작했습니다" : "처리를 마쳤습니다";
+}
+
+export default function Dock({
+  live,
+  stopping,
+  queue,
+  progress,
+  hidden,
+  onRecording,
+  onStop,
+  onOpen,
+}: {
+  /** The recording running, if any. */
+  live?: MeetingItem;
+  /** Its stop was asked and the list does not show it yet. */
+  stopping: boolean;
+  /** Meetings being processed first, then the ones waiting, by place in line. */
+  queue: MeetingItem[];
+  progress: Record<string, Progress>;
+  /** The recording screen shows all of this itself. */
+  hidden: boolean;
+  onRecording: () => void;
+  onStop: () => void;
+  onOpen: (meeting: MeetingItem) => void;
+}) {
+  // Recording stops every worker (TRN-09), so processing waits behind it.
+  const mode: Mode = live ? "recording" : queue.length ? "processing" : "idle";
+  const [said, setSaid] = useState("");
+  const last = useRef(mode);
+  useEffect(() => {
+    if (last.current !== mode) setSaid(announcement(last.current, mode));
+    last.current = mode;
+  }, [mode]);
+
+  // Focus moves to the pill before 종료 swaps the shape, so it never falls back to the page.
+  const pill = useRef<HTMLDivElement>(null);
+  const stop = () => {
+    pill.current?.focus();
+    onStop();
+  };
+  const head = queue[0];
+  const job = head && jobOf(head, progress[head.id]);
+  // Each shape's content, keyed so the pill morphs between them.
+  const content = live
+    ? stopping
+      ? { key: "stopping", body: <span className="px-4 text-label">전사를 시작합니다</span> }
+      : {
+          key: "recording",
+          body: <Recording startedAt={live.created_at} onOpen={onRecording} onStop={stop} />,
+        }
+    : job && {
+        key: "processing",
+        body: (
+          <button
+            aria-label={[`처리 중 ${queue.length}`, job.name, job.shown ? `${job.step} ${job.percent}%` : job.step].join(" · ")}
+            className={`${PART} min-w-0 gap-3 pr-5 pl-3 hover:bg-white/10`}
+            onClick={() => onOpen(head)}
+          >
+            <Processing key={head.id} count={queue.length} job={job} />
+          </button>
+        ),
+      };
+
+  return (
+    // A fixed container needs `layoutRoot` for the pill's layout animation to measure right.
+    <motion.div layoutRoot className="pointer-events-none fixed inset-x-0 bottom-6 z-20 flex justify-center px-4">
+      <AnimatePresence>
+        {content && !hidden && (
+          <motion.div
+            key="dock"
+            ref={pill}
+            tabIndex={-1}
+            layout
+            initial={{ y: 96, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: 96, opacity: 0 }}
+            transition={spring.dock}
+            // In `style`, not a class: Motion corrects the radius while the size morphs.
+            style={{ borderRadius: 28 }}
+            className="pointer-events-auto relative flex h-14 max-w-full items-center gap-1 bg-dock p-2 text-white shadow-float focus-visible:outline-white"
+          >
+            <AnimatePresence mode="popLayout" initial={false}>
+              <motion.div
+                key={content.key}
+                layout="position"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                // Labels slide with the pill's own spring; only their fade is timed.
+                transition={{ duration: dur.small, layout: spring.dock }}
+                className="flex min-w-0 items-center gap-1"
+              >
+                {/* The last shape stays a moment for its exit: never clicked twice meanwhile. */}
+                <Present className="contents">{content.body}</Present>
+              </motion.div>
+            </AnimatePresence>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      <p role="status" className="sr-only">
+        {said}
+      </p>
+    </motion.div>
+  );
+}

@@ -71,7 +71,14 @@ const loaded: LoadedSettings = {
   },
 };
 
-test("switches from home to settings and back", async () => {
+// With no meetings at all, Home is the first screen (design-system 6.5).
+const FIRST = "회의가 끝나면, 기록은 이미 와 있어요.";
+const first = () => screen.findByRole("heading", { level: 1, name: FIRST });
+/** Which way the screen holding this heading came in. */
+const cameIn = (heading: HTMLElement) => heading.closest("[data-direction]")?.getAttribute("data-direction");
+
+// Design-system 6.1: forward from Home, back to it.
+test("switches from home to settings and back, forward and then back", async () => {
   mock((cmd) => {
     if (cmd === "get_settings") return loaded;
     if (cmd === "list_meetings") return [];
@@ -80,18 +87,19 @@ test("switches from home to settings and back", async () => {
 
   render(<App />);
 
-  expect(await screen.findByText("아직 회의가 없습니다")).toBeTruthy();
+  expect(await first()).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "설정" }));
 
   expect(await screen.findByDisplayValue("홍길동")).toBeTruthy();
-  expect(screen.getByRole("heading", { level: 1, name: "설정" })).toBeTruthy();
+  expect(cameIn(screen.getByRole("heading", { level: 1, name: "설정" }))).toBe("forward");
   fireEvent.click(screen.getByRole("button", { name: "홈으로" }));
 
-  expect(await screen.findByText("아직 회의가 없습니다")).toBeTruthy();
-  expect(screen.getByRole("heading", { level: 1, name: "회의" })).toBeTruthy();
+  expect(cameIn(await first())).toBe("back");
+  // Nothing recording or processing: no dock.
+  expect(screen.queryByRole("button", { name: /^(녹음|처리) 중/ })).toBeNull();
 });
 
-test("opens on Home with empty settings; the setup card opens the matching tab", async () => {
+test("opens on Home with empty settings; the setup line opens the matching tab", async () => {
   const empty: LoadedSettings = {
     ...loaded,
     settings: { ...loaded.settings, llm_connections: [], default_llm: null, webhooks: [] },
@@ -103,17 +111,19 @@ test("opens on Home with empty settings; the setup card opens the matching tab",
 
   render(<App />);
 
-  expect(await screen.findByText("LLM 연결이 없습니다")).toBeTruthy();
-  expect(screen.getByText("Slack 웹훅이 없습니다")).toBeTruthy();
-  expect(screen.getByRole("heading", { level: 1, name: "회의" })).toBeTruthy();
-  expect((screen.getByRole("button", { name: "녹음 시작" }) as HTMLButtonElement).disabled).toBe(false);
+  const items = within(await screen.findByRole("list", { name: "남은 설정" }));
+  expect(await items.findByRole("button", { name: "LLM 연결" })).toBeTruthy();
+  expect(items.getByRole("button", { name: "Slack 채널 연결" })).toBeTruthy();
+  expect(screen.getByRole("heading", { level: 1, name: FIRST })).toBeTruthy();
+  // Recording needs no setup: no tour, no gate.
+  expect((screen.getByRole("button", { name: "첫 회의 녹음하기" }) as HTMLButtonElement).disabled).toBe(false);
 
-  fireEvent.click(screen.getByRole("button", { name: "LLM 연결하기" }));
+  fireEvent.click(screen.getByRole("button", { name: "LLM 연결" }));
   expect(await screen.findByRole("textbox", { name: "새 LLM 연결 이름" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "요약(LLM)" }).getAttribute("aria-current")).toBe("page");
 
   fireEvent.click(screen.getByRole("button", { name: "홈으로" }));
-  fireEvent.click(await screen.findByRole("button", { name: "웹훅 추가하기" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Slack 채널 연결" }));
   expect(await screen.findByRole("textbox", { name: "새 웹훅 이름" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Slack" }).getAttribute("aria-current")).toBe("page");
 });
@@ -136,21 +146,26 @@ const meeting = (id: string, status: Status, interrupted = false): MeetingItem =
   interrupted,
 });
 
-test("header chip shows the recording time and returns to the recording screen", async () => {
+/** A recording running now: its start is the dock's first time. */
+const live = (id: string): MeetingItem => ({ ...meeting(id, "recording"), created_at: new Date().toISOString() });
+const RECORDING_HEADING = /^녹음 중 · \d{2}:\d{2} 시작$/;
+// The dock's first second, give or take one for a slow run.
+const LIVE = /^녹음 중 00:0\d$/;
+
+// Design-system 6.2: the dock records, processes, or is gone.
+test("the dock shows the recording time and opens the recording screen, where it hides", async () => {
   const state: RecordingState = { id: "지금 회의", warnings: [] };
   mock((cmd) => {
     if (cmd === "get_settings") return loaded;
-    if (cmd === "list_meetings") {
-      return [meeting("지금 회의", "recording"), meeting("지난 회의", "recorded")];
-    }
+    if (cmd === "list_meetings") return [live("지금 회의"), meeting("지난 회의", "recorded")];
     if (cmd === "recording_state") return state;
   });
 
   render(<App />);
 
-  expect(await screen.findByRole("button", { name: "녹음 중 00:00" })).toBeTruthy();
-  // Recording stops all workers (TRN-09), so the processing counts give way.
-  expect(screen.queryByText(/대기 \d/)).toBeNull();
+  expect(await screen.findByRole("button", { name: LIVE })).toBeTruthy();
+  // Recording stops all workers (TRN-09), so processing gives way.
+  expect(screen.queryByRole("button", { name: /^처리 중/ })).toBeNull();
   // Home goes back to the running recording instead of failing to start a second one.
   expect(screen.queryByRole("button", { name: "녹음 시작" })).toBeNull();
   expect(screen.getByRole("button", { name: "녹음 화면으로" })).toBeTruthy();
@@ -165,11 +180,35 @@ test("header chip shows the recording time and returns to the recording screen",
   await act(() => emit("recording://level", level));
 
   fireEvent.click(screen.getByRole("button", { name: "녹음 중 01:05" }));
-  expect(await screen.findByRole("heading", { level: 1, name: "녹음" })).toBeTruthy();
+  expect(await screen.findByRole("heading", { level: 1, name: RECORDING_HEADING })).toBeTruthy();
   expect(await screen.findByRole("button", { name: /녹음 종료/ })).toBeTruthy();
+  // The recording screen shows all of it itself: one stop button, no dock.
+  await waitFor(() => expect(screen.queryByRole("button", { name: /^녹음 중/ })).toBeNull());
+  expect(screen.getAllByRole("button", { name: /녹음 종료/ })).toHaveLength(1);
 });
 
-test("header chip counts meetings being processed and waiting", async () => {
+test("the dock's 종료 stops the recording where the recorder is, then turns to processing", async () => {
+  const calls: string[] = [];
+  let list = [live("a"), meeting("지난 회의", "sent")];
+  mock((cmd) => {
+    calls.push(cmd);
+    if (cmd === "list_meetings") return list;
+    if (cmd === "stop_recording") {
+      list = [{ ...list[0], status: "recorded" }, list[1]];
+      return "a";
+    }
+  });
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "녹음 종료" }));
+
+  expect(await screen.findByRole("button", { name: "처리 중 1 · a · 대기 중" })).toBeTruthy();
+  expect(calls).toContain("stop_recording");
+  // Still Home: stopping from the dock does not leave the screen.
+  expect(screen.getByRole("button", { name: "녹음 시작" })).toBeTruthy();
+});
+
+test("the dock counts the line: meetings being processed and waiting, nothing else", async () => {
   mock((cmd) => {
     if (cmd === "get_settings") return loaded;
     if (cmd === "list_meetings") {
@@ -196,36 +235,44 @@ test("header chip counts meetings being processed and waiting", async () => {
 
   render(<App />);
 
-  expect(await screen.findByText("처리 중 1 · 대기 3")).toBeTruthy();
+  // One running (a) and three waiting (j, b, d), the one with a place first.
+  expect(await screen.findByRole("button", { name: "처리 중 4 · a · 전사 중" })).toBeTruthy();
   expect(screen.queryByRole("button", { name: /^녹음 중/ })).toBeNull();
 });
 
-test("header chip leaves out a zero count", async () => {
-  mock((cmd) => {
+test("only waiting: the dock names the head of the line and opens it", async () => {
+  mock((cmd, args) => {
     if (cmd === "get_settings") return loaded;
     if (cmd === "list_meetings") return [meeting("a", "recorded")];
+    if (cmd === "get_meeting") return { meta: meeting(args.id as string, "recorded"), summary: "", sending: false };
   });
 
   render(<App />);
 
-  expect(await screen.findByText("대기 1")).toBeTruthy();
+  fireEvent.click(await screen.findByRole("button", { name: "처리 중 1 · a · 대기 중" }));
+  expect(await screen.findByRole("heading", { level: 1, name: "처리 중" })).toBeTruthy();
+  expect(await screen.findByRole("heading", { level: 2, name: "a" })).toBeTruthy();
 });
 
-test("a recording stop refreshes the chip", async () => {
-  let list = [meeting("a", "recording")];
+test("a recording stop turns the dock from recording to processing, said once", async () => {
+  let list = [live("a")];
   mock((cmd) => {
     if (cmd === "get_settings") return loaded;
     if (cmd === "list_meetings") return list;
   });
 
   render(<App />);
-  expect(await screen.findByRole("button", { name: "녹음 중 00:00" })).toBeTruthy();
+  expect(await screen.findByRole("button", { name: LIVE })).toBeTruthy();
+  const said = screen.getAllByRole("status").find((s) => s.closest(".fixed"))!;
+  // Not when the app opens on it: nothing changed.
+  expect(said.textContent).toBe("");
 
-  list = [meeting("a", "recorded")];
+  list = [{ ...list[0], status: "recorded" }];
   await act(() => emit("recording://stopped", { id: "a", message: null }));
 
-  expect(await screen.findByText("대기 1")).toBeTruthy();
+  expect(await screen.findByRole("button", { name: "처리 중 1 · a · 대기 중" })).toBeTruthy();
   expect(screen.queryByRole("button", { name: /^녹음 중/ })).toBeNull();
+  expect(said.textContent).toBe("녹음을 마쳤습니다. 처리를 시작합니다");
 });
 
 // A send may end after its review screen closed: the list must not keep it unsent.
@@ -280,7 +327,7 @@ test("quit dialog's 종료 button confirms the quit", async () => {
   });
 
   render(<App />);
-  expect(await screen.findByText("아직 회의가 없습니다")).toBeTruthy();
+  expect(await first()).toBeTruthy();
   await act(() => emit("app://quit-requested"));
 
   const dialog = await screen.findByRole("alertdialog", { name: "진행 중인 작업이 있습니다" });
@@ -301,31 +348,34 @@ const progress = (id: string, patch: Partial<Progress> = {}): Progress => ({
   ...patch,
 });
 
-test("header chip adds the running percent, follows progress events and goes home", async () => {
+test("the dock follows progress events and opens the meeting at the head of the line", async () => {
   const waiting = { status: "recorded" as const, chunk: 0, chunks: 0, percent: 0, eta_secs: null };
   let list = [meeting("a", "transcribing"), meeting("b", "recorded"), meeting("c", "recorded")];
-  mock((cmd) => {
+  mock((cmd, args) => {
     if (cmd === "get_settings") return loaded;
     if (cmd === "list_meetings") return list;
     if (cmd === "queue_state") {
       return [progress("a"), progress("b", { ...waiting, position: 1 }), progress("c", { ...waiting, position: 2 })];
     }
+    if (cmd === "get_meeting") return { meta: list.find((m) => m.id === args.id), summary: "", sending: false };
   });
 
   render(<App />);
-  expect(await screen.findByText("처리 중 1 (42%) · 대기 2")).toBeTruthy();
+  expect(await screen.findByRole("button", { name: "처리 중 3 · a · 전사 42%" })).toBeTruthy();
   expect(screen.getByText("대기 중 · 2번째")).toBeTruthy();
 
   // b starts: the status changed, so the list is read again.
   list = [meeting("a", "transcribing"), meeting("b", "transcribing"), meeting("c", "recorded")];
   await act(() => emit("meeting://progress", progress("b", { chunks: 4, percent: 17 })));
   await act(() => emit("meeting://progress", progress("c", { ...waiting, position: 1 })));
-  expect(await screen.findByText("처리 중 2 (42%, 17%) · 대기 1")).toBeTruthy();
+  await act(() => emit("meeting://progress", progress("a", { percent: 57 })));
+  expect(await screen.findByRole("button", { name: "처리 중 3 · a · 전사 57%" })).toBeTruthy();
 
   fireEvent.click(screen.getByRole("button", { name: "설정" }));
   expect(await screen.findByRole("heading", { level: 1, name: "설정" })).toBeTruthy();
-  fireEvent.click(screen.getByRole("button", { name: "처리 중 2 (42%, 17%) · 대기 1" }));
-  expect(await screen.findByRole("heading", { level: 1, name: "회의" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "처리 중 3 · a · 전사 57%" }));
+  expect(await screen.findByRole("heading", { level: 1, name: "처리 중" })).toBeTruthy();
+  expect(await screen.findByRole("heading", { level: 2, name: "a" })).toBeTruthy();
 });
 
 // Design-system 6.1: the logo's bars move only while something is transcribed or summarized.
@@ -336,23 +386,23 @@ test("the header logo moves only while a meeting is being processed", async () =
   });
 
   const { container } = render(<App />);
-  expect(await screen.findByText("대기 1")).toBeTruthy();
-  const live = () => container.querySelector("header [data-live]")?.getAttribute("data-live");
-  expect(live()).toBe("false");
+  expect(await screen.findByRole("button", { name: "처리 중 1 · a · 대기 중" })).toBeTruthy();
+  const moving = () => container.querySelector("header [data-live]")?.getAttribute("data-live");
+  expect(moving()).toBe("false");
 
   list = [meeting("a", "transcribing")];
   await act(() => emit("meeting://progress", progress("a")));
-  expect(await screen.findByText("처리 중 1 (42%)")).toBeTruthy();
-  expect(live()).toBe("true");
+  expect(await screen.findByRole("button", { name: "처리 중 1 · a · 전사 42%" })).toBeTruthy();
+  expect(moving()).toBe("true");
 
   list = [meeting("a", "review")];
   await act(() => emit("meeting://progress", progress("a", { status: "review" })));
-  await waitFor(() => expect(screen.queryByText(/처리 중/)).toBeNull());
-  expect(live()).toBe("false");
+  await waitFor(() => expect(screen.queryByRole("button", { name: /^처리 중/ })).toBeNull());
+  expect(moving()).toBe("false");
 });
 
 // While summarizing, `percent` is requests done; one request has nothing to count.
-test("header chip counts a summary as running, with a percent only past one request", async () => {
+test("the dock counts a summary as running, with its requests only past one", async () => {
   const summarizing = { status: "summarizing" as const, eta_secs: null };
   mock((cmd) => {
     if (cmd === "list_meetings") return [meeting("a", "summarizing")];
@@ -360,27 +410,31 @@ test("header chip counts a summary as running, with a percent only past one requ
   });
 
   render(<App />);
-  expect(await screen.findByText("처리 중 1")).toBeTruthy();
+  expect(await screen.findByRole("button", { name: "처리 중 1 · a · 요약 중" })).toBeTruthy();
 
   await act(() => emit("meeting://progress", progress("a", { ...summarizing, chunk: 1, chunks: 3, percent: 33 })));
-  expect(await screen.findByText("처리 중 1 (33%)")).toBeTruthy();
+  expect(await screen.findByRole("button", { name: "처리 중 1 · a · 요약 2/3" })).toBeTruthy();
 });
 
-test("the setup card's model row comes first; 전사 설정 opens the 전사 tab", async () => {
+test("the setup line's model item comes first; after a failed download 전사 설정 opens the 전사 tab", async () => {
   mock((cmd) => {
     if (cmd === "get_settings") return { ...loaded, settings: { ...loaded.settings, webhooks: [] } };
     if (cmd === "list_meetings") return [];
     if (cmd === "has_secret") return true;
     if (cmd === "model_status") return models(false);
+    if (cmd === "download_models") throw new Error("연결이 끊겼습니다");
   });
 
   render(<App />);
 
-  expect(await screen.findByText("전사 모델이 없습니다")).toBeTruthy();
-  await screen.findByText("Slack 웹훅이 없습니다");
-  const rows = screen.getAllByRole("listitem").map((li) => li.firstChild?.textContent);
-  expect(rows).toEqual(["전사 모델이 없습니다", "Slack 웹훅이 없습니다"]);
-  fireEvent.click(screen.getByRole("button", { name: "전사 설정" }));
+  const items = within(await screen.findByRole("list", { name: "남은 설정" }));
+  await items.findByRole("button", { name: "Slack 채널 연결" });
+  await items.findByRole("button", { name: "전사 모델 받기" });
+  const rows = items.getAllByRole("listitem").map((li) => li.firstChild?.textContent);
+  expect(rows).toEqual(["전사 모델 받기", "Slack 채널 연결"]);
+  fireEvent.click(items.getByRole("button", { name: "전사 모델 받기" }));
+  expect(await items.findByText("전사 모델을 받지 못했습니다")).toBeTruthy();
+  fireEvent.click(items.getByRole("button", { name: "전사 설정" }));
 
   expect(await screen.findByText(WHISPER)).toBeTruthy();
   expect(screen.getByRole("button", { name: "전사" }).getAttribute("aria-current")).toBe("page");
@@ -395,13 +449,13 @@ test("progress events win over an older queue_state snapshot", async () => {
   });
 
   render(<App />);
-  expect(await screen.findByText("처리 중 1")).toBeTruthy();
+  expect(await screen.findByRole("button", { name: "처리 중 1 · a · 전사 중" })).toBeTruthy();
   await act(() => emit("meeting://progress", progress("a", { percent: 57 })));
-  expect(await screen.findByText("처리 중 1 (57%)")).toBeTruthy();
+  expect(await screen.findByRole("button", { name: "처리 중 1 · a · 전사 57%" })).toBeTruthy();
 
   await waitFor(() => expect(snapshot).not.toBeNull());
   await act(async () => snapshot?.([progress("a", { percent: 40 })]));
-  expect(screen.getByText("처리 중 1 (57%)")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "처리 중 1 · a · 전사 57%" })).toBeTruthy();
 });
 
 test("a GPU fallback shows a dismissible warning", async () => {
@@ -412,7 +466,7 @@ test("a GPU fallback shows a dismissible warning", async () => {
   });
 
   render(<App />);
-  expect(await screen.findByText("아직 회의가 없습니다")).toBeTruthy();
+  expect(await first()).toBeTruthy();
   await act(() => emit("transcribe://gpu-failed", { message }));
 
   expect(await screen.findByText(message)).toBeTruthy();
@@ -432,7 +486,7 @@ test("a notification click opens its meeting: review when ready, processing when
   });
 
   render(<App />);
-  expect(await screen.findByText("아직 회의가 없습니다")).toBeTruthy();
+  expect(await first()).toBeTruthy();
 
   await act(() => emit("app://open-meeting", "a"));
   expect(await screen.findByRole("heading", { level: 1, name: "검토" })).toBeTruthy();
@@ -476,8 +530,187 @@ test("a screen on its way out cannot move the app", async () => {
     // Past the exit (208 ms).
     await act(() => new Promise((resolve) => setTimeout(resolve, 400)));
 
-    expect(screen.getAllByRole("heading", { level: 1 }).map((h) => h.textContent)).toEqual(["회의"]);
+    // Home alone, under today's date.
+    const headings = screen.getAllByRole("heading", { level: 1 });
+    expect(headings).toHaveLength(1);
+    expect(headings[0].textContent).toMatch(/^\d+월 \d+일 \S+요일$/);
   } finally {
     MotionGlobalConfig.skipAnimations = true;
   }
+});
+
+// ⌘R / ⌘. on macOS, Ctrl elsewhere: both modifiers are set so the test holds on either.
+const press = (target: Element, code: "KeyR" | "Period") =>
+  fireEvent.keyDown(target, { code, key: code === "KeyR" ? "r" : ".", ctrlKey: true, metaKey: true });
+
+test("⌘R starts a recording from any screen, never while typing, in a dialog or recording; ⌘. stops it", async () => {
+  const calls: string[] = [];
+  let list: MeetingItem[] = [meeting("지난 회의", "sent")];
+  mock((cmd, args) => {
+    calls.push(cmd);
+    if (cmd === "list_meetings") return list;
+    if (cmd === "has_secret") return true;
+    if (cmd === "start_recording") {
+      list = [live("새 회의"), ...list];
+      return { id: "새 회의", warnings: [] } satisfies RecordingState;
+    }
+    if (cmd === "recording_state") return { id: "새 회의", warnings: [] } satisfies RecordingState;
+    if (cmd === "stop_recording") {
+      list = [{ ...list[0], status: "recorded" }, ...list.slice(1)];
+      return "새 회의";
+    }
+    if (cmd === "get_meeting") return { meta: list.find((m) => m.id === args.id), summary: "", sending: false };
+  });
+  const starts = () => calls.filter((c) => c === "start_recording").length;
+
+  render(<App />);
+  expect((await screen.findByRole("button", { name: "녹음 시작" })).getAttribute("aria-keyshortcuts")).toMatch(
+    /^(Meta|Control)\+R$/,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "설정" }));
+
+  // Typing: the webview still never reloads, and nothing starts.
+  expect(press(await screen.findByDisplayValue("홍길동"), "KeyR")).toBe(false);
+  expect(starts()).toBe(0);
+  await act(() => emit("app://quit-requested"));
+  press(await screen.findByRole("alertdialog"), "KeyR");
+  expect(starts()).toBe(0);
+  fireEvent.click(screen.getByRole("button", { name: "취소" }));
+  await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+
+  expect(press(document.body, "KeyR")).toBe(false);
+  // Settings keeps its unsaved draft: the recording shows in the dock there.
+  fireEvent.click(await screen.findByRole("button", { name: LIVE }));
+  expect(starts()).toBe(1);
+  expect(await screen.findByRole("heading", { level: 1, name: RECORDING_HEADING })).toBeTruthy();
+  // Already recording (the heading has its start from the list): a second start would only fail.
+  press(document.body, "KeyR");
+  expect(starts()).toBe(1);
+
+  expect(press(document.body, "Period")).toBe(false);
+  expect(await screen.findByRole("heading", { level: 1, name: "처리 중" })).toBeTruthy();
+  expect(calls.filter((c) => c === "stop_recording")).toHaveLength(1);
+});
+
+// A recording that stops by itself before the list ever shows it must not leave 녹음 시작 off.
+test("a start the list never showed ends with its recording://stopped; recording can start again", async () => {
+  const calls: string[] = [];
+  mock((cmd) => {
+    calls.push(cmd);
+    if (cmd === "list_meetings") return [meeting("지난 회의", "sent")];
+    if (cmd === "start_recording") return { id: "짧은 회의", warnings: [] } satisfies RecordingState;
+    if (cmd === "recording_state") return null;
+    if (cmd === "get_meeting") return { meta: meeting("짧은 회의", "recorded"), summary: "", sending: false };
+  });
+  const starts = () => calls.filter((c) => c === "start_recording").length;
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "녹음 시작" }));
+  expect(await screen.findByRole("heading", { level: 1, name: "진행 중인 녹음이 없습니다" })).toBeTruthy();
+  // Still starting as far as the app knows: a second start waits.
+  press(document.body, "KeyR");
+  expect(starts()).toBe(1);
+
+  await act(() => emit("recording://stopped", { id: "짧은 회의", message: "디스크 공간이 부족해 녹음을 멈췄습니다" }));
+  expect(await screen.findByRole("heading", { level: 1, name: "처리 중" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "홈으로" }));
+  expect(((await screen.findByRole("button", { name: "녹음 시작" })) as HTMLButtonElement).disabled).toBe(false);
+  press(document.body, "KeyR");
+  await waitFor(() => expect(starts()).toBe(2));
+});
+
+test("the dock bridges a stop with 전사를 시작합니다, keeps focus, and a second click stops nothing", async () => {
+  const calls: string[] = [];
+  let list = [live("a")];
+  let finish = (_: string) => {};
+  mock((cmd) => {
+    calls.push(cmd);
+    if (cmd === "list_meetings") return list;
+    if (cmd === "stop_recording") return new Promise<string>((resolve) => (finish = resolve));
+  });
+
+  render(<App />);
+  const button = await screen.findByRole("button", { name: "녹음 종료" });
+  fireEvent.click(button);
+  fireEvent.click(button);
+
+  const bridge = await screen.findByText("전사를 시작합니다");
+  expect(screen.queryByRole("button", { name: "녹음 종료" })).toBeNull();
+  expect(calls.filter((c) => c === "stop_recording")).toHaveLength(1);
+  // The pill keeps focus while its shape changes under it.
+  expect(document.activeElement).toBe(bridge.closest("[tabindex]"));
+
+  list = [{ ...list[0], status: "recorded" }];
+  await act(async () => finish("a"));
+  expect(await screen.findByRole("button", { name: "처리 중 1 · a · 대기 중" })).toBeTruthy();
+});
+
+test("a failed start says why and lets the recorder try again", async () => {
+  mock((cmd) => {
+    if (cmd === "list_meetings") return [meeting("지난 회의", "sent")];
+    if (cmd === "start_recording") throw new Error("마이크를 열 수 없습니다");
+  });
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "녹음 시작" }));
+
+  expect(await screen.findByText("녹음을 시작하지 못했습니다: Error: 마이크를 열 수 없습니다")).toBeTruthy();
+  expect((screen.getByRole("button", { name: "녹음 시작" }) as HTMLButtonElement).disabled).toBe(false);
+  expect(screen.queryByRole("heading", { level: 1, name: RECORDING_HEADING })).toBeNull();
+});
+
+test("the dock's head of the line goes by place in line, not list order", async () => {
+  const waiting = { status: "recorded" as const, chunk: 0, chunks: 0, percent: 0, eta_secs: null };
+  mock((cmd) => {
+    if (cmd === "list_meetings") return [meeting("b", "recorded"), meeting("c", "recorded")];
+    if (cmd === "queue_state") return [progress("b", { ...waiting, position: 2 }), progress("c", { ...waiting, position: 1 })];
+  });
+
+  render(<App />);
+
+  expect(await screen.findByRole("button", { name: "처리 중 2 · c · 대기 중" })).toBeTruthy();
+});
+
+test("an automatic stop on Home says why; the dock bridges it until the list shows it", async () => {
+  let list = [live("a")];
+  let hold = false;
+  const held: (() => void)[] = [];
+  mock((cmd) => {
+    if (cmd !== "list_meetings") return;
+    if (hold) return new Promise((resolve) => held.push(() => resolve(list)));
+    return list;
+  });
+
+  render(<App />);
+  expect(await screen.findByRole("button", { name: LIVE })).toBeTruthy();
+  hold = true;
+  list = [{ ...list[0], status: "recorded" }];
+  await act(() => emit("recording://stopped", { id: "a", message: "디스크 공간이 부족해 녹음을 멈췄습니다" }));
+
+  expect(await screen.findByText("디스크 공간이 부족해 녹음을 멈췄습니다")).toBeTruthy();
+  // No 종료 for a recording already over, while the list catches up.
+  expect(screen.getByText("전사를 시작합니다")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "녹음 종료" })).toBeNull();
+  await act(async () => held.forEach((resolve) => resolve()));
+  expect(await screen.findByRole("button", { name: "처리 중 1 · a · 대기 중" })).toBeTruthy();
+});
+
+test("a shortcut waits while a select is open", async () => {
+  const calls: string[] = [];
+  mock((cmd) => {
+    calls.push(cmd);
+    if (cmd === "list_meetings") return [];
+    if (cmd === "has_secret") return true;
+    if (cmd === "list_audio_devices") return { inputs: [{ id: "mic", name: "마이크 1" }], outputs: [] };
+  });
+
+  render(<App />);
+  await first();
+  fireEvent.click(screen.getByRole("button", { name: "설정" }));
+  fireEvent.click(await screen.findByRole("button", { name: "오디오" }));
+  fireEvent.keyDown(screen.getByRole("combobox", { name: "마이크" }), { key: "ArrowDown" });
+  expect(await screen.findByRole("listbox")).toBeTruthy();
+
+  expect(press(document.body, "KeyR")).toBe(false);
+  expect(calls).not.toContain("start_recording");
 });

@@ -118,11 +118,11 @@ test("no speech: a warning and no editor; send stays disabled, only 전송 안 �
 
   expect(await screen.findByText("음성이 거의 감지되지 않았습니다")).toBeTruthy();
   expect(screen.queryByRole("textbox")).toBeNull();
-  const send = (await screen.findByRole("button", { name: "#회의록(으)로 전송" })) as HTMLButtonElement;
+  const send = (await screen.findByRole("button", { name: "#회의록으로 전송" })) as HTMLButtonElement;
   expect(send.disabled).toBe(true);
   expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual([
     "홈으로",
-    "#회의록(으)로 전송",
+    "#회의록으로 전송",
     "전송 안 함",
     "삭제",
   ]);
@@ -352,8 +352,8 @@ test("a delete drops a pending edit: nothing is saved afterwards and nothing is 
 // SUM-07: only a meeting whose transcript went to an LLM says where.
 test("says where the transcript went only when it went somewhere", async () => {
   const cases: [Partial<Meta>, string | null][] = [
-    [{}, "전사본을 회사 클라우드(으)로 보내 요약했습니다"],
-    [{ llm_connection: "Ollama", summarize_local: true }, "이 PC의 Ollama(으)로 요약했습니다"],
+    [{}, "전사본을 회사 클라우드로 보내 요약했습니다"],
+    [{ llm_connection: "Ollama", summarize_local: true }, "이 PC의 Ollama로 요약했습니다"],
     [{ llm_connection: null }, null],
     [{ no_speech: true }, null],
   ];
@@ -415,15 +415,21 @@ const sendButton = (name: string) => screen.findByRole("button", { name }) as Pr
 
 // SND-04, NFR-04: with one webhook the button is ready, no choice to make.
 test("the send button names the default channel: the only one, the last one sent to, else the first", async () => {
-  const cases: [Partial<Settings>, string, boolean][] = [
-    [{}, "#회의록", false],
-    [{ webhooks: [{ name: "#회의록" }, { name: "#개발" }], last_channel: "#개발" }, "#개발", true],
-    [{ webhooks: [{ name: "#회의록" }, { name: "#개발" }], last_channel: "#지운 채널" }, "#회의록", true],
+  // The particle follows the channel's last syllable: 록 → 으로, 발 (ㄹ) → 로.
+  const cases: [Partial<Settings>, string, string, boolean][] = [
+    [{}, "#회의록", "#회의록으로 전송", false],
+    [{ webhooks: [{ name: "#회의록" }, { name: "#개발" }], last_channel: "#개발" }, "#개발", "#개발로 전송", true],
+    [
+      { webhooks: [{ name: "#회의록" }, { name: "#개발" }], last_channel: "#지운 채널" },
+      "#회의록",
+      "#회의록으로 전송",
+      true,
+    ],
   ];
-  for (const [patch, channel, choice] of cases) {
+  for (const [patch, channel, button, choice] of cases) {
     mock({ meta: meta(), summary: "요약" }, (cmd) => (cmd === "get_settings" ? settings(patch) : undefined));
     render(<Review id={id} {...props} />);
-    expect((await sendButton(`${channel}(으)로 전송`)).disabled).toBe(false);
+    expect((await sendButton(button)).disabled).toBe(false);
     const select = screen.queryByRole("combobox", { name: "보낼 채널" });
     expect(select?.textContent ?? null).toBe(choice ? channel : null);
     cleanup();
@@ -439,7 +445,7 @@ test("sends to the channel picked, with the title, body and the start's UTC offs
 
   fireEvent.keyDown(await screen.findByRole("combobox", { name: "보낼 채널" }), { key: "Enter" });
   fireEvent.click(await screen.findByRole("option", { name: "#개발" }));
-  fireEvent.click(await sendButton("#개발(으)로 전송"));
+  fireEvent.click(await sendButton("#개발로 전송"));
 
   await waitFor(() => expect(calls.map((c) => c.cmd)).toContain("send_to_slack"));
   expect(calls.find((c) => c.cmd === "send_to_slack")?.args).toEqual({
@@ -459,7 +465,7 @@ test("over 12,000 characters the send is off and says by how much", async () => 
 
   expect(await screen.findByText("12,345 / 12,000자 (Slack 전송 기준)")).toBeTruthy();
   expect(screen.getByText("Slack 한도 12,000자를 넘었습니다. 345자를 줄여 주세요")).toBeTruthy();
-  expect((await sendButton("#회의록(으)로 전송")).disabled).toBe(true);
+  expect((await sendButton("#회의록으로 전송")).disabled).toBe(true);
   expect(calls.find((c) => c.cmd === "slack_length")?.args).toEqual({
     id,
     title: "주간 회의",
@@ -471,7 +477,7 @@ test("over 12,000 characters the send is off and says by how much", async () => 
   fireEvent.change(screen.getByRole("textbox", { name: "요약" }), { target: { value: "줄인 요약" } });
   expect(await screen.findByText("12,000 / 12,000자 (Slack 전송 기준)")).toBeTruthy();
   expect(screen.queryByText(/Slack 한도/)).toBeNull();
-  expect((await sendButton("#회의록(으)로 전송")).disabled).toBe(false);
+  expect((await sendButton("#회의록으로 전송")).disabled).toBe(false);
   const counted = calls.filter((c) => c.cmd === "slack_length");
   expect(counted[counted.length - 1].args.body).toBe("줄인 요약");
 });
@@ -489,7 +495,7 @@ test("no webhook: the send is off and the Slack settings are one click away", as
 test("a meeting out of review is never sent from here", async () => {
   mock({ meta: meta({ status: "archived" }), summary: "요약" });
   render(<Review id={id} {...props} />);
-  expect((await sendButton("#회의록(으)로 전송")).disabled).toBe(true);
+  expect((await sendButton("#회의록으로 전송")).disabled).toBe(true);
 });
 
 test("the pending edit is saved before the send, and a failed save stops it", async () => {
@@ -500,7 +506,7 @@ test("the pending edit is saved before the send, and a failed save stops it", as
   render(<Review id={id} {...props} />);
 
   fireEvent.change(await screen.findByRole("textbox", { name: "요약" }), { target: { value: "고친 요약" } });
-  fireEvent.click(await sendButton("#회의록(으)로 전송"));
+  fireEvent.click(await sendButton("#회의록으로 전송"));
   await waitFor(() => expect(held).toHaveLength(1));
   expect(held[0].args.body).toBe("고친 요약");
   expect(calls.map((c) => c.cmd)).not.toContain("send_to_slack");
@@ -512,7 +518,7 @@ test("the pending edit is saved before the send, and a failed save stops it", as
   expect(await screen.findByText("저장하지 못했습니다: 디스크가 가득 찼습니다")).toBeTruthy();
   expect(calls.map((c) => c.cmd)).not.toContain("send_to_slack");
 
-  fireEvent.click(await sendButton("#회의록(으)로 전송"));
+  fireEvent.click(await sendButton("#회의록으로 전송"));
   await waitFor(() => expect(held).toHaveLength(2));
   held[1].resolve(meta());
   await waitFor(() => expect(calls.map((c) => c.cmd)).toContain("send_to_slack"));
@@ -530,7 +536,7 @@ test("a failed send shows the cause and becomes 다시 보내기, with 요약 �
   });
   render(<Review id={id} {...props} />);
 
-  fireEvent.click(await sendButton("#회의록(으)로 전송"));
+  fireEvent.click(await sendButton("#회의록으로 전송"));
   expect(await screen.findByText(cause)).toBeTruthy();
   expect(screen.getByRole("button", { name: "요약 복사" })).toBeTruthy();
   // Still in review, so still editable.
@@ -538,7 +544,7 @@ test("a failed send shows the cause and becomes 다시 보내기, with 요약 �
 
   fail = false;
   fireEvent.click(await sendButton("다시 보내기"));
-  expect(await screen.findByText(/^#회의록\(으\)로 전송함/)).toBeTruthy();
+  expect(await screen.findByText(/^#회의록으로 전송함/)).toBeTruthy();
   expect(screen.queryByText(cause)).toBeNull();
 });
 
@@ -563,7 +569,7 @@ test("a send still out from an earlier visit keeps the screen read-only until it
   await act(() => emit("slack://finished", "다른 회의"));
   expect(calls.filter((c) => c.cmd === "get_meeting")).toHaveLength(1);
   await act(() => emit("slack://finished", id));
-  expect(await screen.findByText(/^#회의록\(으\)로 전송함/)).toBeTruthy();
+  expect(await screen.findByText(/^#회의록으로 전송함/)).toBeTruthy();
   expect(screen.queryByRole("button", { name: "보내는 중…" })).toBeNull();
 });
 
@@ -581,8 +587,8 @@ test("a sent meeting says where, when and how many edits, and is read-only", asy
   mock({ meta: meta(), summary: "요약" }, (cmd) => (cmd === "send_to_slack" ? sent : undefined));
   render(<Review id={id} {...props} />);
 
-  fireEvent.click(await sendButton("#회의록(으)로 전송"));
-  const line = `#회의록(으)로 전송함 · ${new Date(at).toLocaleString("ko-KR")} · 수정 2곳`;
+  fireEvent.click(await sendButton("#회의록으로 전송"));
+  const line = `#회의록으로 전송함 · ${new Date(at).toLocaleString("ko-KR")} · 수정 2곳`;
   expect(await screen.findByText(line)).toBeTruthy();
   expect(screen.getByRole("textbox", { name: "요약" }).hasAttribute("readonly")).toBe(true);
   expect(screen.queryByRole("button", { name: /전송$/ })).toBeNull();

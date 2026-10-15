@@ -21,7 +21,7 @@ import {
 // with the real IPC shapes, plus the events the Rust side sends. Never in the build.
 
 export const SCENARIOS = {
-  empty: "빈 홈",
+  empty: "첫 화면",
   many: "여러 상태",
   recording: "녹음 중",
   setup: "설정 없음",
@@ -221,6 +221,13 @@ export function reset(scenario: Scenario) {
   meetings = [];
   line = [];
 
+  // The first run: no meetings and nothing set up yet, so the first screen shows its setup line.
+  if (scenario === "empty") {
+    settings = { ...settings, llm_connections: [], default_llm: null, webhooks: [], last_channel: null };
+    secrets = new Set();
+    models = modelState(false);
+  }
+  // 지금 할 일 (running, waiting, review, failed, interrupted) over 오늘, 어제 and older days.
   if (scenario === "many") {
     const chunked = stored("transcribing", at(0, 14, 0), {
       duration_ms: 47 * 60_000,
@@ -251,6 +258,10 @@ export function reset(scenario: Scenario) {
       queued,
       paused,
       summarized("주간 제품 회의", "review", at(0, 10, 0)),
+      summarized("채용 인터뷰 디브리프", "sent", at(0, 8, 30), {
+        duration_ms: 24 * 60_000,
+        sent: { channel: "#채용", at: at(0, 9, 5).toISOString(), edit_count: 1 },
+      }),
       // SUM-10: no LLM was asked, so no title and nothing sent anywhere.
       stored(
         "review",
@@ -267,6 +278,7 @@ export function reset(scenario: Scenario) {
       }),
       summarized("1:1 미팅", "archived", at(2, 11, 0), { duration_ms: 28 * 60_000 }),
       stored("transcribe_failed", at(1, 14, 0), {
+        duration_ms: 36 * 60_000,
         backend: "cpu",
         chunks_done: 2,
         error: "전사 워커가 같은 구간에서 세 번 멈췄습니다 (구간 3/5)",
@@ -275,6 +287,7 @@ export function reset(scenario: Scenario) {
         "summarize_failed",
         at(1, 10, 30),
         {
+          duration_ms: 51 * 60_000,
           backend: "gpu",
           chunks_done: 5,
           llm_connection: CLOUD.name,
@@ -308,16 +321,28 @@ export function reset(scenario: Scenario) {
     meetings = [
       live,
       summarized("주간 제품 회의", "review", at(0, 10, 0)),
+      summarized("채용 인터뷰 디브리프", "sent", at(0, 8, 30), {
+        duration_ms: 24 * 60_000,
+        sent: { channel: "#채용", at: at(0, 9, 5).toISOString(), edit_count: 1 },
+      }),
       summarized("디자인 리뷰", "sent", at(1, 16, 0), {
         sent: { channel: "#회의록", at: at(1, 16, 52).toISOString(), edit_count: 0 },
       }),
+      summarized("1:1 미팅", "archived", at(2, 11, 0), { duration_ms: 28 * 60_000 }),
     ];
   }
+  // Home with its setup line: a meeting stopped after transcribing for want of an LLM connection.
   if (scenario === "setup") {
     settings = { ...settings, llm_connections: [], default_llm: null, webhooks: [], last_channel: null };
     secrets = new Set();
     // A download stopped part way: 300 MB kept for resuming.
     models = modelState(false, 300_000_000);
+    meetings = [
+      stored("transcribed", at(0, 11, 0), { backend: "cpu", chunks_done: 3 }, { transcript: TRANSCRIPT }),
+      summarized("킥오프 미팅", "sent", at(3, 14, 0), {
+        sent: { channel: "#회의록", at: at(3, 14, 50).toISOString(), edit_count: 0 },
+      }),
+    ];
   }
 
   timers.push(setInterval(tick, 700), setInterval(levels, 40));

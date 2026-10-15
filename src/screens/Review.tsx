@@ -6,6 +6,7 @@ import {
   Field,
   mmss,
   Page,
+  ro,
   SelectField,
   TranscriptList,
 } from "@/components/common";
@@ -319,8 +320,8 @@ export default function Review({
               {meta.llm_connection && (
                 <p className="text-sm text-muted-foreground">
                   {meta.summarize_local
-                    ? `이 PC의 ${meta.llm_connection}(으)로 요약했습니다`
-                    : `전사본을 ${meta.llm_connection}(으)로 보내 요약했습니다`}
+                    ? `이 PC의 ${meta.llm_connection}${ro(meta.llm_connection)} 요약했습니다`
+                    : `전사본을 ${meta.llm_connection}${ro(meta.llm_connection)} 보내 요약했습니다`}
                 </p>
               )}
               <Field label="제목">
@@ -424,7 +425,7 @@ export default function Review({
             <Alert variant="success" role="status">
               <CircleCheck aria-hidden />
               <AlertDescription>
-                {`${meta.sent.channel}(으)로 전송함 · ${new Date(meta.sent.at).toLocaleString("ko-KR")} · 수정 ${meta.sent.edit_count}곳`}
+                {`${meta.sent.channel}${ro(meta.sent.channel)} 전송함 · ${new Date(meta.sent.at).toLocaleString("ko-KR")} · 수정 ${meta.sent.edit_count}곳`}
               </AlertDescription>
             </Alert>
           )}
@@ -450,7 +451,7 @@ export default function Review({
                   : editable && sendError
                     ? "다시 보내기"
                     : channel
-                      ? `${channel}(으)로 전송`
+                      ? `${channel}${ro(channel)} 전송`
                       : "Slack으로 전송"}
               </Button>
             )}
