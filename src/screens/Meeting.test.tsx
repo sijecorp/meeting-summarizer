@@ -240,6 +240,21 @@ test("a click on a line opens the editor there, and Esc goes back to the documen
   expect(textbox("요약").selectionStart).toBe(summary.indexOf("## 액션 아이템"));
 });
 
+// Moving up, a browser brings the caret only to the window's top edge: under App's sticky header.
+test("the caret moving up is kept clear of the sticky header", async () => {
+  mock({ meta: meta(), summary: "요약" });
+  render(<Meeting id={id} {...props} />);
+  const field = await openEditor();
+  const scrollBy = vi.spyOn(window, "scrollBy").mockImplementation(() => {});
+  const caret = vi.spyOn(Range.prototype, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 20, 1, 20));
+
+  fireEvent.select(field);
+  // 16px below the 48px header.
+  await waitFor(() => expect(scrollBy).toHaveBeenCalledWith(0, 20 - 48 - 16));
+  caret.mockRestore();
+  scrollBy.mockRestore();
+});
+
 test("leaving the editor goes back to the document, but not for the send bar or another app", async () => {
   mock({ meta: meta(), summary: "요약" });
   render(<Meeting id={id} {...props} />);

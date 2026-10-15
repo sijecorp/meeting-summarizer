@@ -1,3 +1,4 @@
+import { StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
@@ -97,6 +98,34 @@ test("switches from home to settings and back, forward and then back", async () 
   expect(cameIn(await first())).toBe("back");
   // Nothing recording or processing: no dock.
   expect(screen.queryByRole("button", { name: /^(녹음|처리) 중/ })).toBeNull();
+});
+
+// A key on a button that leaves with its screen: focus lands on the new screen's title, never the
+// page. A button that stays (the header's) keeps it. Opening the app moves nothing, even in
+// StrictMode's double run.
+test("a screen changed from the keyboard takes the focus its button had", async () => {
+  mock((cmd) => {
+    if (cmd === "list_meetings") return [];
+    if (cmd === "has_secret") return true;
+  });
+  render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
+  );
+  await first();
+  expect(document.activeElement).toBe(document.body);
+
+  const gear = screen.getByRole("button", { name: "설정" });
+  gear.focus();
+  fireEvent.click(gear, { detail: 0 });
+  const back = await screen.findByRole("button", { name: "홈으로" });
+  expect(document.activeElement).toBe(gear);
+
+  back.focus();
+  fireEvent.click(back, { detail: 0 });
+  const heading = await first();
+  await waitFor(() => expect(document.activeElement).toBe(heading));
 });
 
 test("opens on Home with empty settings; the setup line opens the matching tab", async () => {

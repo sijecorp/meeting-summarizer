@@ -289,7 +289,21 @@ export default function App() {
   useLayoutEffect(() => {
     if (window.scrollY) window.scrollTo(0, 0);
   }, [key]);
-  // The meeting's send bar goes here, above the dock.
+  // A control that changed the screen leaves with the old one, and its focus would fall to the page:
+  // it lands on the new screen's title instead (each screen's h1 takes focus), so Tab goes on from
+  // there and a screen reader says where it is. Its box stands in while the title is not there yet
+  // (Home before its list). Never as the app opens: StrictMode runs this twice with the first key.
+  const screenBox = useRef<HTMLDivElement>(null);
+  const shownKey = useRef(key);
+  useEffect(() => {
+    if (shownKey.current === key) return;
+    shownKey.current = key;
+    const active = document.activeElement;
+    if (active && active !== document.body && !active.closest("[inert]")) return;
+    const box = screenBox.current;
+    (box?.querySelector<HTMLElement>("h1") ?? box)?.focus({ preventScroll: true });
+  }, [key]);
+  // The meeting's send bar or the settings' save bar goes here, above the dock.
   const [barSlot, setBarSlot] = useState<HTMLElement | null>(null);
 
   const banners = [quitError, listError].filter(Boolean);
@@ -342,6 +356,9 @@ export default function App() {
         <AnimatePresence initial={false} mode="popLayout" custom={move}>
           <motion.div
             key={key}
+            ref={screenBox}
+            tabIndex={-1}
+            className="outline-hidden"
             layout="position"
             custom={move}
             variants={screenVariants}
@@ -382,7 +399,7 @@ export default function App() {
                   onSetup={(tab) => go({ name: "settings", tab })}
                 />
               )}
-              {screen.name === "settings" && <Settings tab={screen.tab} onHome={home} />}
+              {screen.name === "settings" && <Settings tab={screen.tab} barSlot={barSlot} onHome={home} />}
             </Present>
           </motion.div>
         </AnimatePresence>

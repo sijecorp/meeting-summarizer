@@ -399,7 +399,7 @@ export default function Home({
       <main className="mx-auto box-content flex min-h-[calc(100dvh-9rem)] max-w-home flex-col items-center justify-center gap-12 px-8 py-10 text-center">
         {errorBanner}
         <div className="space-y-4">
-          <h1 className="font-display text-display-l">
+          <h1 tabIndex={-1} className="font-display text-display-l outline-hidden">
             <span className="block">회의가 끝나면,</span> <span className="block">기록은 이미 와 있어요.</span>
           </h1>
           <p className="text-ink-2">녹음만 하면 이 PC에서 전사하고, 요약을 검토해 Slack으로 보냅니다.</p>
@@ -500,7 +500,7 @@ export default function Home({
     <main className="mx-auto box-content max-w-home space-y-10 px-8 pt-10 pb-8">
       <div className="space-y-4">
         <header className="flex flex-wrap items-center justify-between gap-4">
-          <h1 className="font-display text-display-m">
+          <h1 tabIndex={-1} className="font-display text-display-m outline-hidden">
             {today.toLocaleDateString("ko-KR", { month: "long", day: "numeric" })}{" "}
             <span className="font-display text-title text-ink-2">
               {today.toLocaleDateString("ko-KR", { weekday: "long" })}

@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import ReactDOM from "react-dom/client";
 import { MotionConfig } from "motion/react";
 import App from "@/App";
+import { modelDownload, startModelDownload } from "@/lib/ipc";
 import { install, reset, SCENARIOS, simulate, type Scenario } from "./fixtures";
 import "./preview.css";
 
@@ -15,8 +16,12 @@ function Preview() {
   const [scenario, setScenario] = useState<Scenario>("many");
   // Picking a scenario, even the same one, starts it over with a fresh App.
   const [run, setRun] = useState(0);
-  const pick = (next: Scenario) => {
+  const pick = async (next: Scenario) => {
     reset(next);
+    // ipc.ts keeps one download for the app: the last one settles first. 설정 없음 is mid-download,
+    // started before the App so Home and the 전사 tab follow it.
+    await modelDownload();
+    if (next === "setup") void startModelDownload();
     setScenario(next);
     setRun((n) => n + 1);
   };

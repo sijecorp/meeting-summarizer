@@ -70,7 +70,9 @@ export function Page({
           </Button>
         )}
         <div className="flex flex-wrap items-center justify-between gap-4">
-          <h1 className="font-display text-display-m">{title}</h1>
+          <h1 tabIndex={-1} className="font-display text-display-m outline-hidden">
+            {title}
+          </h1>
           {action}
         </div>
       </div>
@@ -376,9 +378,9 @@ export function Banner({
 }
 
 /** A native wrapping label: the control stays text-selectable and needs no id. */
-export function Field({ label, children }: { label: string; children: ReactNode }) {
+export function Field({ label, className, children }: { label: string; className?: string; children: ReactNode }) {
   return (
-    <label className="grid gap-1.5 text-sm">
+    <label className={`grid gap-1.5 text-sm ${className ?? ""}`}>
       <span className="font-medium text-muted-foreground">{label}</span>
       {children}
     </label>

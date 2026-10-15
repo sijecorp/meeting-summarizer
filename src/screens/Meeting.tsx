@@ -82,8 +82,10 @@ const REVIEWABLE: Status[] = ["review", "sent", "archived"];
 // `transcript.json` exists from `transcribed` on; a `paused` meeting has it only if it stopped
 // while summarizing, which is when it has a connection.
 const TRANSCRIBED: Status[] = ["transcribed", "summarizing", "summarize_failed", ...REVIEWABLE];
-/** Room kept between the caret and the send bar over the page's bottom. */
+/** Room kept between the caret and the send bar over the page's bottom, or App's header over its top. */
 const CARET_ROOM = 16;
+/** App's sticky header (h-12). */
+const HEADER = 48;
 
 /** SND-04: the channel last sent to while it still exists, else the first (so the only one). */
 const defaultChannel = (webhooks: Webhook[], last: string | null) =>
@@ -368,12 +370,15 @@ export default function Meeting({
     if (c.top != null && box?.height) window.scrollBy(0, box.top - c.top);
   };
   // The page scrolls, not the field, and a browser brings the caret only to the window's edge:
-  // under the send bar and the dock. It is lifted above them, once the text has its new layout.
+  // under the send bar and the dock, or going up, under the header. It is moved clear of them, once
+  // the text has its new layout.
   const lift = (field: HTMLTextAreaElement) =>
     requestAnimationFrame(() => {
       const box = caretRect(field);
+      if (!box?.height) return;
       const stack = barSlot?.parentElement?.getBoundingClientRect().top;
-      if (box?.height && stack && box.bottom > stack - CARET_ROOM) window.scrollBy(0, box.bottom - stack + CARET_ROOM);
+      if (box.top < HEADER + CARET_ROOM) window.scrollBy(0, box.top - HEADER - CARET_ROOM);
+      else if (stack && box.bottom > stack - CARET_ROOM) window.scrollBy(0, box.bottom - stack + CARET_ROOM);
     });
   // After Esc the document keeps the caret's line where it was, and focus goes to 고치기 without
   // taking the page to it.
@@ -612,7 +617,8 @@ export default function Meeting({
             layout="position"
             transition={arriving || !present ? titleMove : { duration: 0 }}
           >
-            <h1 className={editable ? undefined : cn(TITLE, !meta.title && "text-ink-2")}>
+            {/* Focus lands here when this screen opens from a key (App.tsx). */}
+            <h1 tabIndex={-1} className={cn("outline-hidden", !editable && TITLE, !editable && !meta.title && "text-ink-2")}>
               {editable ? (
                 <Grow
                   aria-label="제목"

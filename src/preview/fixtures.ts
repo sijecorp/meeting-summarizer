@@ -53,6 +53,16 @@ const OLLAMA: LlmConnection = {
   timeout_secs: 600,
 };
 
+// A second cloud connection, so the settings list has more than one of each.
+const GATEWAY: LlmConnection = {
+  name: "사내 게이트웨이",
+  base_url: "https://llm-gw.example.co.kr/v1",
+  model: "qwen3-235b",
+  context_tokens: 64_000,
+  is_local: false,
+  timeout_secs: 300,
+};
+
 const fullSettings = (): Settings => ({
   schema_version: 1,
   recorder_name: "홍길동",
@@ -62,7 +72,7 @@ const fullSettings = (): Settings => ({
   model_base_url: "https://huggingface.co",
   input_device: null,
   output_device: null,
-  llm_connections: [CLOUD, OLLAMA],
+  llm_connections: [CLOUD, OLLAMA, GATEWAY],
   default_llm: CLOUD.name,
   summarize_local_by_default: false,
   webhooks: [{ name: "#회의록" }, { name: "#개발팀" }],
@@ -236,7 +246,7 @@ export function reset(scenario: Scenario) {
   recording = null;
   serial = done = 0;
   settings = fullSettings();
-  secrets = new Set([`llm:${CLOUD.name}`, "slack:#회의록", "slack:#개발팀"]);
+  secrets = new Set([`llm:${CLOUD.name}`, `llm:${GATEWAY.name}`, "slack:#회의록", "slack:#개발팀"]);
   models = modelState(true);
   meetings = [];
   line = [];
@@ -363,7 +373,7 @@ export function reset(scenario: Scenario) {
   if (scenario === "setup") {
     settings = { ...settings, llm_connections: [], default_llm: null, webhooks: [], last_channel: null };
     secrets = new Set();
-    // A download stopped part way: 300 MB kept for resuming.
+    // A download stopped part way: 300 MB kept, resumed as the scenario starts (main.tsx).
     models = modelState(false, 300_000_000);
     meetings = [
       stored("transcribed", at(0, 11, 0), { backend: "cpu", chunks_done: 3 }, { transcript: TRANSCRIPT }),
@@ -715,10 +725,11 @@ const handlers: Handlers = {
           downloading = null;
           return cancelled ? reject("다운로드를 취소했습니다") : resolve();
         }
-        file.received = Math.min(file.size, file.received + Math.ceil(file.size / 30));
+        // About 32 MB/s: slow enough to watch the progress in the settings and on Home.
+        file.received = Math.min(file.size, file.received + 8_000_000);
         send("model://download", { file: file.file, received: file.received, total: file.size });
         if (file.received === file.size) Object.assign(file, { installed: true, received: 0 });
-      }, 100);
+      }, 250);
       timers.push(timer);
       downloading = { cancelled: false, done: resolve };
     }),

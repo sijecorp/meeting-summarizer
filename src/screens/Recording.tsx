@@ -126,11 +126,15 @@ export default function Recording({
             <Banner kind="error">{error}</Banner>
           </div>
         )}
-        {id === null && <h1 className="font-display text-display-m">진행 중인 녹음이 없습니다</h1>}
+        {id === null && (
+          <h1 tabIndex={-1} className="font-display text-display-m outline-hidden">
+            진행 중인 녹음이 없습니다
+          </h1>
+        )}
         {id && (
           <>
             <div className="flex flex-col items-center gap-2">
-              <h1 className="flex items-center gap-2 text-label text-ink-2">
+              <h1 tabIndex={-1} className="flex items-center gap-2 text-label text-ink-2 outline-hidden">
                 <span aria-hidden className="size-2 rounded-full bg-rec motion-safe:animate-breathe" />
                 녹음 중{startedAt && ` · ${hhmm(startedAt)} 시작`}
               </h1>

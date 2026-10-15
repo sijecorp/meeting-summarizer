@@ -1,7 +1,8 @@
+import { useState, type ComponentProps } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import {
   modelDownload,
   modelDownloadFailure,
@@ -11,13 +12,28 @@ import {
   type ModelFileState,
   type ModelState,
 } from "../lib/ipc";
-import Settings from "./Settings";
+import SettingsScreen from "./Settings";
+
+// Like App: the save bar goes into a slot of the bottom stack.
+function Settings(props: ComponentProps<typeof SettingsScreen>) {
+  const [slot, setSlot] = useState<HTMLElement | null>(null);
+  return (
+    <>
+      <SettingsScreen {...props} barSlot={slot} />
+      <div ref={setSlot} />
+    </>
+  );
+}
+// Connections and webhooks are rows that open to edit them.
+const expand = async (name: string) =>
+  fireEvent.click(await screen.findByRole("button", { name: new RegExp(`^${name}`) }));
 
 // The model download is app-wide (ipc.ts): each test's is settled and awaited here, and a failure
 // it left (kept until the next download) is cleared by one that works, so nothing leaks into the
 // next test. No clearMocks(): the screen unlistens asynchronously after unmount (see App.test.tsx).
 let release = () => {};
 afterEach(async () => {
+  vi.useRealTimers();
   cleanup();
   release();
   await modelDownload();
@@ -69,6 +85,7 @@ test("deletes a removed connection's secret only after a successful save", async
 
   render(<Settings onHome={() => {}} />);
   fireEvent.click(await screen.findByRole("button", { name: "요약(LLM)" }));
+  await expand("회사 클라우드");
   fireEvent.click(screen.getByRole("button", { name: "연결 삭제" }));
   const dialog = await screen.findByRole("alertdialog", { name: "회사 클라우드 연결을 삭제할까요?" });
   fireEvent.click(within(dialog).getByRole("button", { name: "삭제" }));
@@ -100,7 +117,7 @@ test("keeps unsaved edits across tabs and saves them all, keys included, at once
   render(<Settings onHome={() => {}} />);
   const tab = (name: string) => screen.getByRole("button", { name });
   const recorderName = () =>
-    screen.queryByRole("textbox", { name: "녹음자 이름 (Slack 메시지에 표시됩니다)" }) as HTMLInputElement;
+    screen.queryByRole("textbox", { name: "녹음자 이름" }) as HTMLInputElement;
 
   await screen.findByDisplayValue("홍길동");
   fireEvent.change(recorderName(), { target: { value: "김철수" } });
@@ -108,6 +125,7 @@ test("keeps unsaved edits across tabs and saves them all, keys included, at once
   fireEvent.click(tab("요약(LLM)"));
   expect(tab("요약(LLM)").getAttribute("aria-current")).toBe("page");
   expect(tab("일반").getAttribute("aria-current")).toBeNull();
+  await expand("회사 클라우드");
   fireEvent.change(screen.getByLabelText(/^API 키/), { target: { value: "sk-아직-안-넣음" } });
 
   fireEvent.click(tab("Slack"));
@@ -189,7 +207,8 @@ test("keeps a typed key and says so when the keychain write fails", async () => 
   });
   render(<Settings tab="llm" onHome={() => {}} />);
 
-  fireEvent.change(await screen.findByLabelText(/^API 키/), { target: { value: "sk-새 키" } });
+  await expand("회사 클라우드");
+  fireEvent.change(screen.getByLabelText(/^API 키/), { target: { value: "sk-새 키" } });
   fireEvent.click(screen.getByRole("button", { name: "저장" }));
 
   expect(
@@ -207,7 +226,8 @@ test("refuses to re-add a removed saved name before saving", async () => {
   });
   render(<Settings tab="llm" onHome={() => {}} />);
 
-  fireEvent.click(await screen.findByRole("button", { name: "연결 삭제" }));
+  await expand("회사 클라우드");
+  fireEvent.click(screen.getByRole("button", { name: "연결 삭제" }));
   const dialog = await screen.findByRole("alertdialog", { name: "회사 클라우드 연결을 삭제할까요?" });
   fireEvent.click(within(dialog).getByRole("button", { name: "삭제" }));
   await waitFor(() => expect(screen.queryByRole("button", { name: "연결 삭제" })).toBeNull());
@@ -238,16 +258,25 @@ test("a failed check opens the tab that holds the field", async () => {
   fireEvent.click(screen.getByRole("button", { name: "저장" }));
   expect(screen.getByText("용어집은 100개까지 넣을 수 있습니다")).toBeTruthy();
   expect(tab("전사").getAttribute("aria-current")).toBe("page");
+  // Pressed again with the same problem: a new alert, said again.
+  const said = screen.getByRole("alert");
+  fireEvent.click(screen.getByRole("button", { name: "저장" }));
+  expect(screen.getByRole("alert")).not.toBe(said);
+  expect(screen.getByRole("alert").textContent).toBe("용어집은 100개까지 넣을 수 있습니다");
 
   fireEvent.change(glossary, { target: { value: "홍길동" } });
   fireEvent.click(tab("요약(LLM)"));
+  await expand("회사 클라우드");
   fireEvent.change(screen.getByRole("spinbutton", { name: "컨텍스트 토큰" }), {
     target: { value: "" },
   });
+  // Closed again: the failure opens it.
+  await expand("회사 클라우드");
   fireEvent.click(tab("일반"));
   fireEvent.click(screen.getByRole("button", { name: "저장" }));
   expect(screen.getByText(/컨텍스트 토큰과 응답 시간 제한은 1 이상의 정수여야 합니다/)).toBeTruthy();
   expect(tab("요약(LLM)").getAttribute("aria-current")).toBe("page");
+  expect(screen.getByRole("button", { name: /^회사 클라우드/ }).getAttribute("aria-expanded")).toBe("true");
   expect(cmds).not.toContain("save_settings");
 });
 
@@ -295,7 +324,8 @@ test("retries a failed key delete on the next save and blocks re-adding the name
     fireEvent.click(screen.getByRole("button", { name: "연결 추가" }));
   };
 
-  fireEvent.click(await screen.findByRole("button", { name: "연결 삭제" }));
+  await expand("회사 클라우드");
+  fireEvent.click(screen.getByRole("button", { name: "연결 삭제" }));
   const dialog = await screen.findByRole("alertdialog", { name: "회사 클라우드 연결을 삭제할까요?" });
   fireEvent.click(within(dialog).getByRole("button", { name: "삭제" }));
   fireEvent.click(screen.getByRole("button", { name: "저장" }));
@@ -324,7 +354,8 @@ test("never stores a whitespace-only key and clears it", async () => {
   });
   render(<Settings tab="llm" onHome={() => {}} />);
 
-  fireEvent.change(await screen.findByLabelText(/^API 키/), { target: { value: "   " } });
+  await expand("회사 클라우드");
+  fireEvent.change(screen.getByLabelText(/^API 키/), { target: { value: "   " } });
   fireEvent.click(screen.getByRole("button", { name: "저장" }));
 
   expect(await screen.findByText("저장했습니다")).toBeTruthy();
@@ -369,11 +400,21 @@ test("read-only settings disable the key inputs and 저장", async () => {
   });
   render(<Settings tab="llm" onHome={() => {}} />);
 
-  // Disabled through the fieldset, which `.disabled` does not reflect but `:disabled` does.
-  expect((await screen.findByLabelText(/^API 키/)).matches(":disabled")).toBe(true);
-  expect(screen.getByRole("button", { name: "저장" }).matches(":disabled")).toBe(true);
-  // The tabs stay usable for reading.
+  // Disabled through the fieldset, which `.disabled` does not reflect but `:disabled` does. Rows
+  // still open, for reading.
+  await expand("회사 클라우드");
+  expect(screen.getByLabelText(/^API 키/).matches(":disabled")).toBe(true);
+  // Even a change forced past the disabled field never brings the save bar.
+  fireEvent.change(screen.getByLabelText(/^API 키/), { target: { value: "sk-막힘" } });
+  fireEvent.click(screen.getByRole("button", { name: "일반" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "녹음자 이름" }), { target: { value: "김철수" } });
+  await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+  expect(screen.queryByText(/^저장 안 한 변경/)).toBeNull();
+  expect(screen.queryByRole("button", { name: "저장" })).toBeNull();
+  // The tabs stay usable for reading; the selects are locked by their own prop, which Radix reads.
   expect(screen.getByRole("button", { name: "Slack" }).matches(":disabled")).toBe(false);
+  fireEvent.click(screen.getByRole("button", { name: "요약(LLM)" }));
+  expect((screen.getByRole("combobox", { name: "기본 LLM" }) as HTMLButtonElement).disabled).toBe(true);
 });
 
 // SUM-07 for each cloud address; SUM-08's default for new meetings needs a local connection.
@@ -390,10 +431,12 @@ test("요약(LLM) tab: where a transcript goes, and the local default only with 
   const localDefault = () => screen.queryByRole("switch", { name: "새 회의를 기본으로 로컬에서 요약" });
   const saved = () => calls.filter((c) => c.cmd === "save_settings").map((c) => c.args.value);
 
-  expect(await screen.findByText("요약할 때 전사본 전문이 이 주소로 전송됩니다")).toBeTruthy();
+  await expand("회사 클라우드");
+  expect(screen.getByText("요약할 때 전사본 전문이 이 주소로 전송됩니다")).toBeTruthy();
   expect(screen.queryByText(/OLLAMA_CONTEXT_LENGTH/)).toBeNull();
   expect(localDefault()).toBeNull();
-  // Hidden, so it cannot stay on.
+  // Hidden, so it cannot stay on. (The bar comes with an edit.)
+  fireEvent.change(screen.getByRole("textbox", { name: "모델" }), { target: { value: "m2" } });
   fireEvent.click(screen.getByRole("button", { name: "저장" }));
   await waitFor(() => expect(saved()).toMatchObject([{ summarize_local_by_default: false }]));
 
@@ -444,7 +487,10 @@ test("전사 tab: file states, download progress from events, and a quiet cancel
   fireEvent.click(screen.getByRole("button", { name: "다운로드" }));
   await act(() => emit("model://download", { file: WHISPER, received: 524_512_845, total: 874_188_075 }));
   expect(await screen.findByText("받는 중 60% (525/874MB)")).toBeTruthy();
-  expect((screen.getByRole("button", { name: "다운로드" }) as HTMLButtonElement).disabled).toBe(true);
+  // While it runs: only 취소 and the progress.
+  expect(screen.queryByRole("button", { name: "다운로드" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "직접 가져오기" })).toBeNull();
+  expect(screen.getByRole("progressbar", { name: "전사 모델 받는 중" })).toBeTruthy();
 
   fireEvent.click(screen.getByRole("button", { name: "취소" }));
   await waitFor(() =>
@@ -541,7 +587,7 @@ test("reopened mid-download, the tab follows the same download and later shows i
 
   const second = render(<Settings tab="transcription" onHome={() => {}} />);
   await waitFor(() => expect(button("취소").disabled).toBe(false));
-  expect(button("다운로드").disabled).toBe(true);
+  expect(screen.queryByRole("button", { name: "다운로드" })).toBeNull();
   // One decimal below 10 MB.
   await act(() => emit("model://download", { file: WHISPER, received: 4_370_940, total: 874_188_075 }));
   expect(await screen.findByText("받는 중 0% (4.4/874MB)")).toBeTruthy();
@@ -566,4 +612,258 @@ test("the 전사 tab explains a GPU fallback in automatic mode", async () => {
       "GPU 전사에 실패해 CPU로 처리하고 있습니다. 전사 백엔드를 GPU로 골라 저장하면 다시 GPU로 처리합니다.",
     ),
   ).toBeTruthy();
+});
+
+test("the selected tab carries the sliding indicator", async () => {
+  mockIPC((cmd) => {
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "has_secret") return true;
+    if (cmd === "model_status") return models();
+  });
+  render(<Settings onHome={() => {}} />);
+  const tab = (name: string) => screen.getByRole("button", { name });
+  const marked = () =>
+    ["일반", "오디오", "전사", "요약(LLM)", "Slack"].filter((name) => tab(name).querySelector("[data-indicator]"));
+
+  await screen.findByRole("heading", { name: "일반" });
+  expect(marked()).toEqual(["일반"]);
+  fireEvent.click(tab("전사"));
+  expect(marked()).toEqual(["전사"]);
+  expect(tab("전사").getAttribute("aria-current")).toBe("page");
+  expect(screen.getByRole("heading", { name: "전사" })).toBeTruthy();
+  expect(screen.queryByRole("heading", { name: "일반" })).toBeNull();
+});
+
+test("the backend is a segmented choice, and choosing GPU clears the fallback", async () => {
+  const calls: Call[] = [];
+  mockIPC((cmd, args) => {
+    calls.push({ cmd, args: args as Call["args"] });
+    if (cmd === "get_settings") return { ...loaded, settings: { ...loaded.settings, gpu_failed: true } };
+    if (cmd === "has_secret") return true;
+    if (cmd === "model_status") return models();
+  });
+  render(<Settings tab="transcription" onHome={() => {}} />);
+  const choice = (name: string) => screen.getByRole("radio", { name }) as HTMLInputElement;
+
+  // Named by its row's label and described by its help, as every row's control.
+  const group = await screen.findByRole("radiogroup", { name: "전사 백엔드" });
+  const help = document.getElementById(group.getAttribute("aria-describedby")!);
+  expect(help?.textContent).toBe("자동은 GPU로 처리하다 문제가 생기면 CPU로 바꿉니다");
+  const label = screen.getByText("전사 백엔드", { selector: "label" }) as HTMLLabelElement;
+  expect(document.getElementById(label.htmlFor)).toBe(group);
+  expect(within(group).getAllByRole("radio").map((r) => r.closest("label")?.textContent)).toEqual(["자동", "GPU", "CPU"]);
+  expect(choice("자동").checked).toBe(true);
+  fireEvent.click(choice("GPU"));
+  expect(choice("GPU").checked).toBe(true);
+  expect(choice("자동").checked).toBe(false);
+
+  fireEvent.click(screen.getByRole("button", { name: "저장" }));
+  await waitFor(() =>
+    expect(calls.find((c) => c.cmd === "save_settings")?.args.value).toMatchObject({ backend: "gpu", gpu_failed: false }),
+  );
+  expect(screen.queryByText(/GPU 전사에 실패해/)).toBeNull();
+});
+
+test("connection and webhook rows open in place and close again", async () => {
+  mockIPC((cmd) => {
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "has_secret") return true;
+  });
+  render(<Settings tab="llm" onHome={() => {}} />);
+  const row = (name: string) => screen.getByRole("button", { name: new RegExp(`^${name}`) });
+
+  // Its summary: name, where it sends, a tag in words, and the default marker.
+  expect((await screen.findByRole("button", { name: /^회사 클라우드/ })).getAttribute("aria-label")).toBe(
+    "회사 클라우드, 클라우드, api.example.com, 기본 LLM",
+  );
+  expect(row("회사 클라우드").getAttribute("aria-expanded")).toBe("false");
+  expect(screen.queryByRole("textbox", { name: "Base URL" })).toBeNull();
+  fireEvent.click(row("회사 클라우드"));
+  expect(row("회사 클라우드").getAttribute("aria-expanded")).toBe("true");
+  expect((screen.getByRole("textbox", { name: "Base URL" }) as HTMLInputElement).value).toBe("https://api.example.com/v1");
+  fireEvent.click(row("회사 클라우드"));
+  expect(screen.queryByRole("textbox", { name: "Base URL" })).toBeNull();
+
+  // A new webhook opens for its URL; removed, focus goes to the add row, not the page.
+  fireEvent.click(screen.getByRole("button", { name: "Slack" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "새 웹훅 이름" }), { target: { value: "#회의록" } });
+  fireEvent.click(screen.getByRole("button", { name: "웹훅 추가" }));
+  expect(row("#회의록").getAttribute("aria-expanded")).toBe("true");
+  expect(row("#회의록").getAttribute("aria-label")).toBe("#회의록, URL 입력 안 됨");
+  fireEvent.click(row("#회의록"));
+  expect(screen.queryByLabelText(/^웹훅 URL/)).toBeNull();
+  fireEvent.click(row("#회의록"));
+  fireEvent.click(screen.getByRole("button", { name: "웹훅 삭제" }));
+  fireEvent.click(within(await screen.findByRole("alertdialog")).getByRole("button", { name: "삭제" }));
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "새 웹훅 이름" })));
+});
+
+test("the save bar shows only with unsaved changes, and counts them", async () => {
+  mockIPC((cmd) => {
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "has_secret") return false;
+    if (cmd === "model_status") return models();
+  });
+  render(<Settings onHome={() => {}} />);
+  const count = () => screen.queryByText(/^저장 안 한 변경/)?.textContent ?? null;
+  const name = await screen.findByRole("textbox", { name: "녹음자 이름" });
+
+  expect(screen.queryByRole("button", { name: "저장" })).toBeNull();
+  expect(count()).toBeNull();
+  // 저장 trims the name, so spaces alone change nothing.
+  fireEvent.change(name, { target: { value: "홍길동 " } });
+  expect(count()).toBeNull();
+  fireEvent.change(name, { target: { value: "김철수" } });
+  expect(count()).toBe("저장 안 한 변경 1개");
+
+  fireEvent.click(screen.getByRole("button", { name: "전사" }));
+  fireEvent.click(await screen.findByRole("radio", { name: "CPU" }));
+  // Blank lines and spaces around terms are not a change: 저장 drops them.
+  fireEvent.change(screen.getByRole("textbox", { name: /^용어집/ }), { target: { value: "\n  \n" } });
+  expect(count()).toBe("저장 안 한 변경 2개");
+
+  // An added webhook and its typed URL are two; an edited connection is one however many fields.
+  fireEvent.click(screen.getByRole("button", { name: "Slack" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "새 웹훅 이름" }), { target: { value: "#회의록" } });
+  fireEvent.click(screen.getByRole("button", { name: "웹훅 추가" }));
+  fireEvent.change(screen.getByLabelText(/^웹훅 URL/), { target: { value: "https://hooks/x" } });
+  fireEvent.click(screen.getByRole("button", { name: "요약(LLM)" }));
+  await expand("회사 클라우드");
+  fireEvent.change(screen.getByRole("textbox", { name: "모델" }), { target: { value: "m2" } });
+  fireEvent.change(screen.getByRole("spinbutton", { name: "컨텍스트 토큰" }), { target: { value: "1000" } });
+  expect(count()).toBe("저장 안 한 변경 5개");
+
+  // Typing it back is no change at all.
+  fireEvent.click(screen.getByRole("button", { name: "일반" }));
+  fireEvent.change(name, { target: { value: "홍길동" } });
+  expect(count()).toBe("저장 안 한 변경 4개");
+});
+
+test("되돌리기 puts back what was saved, typed keys too after asking", async () => {
+  const cmds: string[] = [];
+  mockIPC((cmd) => {
+    cmds.push(cmd);
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "has_secret") return false;
+  });
+  render(<Settings onHome={() => {}} />);
+  const name = (await screen.findByRole("textbox", { name: "녹음자 이름" })) as HTMLInputElement;
+
+  // Nothing typed into a key: no question.
+  fireEvent.change(name, { target: { value: "김철수" } });
+  fireEvent.click(screen.getByRole("button", { name: "되돌리기" }));
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+  expect(name.value).toBe("홍길동");
+  await waitFor(() => expect(screen.queryByRole("button", { name: "저장" })).toBeNull());
+
+  fireEvent.change(name, { target: { value: "김철수" } });
+  fireEvent.click(screen.getByRole("button", { name: "Slack" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "새 웹훅 이름" }), { target: { value: "#회의록" } });
+  fireEvent.click(screen.getByRole("button", { name: "웹훅 추가" }));
+  fireEvent.change(screen.getByLabelText(/^웹훅 URL/), { target: { value: "https://hooks/x" } });
+  fireEvent.click(screen.getByRole("button", { name: "되돌리기" }));
+  const dialog = await screen.findByRole("alertdialog", { name: "입력한 키도 되돌릴까요?" });
+  fireEvent.click(within(dialog).getByRole("button", { name: "되돌리기" }));
+
+  await waitFor(() => expect(screen.queryByRole("button", { name: "저장" })).toBeNull());
+  expect(screen.queryByRole("button", { name: /^#회의록/ })).toBeNull();
+  expect(name.value).toBe("홍길동");
+  // Added again, it comes back without the URL typed before.
+  fireEvent.change(screen.getByRole("textbox", { name: "새 웹훅 이름" }), { target: { value: "#회의록" } });
+  fireEvent.click(screen.getByRole("button", { name: "웹훅 추가" }));
+  expect((screen.getByLabelText(/^웹훅 URL/) as HTMLInputElement).value).toBe("");
+  expect(cmds).not.toContain("save_settings");
+  expect(cmds).not.toContain("set_secret");
+});
+
+test("after a save the bar says so for a moment, then leaves", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  mockIPC((cmd) => {
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "has_secret") return true;
+  });
+  render(<Settings onHome={() => {}} />);
+
+  fireEvent.change(await screen.findByRole("textbox", { name: "녹음자 이름" }), { target: { value: "김철수" } });
+  fireEvent.click(screen.getByRole("button", { name: "저장" }));
+  expect(await screen.findByText("저장했습니다")).toBeTruthy();
+  expect(screen.getByRole("status").textContent).toBe("설정을 저장했습니다");
+  expect(screen.queryByRole("button", { name: "저장" })).toBeNull();
+
+  await act(() => vi.advanceTimersByTimeAsync(1500));
+  expect(screen.queryByText("저장했습니다")).toBeNull();
+  expect(screen.getByRole("status").textContent).toBe("");
+});
+
+test("saving locks the form and the bar until it ends", async () => {
+  let finish = () => {};
+  const cmds: string[] = [];
+  mockIPC((cmd) => {
+    cmds.push(cmd);
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "has_secret") return true;
+    if (cmd === "save_settings") return new Promise<void>((resolve) => (finish = resolve));
+  });
+  render(<Settings onHome={() => {}} />);
+  const name = await screen.findByRole("textbox", { name: "녹음자 이름" });
+
+  fireEvent.change(name, { target: { value: "김철수" } });
+  fireEvent.click(screen.getByRole("button", { name: "저장" }));
+  const saving = await screen.findByRole("button", { name: "저장 중…" });
+  expect(saving.getAttribute("aria-disabled")).toBe("true");
+  expect(screen.getByRole("button", { name: "되돌리기" }).getAttribute("aria-disabled")).toBe("true");
+  expect(name.matches(":disabled")).toBe(true);
+  // Pressed again meanwhile: still one save, and nothing reverted.
+  fireEvent.click(saving);
+  fireEvent.click(screen.getByRole("button", { name: "되돌리기" }));
+  expect(cmds.filter((c) => c === "save_settings")).toHaveLength(1);
+  expect((name as HTMLInputElement).value).toBe("김철수");
+  // Radix opens a select on pointerdown whatever its fieldset says: it is locked by its own prop.
+  fireEvent.click(screen.getByRole("button", { name: "요약(LLM)" }));
+  expect((screen.getByRole("combobox", { name: "기본 LLM" }) as HTMLButtonElement).disabled).toBe(true);
+
+  await act(async () => finish());
+  expect(await screen.findByText("저장했습니다")).toBeTruthy();
+  expect(name.matches(":disabled")).toBe(false);
+});
+
+// Architecture 9.2's keychain steps run after settings.json is written: the bar holds through them.
+test("the save bar stays through the keychain steps, then hands focus to the tab", async () => {
+  let finishDelete = () => {};
+  mockIPC((cmd) => {
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "has_secret") return true;
+    if (cmd === "delete_secret") return new Promise<void>((resolve) => (finishDelete = resolve));
+  });
+  render(<Settings tab="llm" onHome={() => {}} />);
+  await expand("회사 클라우드");
+  fireEvent.click(screen.getByRole("button", { name: "연결 삭제" }));
+  fireEvent.click(within(await screen.findByRole("alertdialog")).getByRole("button", { name: "삭제" }));
+  await waitFor(() => expect(screen.queryByRole("button", { name: /^회사 클라우드/ })).toBeNull());
+
+  const save = screen.getByRole("button", { name: "저장" });
+  save.focus();
+  fireEvent.click(save, { detail: 0 });
+  // settings.json is written and the key's delete is still out: the count stays as pressed.
+  await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
+  expect(document.activeElement).toBe(screen.getByRole("button", { name: "저장 중…" }));
+  expect(screen.getByText("저장 안 한 변경 2개")).toBeTruthy();
+
+  await act(async () => finishDelete());
+  expect(await screen.findByText("저장했습니다")).toBeTruthy();
+  expect(document.activeElement).toBe(screen.getByRole("button", { name: "요약(LLM)" }));
+});
+
+// ONB-02: import is the way out when the model state cannot be read.
+test("직접 가져오기 stays offered when the model status cannot be read", async () => {
+  mockIPC((cmd) => {
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "has_secret") return true;
+    if (cmd === "model_status") throw new Error("모델 폴더를 읽지 못했습니다");
+  });
+  render(<Settings tab="transcription" onHome={() => {}} />);
+
+  expect((await screen.findByRole("alert")).textContent).toMatch(/모델 폴더를 읽지 못했습니다/);
+  expect((screen.getByRole("button", { name: "직접 가져오기" }) as HTMLButtonElement).disabled).toBe(false);
+  expect(screen.queryByRole("button", { name: "다운로드" })).toBeNull();
 });

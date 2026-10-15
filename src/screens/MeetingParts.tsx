@@ -85,10 +85,11 @@ export function Grow({
 
 /** Where the caret is on screen, read off a `Grow`'s mirror, which holds the same text in the same
  * place: a textarea has no way to say. The box is the character after the caret's (a collapsed
- * range has none in some engines); at the very end the mirror's zero-width space stands in. */
+ * range has none in some engines); at the very end the mirror's zero-width space stands in. With a
+ * selection, the caret is its moving end: the start when it grows backward (Shift+Up). */
 export function caretRect(field: HTMLTextAreaElement) {
   const walk = document.createTreeWalker(field.previousElementSibling!, NodeFilter.SHOW_TEXT);
-  let left = field.selectionEnd;
+  let left = field.selectionDirection === "backward" ? field.selectionStart : field.selectionEnd;
   for (let node = walk.nextNode(); node; node = walk.nextNode()) {
     const length = node.textContent!.length;
     if (left < length) {
