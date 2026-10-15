@@ -140,6 +140,30 @@ pub fn classify(status: Status) -> Recovery {
     }
 }
 
+/// `2026-10-13T05:00:03Z`: how `meta.json` keeps times (8.2). UTC: std/time cannot read the local
+/// offset safely; the UI formats it in local time.
+pub fn utc(at: time::OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        at.year(),
+        at.month() as u8,
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second()
+    )
+}
+
+/// A title as stored: one line, however it was typed or pasted. It heads the `.md` export and
+/// names its file, and Slack's header (7.1).
+pub fn one_line(title: &str) -> String {
+    title
+        .split(|c: char| c.is_control() || c.is_whitespace())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Write to a temp file, fsync, then rename over the target so a crash never leaves a torn file.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp_name = path.as_os_str().to_owned();
@@ -255,7 +279,6 @@ impl Store {
     /// `summarize_local`: "로컬로 요약" starts as the settings' default (SUM-08).
     pub fn create(&self, title: &str, summarize_local: bool) -> Result<Meta, String> {
         let now = time::OffsetDateTime::now_utc();
-        // UTC: std/time cannot read the local offset safely; the UI formats it in local time.
         let id = format!(
             "{:04}-{:02}-{:02}T{:02}{:02}-{:04x}",
             now.year(),
@@ -270,15 +293,7 @@ impl Store {
             id: id.clone(),
             title: title.to_string(),
             status: Status::Recording,
-            created_at: format!(
-                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-                now.year(),
-                now.month() as u8,
-                now.day(),
-                now.hour(),
-                now.minute(),
-                now.second()
-            ),
+            created_at: utc(now),
             duration_ms: 0,
             gaps: Vec::new(),
             backend: None,
@@ -376,14 +391,10 @@ impl Store {
     }
 
     /// REV-01: the recorder's title and summary. `summary.generated.md` stays as the LLM wrote it
-    /// (SUM-05). The title is kept to one line: it heads the `.md` export and names its file.
+    /// (SUM-05). The title is kept to one line (`one_line`).
     pub fn save_summary(&self, id: &str, title: &str, body: &str) -> Result<Meta, String> {
         let path = self.dir_for(id)?.join("summary.md");
-        let title = title
-            .split(|c: char| c.is_control() || c.is_whitespace())
-            .filter(|w| !w.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let title = one_line(title);
         self.update(id, |meta| {
             if meta.status != Status::Review {
                 return Err("검토 중인 회의만 저장할 수 있습니다".into());

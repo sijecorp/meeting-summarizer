@@ -17,7 +17,6 @@ import { Button } from "@/components/ui/button";
 import { Progress as ProgressBar } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   deleteMeeting,
   SCHEMA_VERSION,
@@ -312,34 +311,22 @@ export function SelectField({
   );
 }
 
-/** A disabled control for a feature that is not built yet, with a hint on hover or focus. */
-export function NotYet({ hint, children }: { hint: string; children: ReactNode }) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span tabIndex={0} className="inline-block">
-          {children}
-        </span>
-      </TooltipTrigger>
-      <TooltipContent>{hint}</TooltipContent>
-    </Tooltip>
-  );
-}
-
 /** Confirmed in a dialog so a single misclick never removes a meeting (REV-04). */
 export function DeleteButton({
   id,
+  disabled,
   onDeleted,
   onError,
 }: {
   id: string;
+  disabled?: boolean;
   onDeleted: () => void;
   onError: (message: string) => void;
 }) {
   return (
     <AlertDialog>
       <AlertDialogTrigger asChild>
-        <Button variant="outline">
+        <Button variant="outline" disabled={disabled}>
           <Trash2 aria-hidden />
           삭제
         </Button>

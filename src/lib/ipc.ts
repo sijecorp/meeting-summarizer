@@ -1,8 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-// Mirrors src-tauri/src/store.rs, settings.rs, commands.rs, audio/mod.rs, queue.rs, summarize.rs
-// and transcribe/model.rs.
+// Mirrors src-tauri/src/store.rs, settings.rs, commands.rs, audio/mod.rs, queue.rs, summarize.rs,
+// slack.rs and transcribe/model.rs.
 
 export const SCHEMA_VERSION = 1;
 export const NEWER_VERSION = "새 버전 앱에서 만든 데이터입니다";
@@ -61,8 +61,9 @@ export type Meta = {
 /** A listed meeting. `interrupted`: left in `recording` by a crash, offered as 처리 계속 / 삭제 (STO-03). */
 export type MeetingItem = Meta & { interrupted: boolean };
 
-/** `summary`: the body (`summary.md` if edited, else the generated one without its title line). */
-export type MeetingDetail = { meta: Meta; summary: string };
+/** `summary`: the body (`summary.md` if edited, else the generated one without its title line).
+ * `sending`: a send of it is out, maybe from a review screen since closed. */
+export type MeetingDetail = { meta: Meta; summary: string; sending: boolean };
 
 export type Backend = "auto" | "gpu" | "cpu";
 
@@ -156,6 +157,28 @@ export const retrySummary = (id: string, connection: string) =>
  * when cancelled. */
 export const exportMarkdown = (id: string) => invoke<string | null>("export_markdown", { id });
 
+// Slack (architecture 7, 10.2).
+
+/** REV-02: Slack's limit for the message block. */
+export const SLACK_MAX = 12_000;
+/** REV-02: the characters Slack gets for this title and body, header included and footer not.
+ * `offsetMinutes`: the local UTC offset at the meeting's start; Rust cannot read it safely. */
+export const slackLength = (id: string, title: string, body: string, offsetMinutes: number) =>
+  invoke<number>("slack_length", { id, title, body, offsetMinutes });
+/** SND-01..06, on the send button only: saves the title and body, then posts them to the webhook
+ * named `webhook`. Resolves `sent`; on failure the meeting stays in `review` with the cause in
+ * `error`. Never retried by itself: a resend could post twice. */
+export const sendToSlack = (
+  id: string,
+  webhook: string,
+  title: string,
+  body: string,
+  offsetMinutes: number,
+) => invoke<Meta>("send_to_slack", { id, webhook, title, body, offsetMinutes });
+/** A send of this meeting ended, sent or not, whichever screen started it. */
+export const onSlackFinished = (handler: (id: string) => void) =>
+  listen<string>("slack://finished", (e) => handler(e.payload));
+
 // Recording (architecture 4, 10.2).
 
 /** A newer warning of the same kind replaces the older one. */
@@ -193,6 +216,9 @@ export const requestQuit = () => invoke<void>("request_quit");
 /** Quit was requested while work is running; the UI must ask before `confirmQuit`. */
 export const onQuitRequested = (handler: () => void) =>
   listen("app://quit-requested", handler);
+/** APP-03: an OS notification about this meeting was clicked; the window is already shown. */
+export const onOpenMeeting = (handler: (id: string) => void) =>
+  listen<string>("app://open-meeting", (e) => handler(e.payload));
 
 // Processing queue and models (architecture 5, 6, 10.2).
 

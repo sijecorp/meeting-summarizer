@@ -26,7 +26,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-single-instance = "2.5.3"
 keyring = "4.2.0"
-time = "0.3"
+# `parsing`: the meeting start for the Slack header (slack.rs).
+time = { version = "0.3", features = ["parsing"] }
 cpal = "0.18.2"
 hound = "3.5.1"
 rubato = "5.0.1"
@@ -39,9 +40,11 @@ keepawake = "0.6.1"
 whisper-rs = "0.16.0"
 # Model hashes. Same version the tree already has.
 sha2 = "0.10.9"
-# Model download, later LLM and Slack. The OS TLS stack and certificate store, so a company mirror
+# Model download, LLM and Slack. The OS TLS stack and certificate store, so a company mirror
 # with an in-house CA just works; system-proxy for company proxies.
 reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "system-proxy"] }
+# APP-03. 2.6.0 is the first to report desktop notification clicks (`Notification::on_action`).
+tauri-plugin-notification = "2.7.0"
 
 
 # Model hashes in dev builds and tests: unoptimized sha2 runs at ~30 MB/s, so checking the 874 MB
@@ -68,7 +71,9 @@ libc = "0.2.190"
 objc2 = "0.6.5"
 objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware", "objc2", "objc2-foundation"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFArray", "CFDictionary", "CFNumber", "CFString"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSString", "NSUUID", "NSValue"] }
+# NSBundle, NSUserNotification: clearing our delivered notifications when the window gains focus
+# (architecture 11.1).
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSString", "NSUUID", "NSUserNotification", "NSValue"] }
 whisper-rs = { version = "0.16.0", features = ["metal"] }
 
 [target."cfg(windows)".dependencies]

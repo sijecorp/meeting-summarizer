@@ -28,15 +28,15 @@ const models = (installed: boolean): ModelState => ({
 
 // What App asks on every start, unless the handler says otherwise: complete settings, installed
 // models and an empty line, so no setup card shows by accident.
-const mock = (handler: (cmd: string) => unknown) =>
+const mock = (handler: (cmd: string, args: Record<string, unknown>) => unknown) =>
   mockIPC(
-    (cmd) => {
+    (cmd, args) => {
       const defaults: Record<string, unknown> = {
         get_settings: loaded,
         model_status: models(true),
         queue_state: [],
       };
-      return handler(cmd) ?? defaults[cmd];
+      return handler(cmd, args as Record<string, unknown>) ?? defaults[cmd];
     },
     { shouldMockEvents: true },
   );
@@ -227,6 +227,23 @@ test("a recording stop refreshes the chip", async () => {
   expect(screen.queryByRole("button", { name: /^녹음 중/ })).toBeNull();
 });
 
+// A send may end after its review screen closed: the list must not keep it unsent.
+test("a finished send refreshes the list", async () => {
+  let list = [meeting("a", "review")];
+  mock((cmd) => {
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "list_meetings") return list;
+  });
+
+  render(<App />);
+  expect(await screen.findByText("검토 대기")).toBeTruthy();
+
+  list = [meeting("a", "sent")];
+  await act(() => emit("slack://finished", "a"));
+
+  expect(await screen.findByText("전송 완료")).toBeTruthy();
+});
+
 test("unreadable settings: the setup card leads to the error and the reset", async () => {
   let broken = true;
   mock((cmd) => {
@@ -377,4 +394,28 @@ test("a GPU fallback shows a dismissible warning", async () => {
   expect(await screen.findByText(message)).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "닫기" }));
   expect(screen.queryByText(message)).toBeNull();
+});
+
+// APP-03: the meeting as it is now decides the screen; it may have moved on since the notification.
+test("a notification click opens its meeting: review when ready, processing when it failed", async () => {
+  mock((cmd, args) => {
+    if (cmd === "list_meetings") return [];
+    if (cmd !== "get_meeting") return;
+    if (args.id === "a") return { meta: meeting("a", "review"), summary: "요약" };
+    if (args.id === "b") return { meta: meeting("b", "summarize_failed"), summary: "" };
+    throw new Error(`회의를 찾을 수 없습니다: ${args.id}`);
+  });
+
+  render(<App />);
+  expect(await screen.findByText("아직 회의가 없습니다")).toBeTruthy();
+
+  await act(() => emit("app://open-meeting", "a"));
+  expect(await screen.findByRole("heading", { level: 1, name: "검토" })).toBeTruthy();
+  expect(await screen.findByDisplayValue("요약")).toBeTruthy();
+
+  await act(() => emit("app://open-meeting", "b"));
+  expect(await screen.findByRole("heading", { level: 1, name: "처리 중" })).toBeTruthy();
+
+  await act(() => emit("app://open-meeting", "gone"));
+  expect(await screen.findByText("회의를 열지 못했습니다: Error: 회의를 찾을 수 없습니다: gone")).toBeTruthy();
 });

@@ -47,7 +47,7 @@ test("shows a transcribed meeting's transcript with times, HTML as text", async 
     { start_ms: 4_515_000, end_ms: 4_520_000, text: "<img src=x onerror=alert(1)> <b>다음</b> 안건" },
   ];
   mockIPC((cmd, args) => {
-    if (cmd === "get_meeting") return { meta: meta({}), summary: "" } satisfies MeetingDetail;
+    if (cmd === "get_meeting") return { meta: meta({}), summary: "", sending: false } satisfies MeetingDetail;
     if (cmd === "get_transcript" && (args as { id: string }).id === "2026-10-14T0500-a1b2") {
       return segments;
     }

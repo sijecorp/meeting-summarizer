@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { Archive, Copy, FileDown, Send, TriangleAlert } from "lucide-react";
+import { Archive, CircleCheck, Copy, FileDown, Send, TriangleAlert } from "lucide-react";
 import {
   Banner,
   DeleteButton,
   Field,
   mmss,
-  NotYet,
   Page,
+  SelectField,
   TranscriptList,
 } from "@/components/common";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -28,16 +28,32 @@ import {
   archiveMeeting,
   exportMarkdown,
   getMeeting,
+  getSettings,
   getTranscript,
   NEWER_VERSION,
+  onSlackFinished,
   saveSummary,
   SCHEMA_VERSION,
+  sendToSlack,
+  SLACK_MAX,
+  slackLength,
   type MeetingDetail,
   type Segment,
+  type Webhook,
 } from "@/lib/ipc";
+import type { SettingsTab } from "@/screens/Settings";
 
 /** Autosave waits this long after the last keystroke. */
 const SAVE_DELAY_MS = 800;
+/** The Slack length is counted again this long after the last keystroke. */
+const LENGTH_DELAY_MS = 200;
+
+/** SND-04: the channel last sent to while it still exists, else the first (so the only one). */
+const defaultChannel = (webhooks: Webhook[], last: string | null) =>
+  last && webhooks.some((w) => w.name === last) ? last : (webhooks[0]?.name ?? "");
+
+/** The local UTC offset at the meeting's start, in minutes, for the Slack header's time. */
+const offsetOf = (createdAt: string) => -new Date(createdAt).getTimezoneOffset();
 
 // Called within the click, as WebKit wants. The webview may have no clipboard or refuse it: either
 // way the recorder is told.
@@ -69,11 +85,14 @@ export default function Review({
   id,
   onHome,
   onNotice,
+  onSetup,
 }: {
   id: string;
   onHome: () => void;
   /** The app's banner: a save that fails after the screen has closed is told there. */
   onNotice: (message: string) => void;
+  /** Opens a settings tab: the Slack one when there is no webhook to send to. */
+  onSetup: (tab: SettingsTab) => void;
 }) {
   const s = savesOf(id);
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
@@ -86,6 +105,13 @@ export default function Review({
   const [copied, setCopied] = useState<{ at: "summary" | "transcript"; text: string } | null>(null);
   const [exported, setExported] = useState("");
   const [error, setError] = useState("");
+  const [webhooks, setWebhooks] = useState<Webhook[] | null>(null);
+  const [channel, setChannel] = useState("");
+  // REV-02, from slack.rs: what the send would carry, header included.
+  const [length, setLength] = useState<number | null>(null);
+  const [sending, setSending] = useState(false);
+  // SND-06: why the last send failed, also when this screen opens again.
+  const [sendError, setSendError] = useState("");
   const timer = useRef(0);
 
   /** Saves the pending edit now (REV-01). Only the latest save's reply shows. A failed edit stays
@@ -131,16 +157,33 @@ export default function Review({
   };
 
   // Read after the last save of an earlier visit has landed. An edit that visit could not save
-  // comes back into the fields and goes again.
+  // comes back into the fields and goes again. A send that visit started may still be out
+  // (`sending`): its end is listened for before the read, so it cannot fall between, and read then.
   useEffect(() => {
     let live = true;
-    s.last
-      .catch(() => {})
+    const show = (d: MeetingDetail) => {
+      setDetail(d);
+      // In review, `error` is only ever a failed send's (the queue clears it before review).
+      setSendError(d.meta.status === "review" ? (d.meta.error ?? "") : "");
+    };
+    const unlisten = onSlackFinished((done) => {
+      if (done !== id) return;
+      getMeeting(id).then(
+        (d) => live && show(d),
+        (e) => live && setError(String(e)),
+      );
+    });
+    unlisten
+      .then(
+        () => {},
+        (e) => live && setError(`전송 결과 알림을 준비하지 못했습니다: ${e}`),
+      )
+      .then(() => s.last.catch(() => {}))
       .then(() => getMeeting(id))
       .then(
         (d) => {
           if (!live) return;
-          setDetail(d);
+          show(d);
           const unsaved = s.pending;
           setTitle(unsaved?.title ?? d.meta.title);
           setBody(unsaved?.body ?? d.summary);
@@ -153,6 +196,7 @@ export default function Review({
       );
     return () => {
       live = false;
+      unlisten.then((stop) => stop(), () => {});
     };
   }, [id]);
 
@@ -163,6 +207,36 @@ export default function Review({
       void flush().catch((e) => onNotice(`검토 화면에서 고친 내용을 저장하지 못했습니다: ${e}`)),
     [],
   );
+
+  useEffect(() => {
+    getSettings().then(
+      ({ settings }) => {
+        setWebhooks(settings.webhooks);
+        setChannel(defaultChannel(settings.webhooks, settings.last_channel));
+      },
+      (e) => setError(`설정을 읽지 못했습니다: ${e}`),
+    );
+  }, []);
+
+  // Counted by Rust from the very text a send builds, a moment after typing stops.
+  const createdAt = detail?.meta.created_at;
+  const noSpeech = detail?.meta.no_speech;
+  useEffect(() => {
+    if (!createdAt || noSpeech) return;
+    let live = true;
+    const t = window.setTimeout(
+      () =>
+        slackLength(id, title, body, offsetOf(createdAt)).then(
+          (n) => live && setLength(n),
+          () => live && setLength(null),
+        ),
+      LENGTH_DELAY_MS,
+    );
+    return () => {
+      live = false;
+      window.clearTimeout(t);
+    };
+  }, [id, createdAt, noSpeech, title, body]);
 
   useEffect(() => {
     if (!copied) return;
@@ -190,15 +264,39 @@ export default function Review({
       () => {},
     );
   };
+  // SND-05: only this click sends. A pending edit is saved first, and a failed save stops it.
+  const send = () => {
+    if (!createdAt) return;
+    setError("");
+    setSendError("");
+    setSending(true);
+    flush()
+      .then(
+        () =>
+          sendToSlack(id, channel, title, body, offsetOf(createdAt)).then(
+            (meta) => {
+              setDetail((d) => d && { ...d, meta });
+              setTitle(meta.title);
+            },
+            (e) => setSendError(String(e)),
+          ),
+        () => {},
+      )
+      .finally(() => setSending(false));
+  };
   const copyText = (at: "summary" | "transcript", text: string) => {
     setError("");
     copy(text).then((note) => setCopied({ at, text: note }));
   };
 
   const meta = detail?.meta;
+  // This screen's send, or one an earlier visit started that is still out.
+  const inFlight = sending || !!detail?.sending;
   const newer = !!meta && meta.schema_version > SCHEMA_VERSION;
   // `sent`, `archived` and a newer app's meeting stay read-only.
   const editable = meta?.status === "review" && !newer;
+  const over = Math.max(0, (length ?? 0) - SLACK_MAX);
+  const canSend = editable && !meta?.no_speech && !!channel && over === 0 && !inFlight;
   // REV-01: the prompt writes "미정" for an owner or a date nobody named (architecture 6.2).
   const undecided = body
     .split("\n")
@@ -228,7 +326,7 @@ export default function Review({
               <Field label="제목">
                 <Input
                   value={title}
-                  readOnly={!editable}
+                  readOnly={!editable || inFlight}
                   onChange={(e) => edit({ title: e.target.value, body })}
                 />
               </Field>
@@ -236,14 +334,22 @@ export default function Review({
                 <Textarea
                   className="h-96 field-sizing-fixed font-mono"
                   value={body}
-                  readOnly={!editable}
+                  readOnly={!editable || inFlight}
                   onChange={(e) => edit({ title, body: e.target.value })}
                 />
               </Field>
               <div className="flex justify-between gap-4 text-sm text-muted-foreground">
                 <span>{saveState}</span>
-                <span>{Array.from(body).length.toLocaleString("ko-KR")}자</span>
+                {length != null && (
+                  <span>{`${length.toLocaleString("ko-KR")} / ${SLACK_MAX.toLocaleString("ko-KR")}자 (Slack 전송 기준)`}</span>
+                )}
               </div>
+              {/* REV-02 */}
+              {editable && over > 0 && (
+                <Banner kind="warning">
+                  {`Slack 한도 12,000자를 넘었습니다. ${over.toLocaleString("ko-KR")}자를 줄여 주세요`}
+                </Banner>
+              )}
               {/* Updated while typing, so a note rather than an alert that would interrupt. */}
               {undecided.length > 0 && (
                 <Alert variant="warning" role="note">
@@ -313,18 +419,50 @@ export default function Review({
               )}
             </div>
           </details>
+          {meta.status === "sent" && meta.sent && (
+            // Read-only from here on: where it went, when, and how much the recorder changed.
+            <Alert variant="success" role="status">
+              <CircleCheck aria-hidden />
+              <AlertDescription>
+                {`${meta.sent.channel}(으)로 전송함 · ${new Date(meta.sent.at).toLocaleString("ko-KR")} · 수정 ${meta.sent.edit_count}곳`}
+              </AlertDescription>
+            </Alert>
+          )}
+          {/* SND-06: the cause; the send button turns into 다시 보내기, and 요약 복사 is above. */}
+          {editable && sendError && <Banner kind="error">{sendError}</Banner>}
+          {editable && !meta.no_speech && webhooks && webhooks.length > 1 && (
+            <div className="max-w-xs">
+              <SelectField
+                label="보낼 채널"
+                value={channel}
+                options={webhooks.map((w) => ({ value: w.name, label: w.name }))}
+                disabled={inFlight}
+                onChange={setChannel}
+              />
+            </div>
+          )}
           <div className="flex flex-wrap items-center gap-2">
-            {/* REV-02's exact count and the send itself come with slack.rs in M5. */}
-            <NotYet hint="Slack 전송은 다음 단계에서 추가됩니다">
-              <Button disabled>
+            {meta.status !== "sent" && (
+              <Button disabled={!canSend} onClick={send}>
                 <Send aria-hidden />
-                Slack으로 전송
+                {inFlight
+                  ? "보내는 중…"
+                  : editable && sendError
+                    ? "다시 보내기"
+                    : channel
+                      ? `${channel}(으)로 전송`
+                      : "Slack으로 전송"}
               </Button>
-            </NotYet>
+            )}
+            {editable && webhooks?.length === 0 && (
+              <Button variant="link" onClick={() => onSetup("slack")}>
+                웹훅 추가하기
+              </Button>
+            )}
             {meta.status === "review" && !newer && (
               <AlertDialog>
                 <AlertDialogTrigger asChild>
-                  <Button variant="outline">
+                  <Button variant="outline" disabled={inFlight}>
                     <Archive aria-hidden />
                     전송 안 함
                   </Button>
@@ -346,6 +484,7 @@ export default function Review({
             )}
             <DeleteButton
               id={id}
+              disabled={inFlight}
               onDeleted={() => {
                 // Nothing is left to save, and leaving must not say otherwise.
                 saves.delete(id);

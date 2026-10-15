@@ -457,6 +457,10 @@ export default function Settings({
                   onChange={(e) => edit({ recorder_name: e.target.value })}
                 />
               </Field>
+              {/* ONB-03: desktop notification permission cannot be read, so this is all we can say. */}
+              <p className="text-sm text-muted-foreground">
+                알림이 보이지 않으면 OS 알림 설정에서 '회의 요약'을 허용해 주세요
+              </p>
             </section>
 
             <section hidden={tab !== "audio"} className="space-y-4">

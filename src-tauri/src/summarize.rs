@@ -217,7 +217,7 @@ fn message(intro: &str, content: &str) -> String {
 
 /// Greedy: items into packs that, joined by `sep`, hold at most `room` characters, in order. An
 /// item longer than `room` is a pack of its own; callers cut or reject such items first.
-fn pack(items: Vec<String>, sep: &str, room: usize) -> Vec<Vec<String>> {
+pub(crate) fn pack(items: Vec<String>, sep: &str, room: usize) -> Vec<Vec<String>> {
     let mut packs: Vec<Vec<String>> = Vec::new();
     let mut len = 0;
     for item in items {
@@ -237,17 +237,14 @@ fn pack(items: Vec<String>, sep: &str, room: usize) -> Vec<Vec<String>> {
 }
 
 /// A line longer than `room` cut by characters, so a part never overflows (6.3).
-fn cut(line: &str, room: usize) -> Vec<String> {
+pub(crate) fn cut(line: &str, room: usize) -> Vec<String> {
     let chars: Vec<char> = line.chars().collect();
     chars.chunks(room).map(|c| c.iter().collect()).collect()
 }
 
-/// Requests that never go through a proxy: a local connection's (SUM-08 keeps the transcript off
-/// the network), and any to a loopback address. With `system-proxy` they would otherwise reach a
-/// company proxy in cleartext: hyper-util ignores the macOS proxy exceptions, and Windows'
-/// `<local>` does not match `localhost`.
-fn direct(connection: &LlmConnection) -> bool {
-    let loopback = reqwest::Url::parse(connection.base_url.trim())
+/// A URL to this machine: `localhost`, `*.localhost`, `127.0.0.0/8`, `::1`.
+pub(crate) fn loopback(url: &str) -> bool {
+    reqwest::Url::parse(url.trim())
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .is_some_and(|host| {
@@ -257,8 +254,15 @@ fn direct(connection: &LlmConnection) -> bool {
                     .trim_matches(['[', ']'])
                     .parse::<std::net::IpAddr>()
                     .is_ok_and(|ip| ip.is_loopback())
-        });
-    connection.is_local || loopback
+        })
+}
+
+/// Requests that never go through a proxy: a local connection's (SUM-08 keeps the transcript off
+/// the network), and any to a loopback address. With `system-proxy` they would otherwise reach a
+/// company proxy in cleartext: hyper-util ignores the macOS proxy exceptions, and Windows'
+/// `<local>` does not match `localhost`.
+fn direct(connection: &LlmConnection) -> bool {
+    connection.is_local || loopback(&connection.base_url)
 }
 
 /// The server rejected `max_tokens` or `temperature`: OpenAI's reasoning models do (6.1).

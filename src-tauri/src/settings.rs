@@ -180,20 +180,31 @@ impl SettingsStore {
         // keeps the stored value, and switching the backend to "GPU" clears it.
         settings.gpu_failed = stored["gpu_failed"].as_bool().unwrap_or(false)
             && !(settings.backend == Backend::Gpu && stored["backend"] != "gpu");
+        // `last_channel` belongs to sending (SND-04) the same way.
+        settings.last_channel = stored["last_channel"].as_str().map(String::from);
         self.write(settings)
     }
 
-    /// The GPU crashed twice on one chunk: automatic mode uses the CPU from now on (TRN-06).
-    pub fn mark_gpu_failed(&self) -> Result<(), String> {
+    /// One field written by the app itself, the rest as stored.
+    fn patch(&self, f: impl FnOnce(&mut Settings)) -> Result<(), String> {
         let _guard = self.lock.lock().unwrap();
         let loaded = self.load()?;
         if loaded.read_only {
             return Err(NEWER_VERSION.to_string());
         }
-        self.write(Settings {
-            gpu_failed: true,
-            ..loaded.settings
-        })
+        let mut settings = loaded.settings;
+        f(&mut settings);
+        self.write(settings)
+    }
+
+    /// The GPU crashed twice on one chunk: automatic mode uses the CPU from now on (TRN-06).
+    pub fn mark_gpu_failed(&self) -> Result<(), String> {
+        self.patch(|s| s.gpu_failed = true)
+    }
+
+    /// SND-04: a send went to this webhook, so it is the next default.
+    pub fn set_last_channel(&self, name: &str) -> Result<(), String> {
+        self.patch(|s| s.last_channel = Some(name.to_string()))
     }
 
     fn write(&self, mut settings: Settings) -> Result<(), String> {
@@ -443,6 +454,22 @@ mod tests {
             })
             .unwrap();
         assert!(!store.load().unwrap().settings.gpu_failed);
+    }
+
+    #[test]
+    fn a_send_sets_last_channel_and_settings_saves_keep_it() {
+        let (_tmp, store) = store();
+        let loaded_earlier = Settings {
+            recorder_name: "홍길동".into(),
+            ..Settings::default()
+        };
+        store.save(loaded_earlier.clone()).unwrap();
+        store.set_last_channel("#회의록").unwrap();
+        // The settings screen still holds what it loaded before the send.
+        store.save(loaded_earlier).unwrap();
+        let loaded = store.load().unwrap().settings;
+        assert_eq!(loaded.last_channel.as_deref(), Some("#회의록"));
+        assert_eq!(loaded.recorder_name, "홍길동");
     }
 
     #[test]

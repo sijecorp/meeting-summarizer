@@ -45,11 +45,11 @@
 | WAV 기록 | `hound` | |
 | 리샘플 | `rubato` 5 | 장치 샘플레이트 → 16kHz. 안티에일리어싱 FFT 리샘플러(`Fft`) |
 | 전사 | `whisper-rs` 0.16.0 (whisper.cpp 바인딩) | M3에서 0.16.0으로 고정했다(`whisper-rs-sys` 0.15.0, whisper.cpp 1.8.3 내장). 내장 VAD, `suppress_nst`, `no_context`, initial prompt, `use_gpu`, 진행률 콜백이 모두 있다. features는 `Cargo.toml`에서 대상별로 준다: macOS `metal`, Windows `vulkan`. 빌드에 `cmake`가 필요하다. Windows Vulkan 빌드 확인은 **[S3]** CI에 남아 있다 |
-| HTTP | `reqwest` 0.13 (`default-features = false`, `native-tls`, `system-proxy`) | LLM, Slack, 모델 다운로드. OS의 TLS와 인증서 저장소를 써서 사내 미러의 사내 CA를 따로 설정하지 않아도 믿는다. 기본값(rustls + aws-lc-rs)은 C 빌드가 하나 더 붙는다. M4는 기능을 더하지 않았다(요청 본문은 `serde_json`으로 만든다). M5에서 필요한 기능만 더한다 |
+| HTTP | `reqwest` 0.13 (`default-features = false`, `native-tls`, `system-proxy`) | LLM, Slack, 모델 다운로드. OS의 TLS와 인증서 저장소를 써서 사내 미러의 사내 CA를 따로 설정하지 않아도 믿는다. 기본값(rustls + aws-lc-rs)은 C 빌드가 하나 더 붙는다. M4·M5 모두 기능을 더하지 않았다(요청 본문은 `serde_json`으로 만든다) |
 | 해시 | `sha2` 0.10 | 모델 검증. 트리에 이미 있던 버전이라 중복이 없다 |
 | 비밀값 | `keyring` 4.x | `tauri-plugin-stronghold`는 지원 중단돼 쓰지 않는다 |
 | 절전 방지 | `keepawake` | |
-| Tauri 플러그인 | `tauri-plugin-notification` >= 2.6.0(데스크톱 알림 클릭 `onAction`이 이 버전부터 동작), `tauri-plugin-dialog`(파일 선택), `tauri-plugin-single-instance`(두 번째 실행 차단, eng review D14), 내장 tray-icon | 자동 업데이트(`tauri-plugin-updater`)는 파일럿 뒤로 미뤘다(eng review D2) |
+| Tauri 플러그인 | `tauri-plugin-notification` 2.7.0(데스크톱 알림 클릭 보고가 2.6.0부터 동작한다. Rust의 `Notification::on_action`으로 받는다, 10.1), `tauri-plugin-dialog`(파일 선택), `tauri-plugin-single-instance`(두 번째 실행 차단, eng review D14), 내장 tray-icon | 자동 업데이트(`tauri-plugin-updater`)는 파일럿 뒤로 미뤘다(eng review D2) |
 
 ## 3. 디렉터리 구조 (제안)
 
@@ -71,7 +71,7 @@ src-tauri/src/
     engine.rs        whisper-rs 실행, 백엔드 선택, 중단 콜백, VAD 기반 10분 구간 나누기
     filter.rs        환각 필터, 비정상 결과 검사 (순수 로직)
   summarize.rs       OpenAI 호환 클라이언트, 연결 고르기, 프롬프트, 구간 요약, 실패 분류, 요약 eval(12.3)
-  slack.rs           페이로드 생성, 글자 수 계산, 전송
+  slack.rs           페이로드 생성, 글자 수 계산, mrkdwn 대체, 수정 수 계산, 전송
   store.rs           폴더 구조, meta.json, 상태 전이, 앱 시작 시 복구, 요약 저장
   queue.rs           처리 대기열(최대 2개 동시 처리, 한 자리에서 전사 → 요약, 나머지는 FIFO), 일시정지·중단
   resources/
@@ -81,7 +81,7 @@ src/
   main.tsx, App.tsx  화면 전환 (라우터 라이브러리 없이 상태 하나로)
   screens/           Home, Recording, Processing, Review, Settings
   components/ui/     shadcn이 생성한 컴포넌트(button, input, textarea, card, alert, alert-dialog, select, switch, badge, tooltip, progress)
-  components/        앱 전용 컴포넌트(common.tsx: Page, StatusBadge, Banner, Field, DeleteButton 등. 이후 ChannelSelect. 녹음 화면의 Spectrum은 Recording.tsx에 둔다)
+  components/        앱 전용 컴포넌트(common.tsx: Page, StatusBadge, Banner, Field, SelectField, DeleteButton 등. 검토 화면의 채널 선택도 SelectField다. 녹음 화면의 Spectrum은 Recording.tsx에 둔다)
   lib/ipc.ts         invoke·이벤트 타입 래퍼
   lib/utils.ts       shadcn `cn()` (`export { cn } from "cn"`, CLI 4.21 기본)
   test-setup.ts      Vitest jsdom 보완 코드(Radix용)
@@ -270,7 +270,7 @@ queue.rs ──spawn── 앱 실행 파일 --plan-chunks {회의 폴더} {VAD 
 - 장치는 구간마다 설정을 다시 읽어 정한다. 그래서 한 회의가 `gpu_failed`를 쓰면 함께 돌던 다른 회의도 다음 구간부터 CPU를 쓴다.
 - **GPU 워커 크래시** (5.3 종료 코드 계약의 "크래시", 또는 kill하지 않았는데 결과 없이 끝남):
   - 같은 구간을 GPU 워커로 **한 번** 즉시 다시 실행한다.
-  - 다시 비정상 종료하면 `settings.json`에 `gpu_failed=true`를 쓰고, 녹음자에게 "GPU 처리가 불안정해 CPU로 전환했습니다. 처리 시간이 길어집니다" 알림을 띄운 뒤, 같은 구간을 CPU 워커로 처리한다. M3의 알림은 `transcribe://gpu-failed` 이벤트이고, OS 알림은 M5에서 붙인다.
+  - 다시 비정상 종료하면 `settings.json`에 `gpu_failed=true`를 쓰고, 녹음자에게 "GPU 처리가 불안정해 CPU로 전환했습니다. 처리 시간이 길어집니다" 알림을 띄운 뒤, 같은 구간을 CPU 워커로 처리한다. 알림은 `transcribe://gpu-failed` 이벤트(앱 안 배너)다. 열 회의가 없어 OS 알림은 보내지 않는다(10.1, 11.1).
   - CPU 워커까지 비정상 종료하면 회의를 `transcribe_failed`로 바꾸고 원인(`worker.log` 마지막 줄)을 보여준다.
   - 앱 재시작은 필요 없다. 크래시 횟수는 처리 중 메모리에만 둔다.
 - **비정상 결과 검사** (TRN-07): 환각 필터를 거친 구간 결과가 아래 중 하나면 그 구간을 CPU로 한 번 다시 처리한다. GPU 결과에만 한다. CPU 결과는 다시 돌려도 같으므로 이상해 보여도 그대로 쓴다.
@@ -391,16 +391,38 @@ queue.rs ──spawn── 앱 실행 파일 --plan-chunks {회의 폴더} {VAD 
 }
 ```
 
-- `text`는 알림 미리보기용 대체 텍스트다.
-- 요청 시간 제한은 15초다(eng review D12).
-- `markdown` 블록의 `text`(머리말 + 본문) 길이가 12,000자를 넘으면 전송하지 않는다(REV-02). 검토 화면의 글자 수는 이 값을 그대로 센다. 꼬리말은 별도 `context` 블록이라 세지 않는다.
-- **[S5]** 웹훅이 `markdown` 블록을 거부하면 `section` 블록과 mrkdwn으로 바꾼다. 이때는 변환이 필요하다: `**굵게**` → `*굵게*`, 제목(`#`) → 굵은 줄, 링크 → `<url|text>`, `&` `<` `>` 이스케이프. 또 3,000자마다 section 블록을 나눈다.
+- `text`는 알림 미리보기용 대체 텍스트다. mrkdwn으로 읽히므로 제목의 `&` `<` `>`를 이스케이프한다. LLM이 쓴 제목의 `<!channel>`이 멘션이 되지 않게 하려는 것이다.
+- **멘션 무력화**: `markdown` 블록이 `<!here>`, `<!channel>`, `<@U…>`, `<#C…>`를 멘션으로 읽는지 Slack 문서는 말하지 않는다. 그래서 제목·녹음자 이름·본문의 `<!`, `<@`, `<#`는 `<` 바로 뒤에 U+200B(폭 없는 공백)를 넣어 글자로 남긴다. `slack::markdown`이 머리말과 본문을 합친 뒤에 넣으므로 `slack_length`가 세는 글자(12,000자 검사 포함)가 곧 보내는 글자다(넣은 만큼 늘어난다). 대체 경로는 이것을 다시 `&lt;`로 이스케이프하고, `text`에는 이스케이프로 `<`가 남지 않는다. 링크 모양의 `[x](!here)`를 `markdown` 블록이 어떻게 보이는지는 수동 점검으로 확인한다(로드맵 M5).
+- **머리말**: `{제목}`은 저장된 한 줄 제목(`store::one_line`, 비었으면 "제목 없음"). `{일시}`는 회의 시작(`created_at`)의 녹음자 현지 시각으로 `2026-10-13 (화) 14:00` 형식이다. Rust는 현지 시차를 안전하게 읽지 못하므로(8.2) 웹뷰가 그 시각의 시차를 분으로 넘긴다(`-new Date(created_at).getTimezoneOffset()`, 서머타임도 맞는다). `{길이}`는 `duration_ms`로 "1시간 5분", "2시간", "42분", 1분이 안 되면 "1분 미만"이다. `{녹음자}`는 설정의 `recorder_name`이고, 비어 있으면 " · 녹음: …"를 통째로 뺀다.
+- 요청 시간 제한은 연결 10초, 요청 전체 15초다(eng review D12). 클라우드 요청이라 시스템 프록시를 그대로 쓴다. 단 loopback 주소는 LLM 요청과 같이 프록시를 거치지 않는다(6.1). **리다이렉트는 따라가지 않는다**(`redirect::Policy::none`): 따라가면 사내 프록시·SSO 게이트웨이의 302 뒤 로그인 페이지가 준 200을 성공으로 볼 수 있고, 다른 호스트로 가는 요청의 Referer에 웹훅 URL이 실린다. 3xx는 아래 "확인하지 못함"이다.
+- `markdown` 블록의 `text`(머리말 + 본문) 길이(`chars().count()`)가 12,000자를 넘으면 전송하지 않는다(REV-02). 기준은 하나다: 검토 화면의 글자 수도 `slack_length` 명령으로 같은 함수(`slack::markdown`)가 만든 텍스트를 센다. 꼬리말은 별도 `context` 블록이라 세지 않는다.
+- **웹훅 URL**: 전송 직전에 Rust 안에서만 키체인(`slack:{이름}`)으로 읽는다(9.2). URL 자체가 비밀값이라 돌려주지도, 로그에 쓰지도, 오류 문구에 넣지도 않는다. 응답 본문은 Slack의 오류 코드 모양(앞뒤 공백을 뺀 본문이 `^[a-z_]{1,64}$`, 예: `no_service`)일 때만 문구에 쓰고, 그 밖의 본문(프록시의 HTML 페이지 등)은 쓰지 않고 `HTTP {코드}`만 보인다. URL은 경로만, 잘린 채, JSON 이스케이프나 퍼센트 인코딩으로도 되돌아올 수 있어 원문 그대로만 가려서는 막지 못하기 때문이다. 네트워크 오류는 reqwest의 URL을 뺀 가장 안쪽 원인만 보인다. `https://`만 받는다. 평문 `http://`는 `localhost`와 loopback IP(`127.0.0.0/8`, `::1`)로 가는 주소만 받는다(시험용 스텁). `*.localhost`는 받지 않는다(이름 해석이 밖으로 보낼 수 있다). LLM 요청의 프록시 우회 판정(6.1)은 `*.localhost`도 그대로 포함한다.
+- **[S5] 대체 경로는 실행 중에 자동이다** (M5): 먼저 `markdown` 블록으로 보낸다. 웹훅이 400에 `invalid_blocks`(또는 `markdown` 블록을 말하는 본문)로 답하면 **한 번만** `section` 블록 + mrkdwn으로 다시 보낸다. 변환: `**굵게**` → `*굵게*`, 제목(`#`~`######` + 공백) → 굵은 한 줄(안의 `**`는 뺀다), `[text](url)` → `<url|text>`(`url`이 `https://`, `http://`, `mailto:`로 시작할 때만. `[담당](!here)`, `[x](@U…)`, `[x](!subteam^…)`는 바꾸면 멘션이 되므로 이스케이프한 글자 그대로 둔다. `[담당자]`처럼 링크가 아닌 대괄호도 그대로), `&` `<` `>` 이스케이프(링크의 `&`도 `&amp;`로, Slack이 되돌린다). 줄 경계에서 3,000자 이하로 section 블록을 나누고, 3,000자보다 긴 한 줄은 글자 단위로 자른다. 꼬리말은 같다. 그래서 스파이크 S5는 실제 Slack이 어느 경로를 타는지 확인만 한다.
+- **실패 분류** (SND-06). **성공은 200에 본문 `ok`(앞뒤 공백 무시)뿐이다.** 상태 코드로 먼저 가른다: 200 뒤에 본문을 읽지 못하면 확인하지 못한 것이고, 실패 코드는 본문을 읽지 못해도 그 코드의 실패다. 아무것도 가지 않았다고 확신할 수 있는 것은 연결 실패(`is_connect`)뿐이라, 그 밖의 오류는 모두 채널을 확인하라고 한다. 아래에서 `{코드}`는 본문이 오류 코드 모양일 때만 붙는다(위 웹훅 URL).
+
+| 상황 | 화면 메시지 |
+|---|---|
+| 키체인에 웹훅 URL이 없음 (요청 전) | "웹훅 주소가 없습니다. 설정 → Slack에서 웹훅 주소를 입력해 주세요" |
+| `https://`가 아니거나 URL이 아님 (요청 전) | "웹훅 주소가 올바르지 않습니다…" |
+| 연결 실패(연결 10초 초과 포함). 요청은 가지 않았다 | "Slack에 연결하지 못했습니다. 인터넷 연결을 확인해 주세요: {가장 안쪽 원인}" |
+| 전체 15초 초과 | "Slack 응답 시간 초과입니다. 채널에 메시지가 올라갔는지 확인한 뒤 다시 보내 주세요" |
+| 연결 뒤 응답 없이 끊김 등 그 밖의 요청 오류 | "Slack 응답을 받지 못했습니다({가장 안쪽 원인}). 채널에 메시지가 올라갔는지 확인한 뒤 다시 보내 주세요" |
+| 3xx, 200이 아닌 2xx, 본문이 `ok`가 아니거나 읽지 못한 200 | "Slack 응답을 확인하지 못했습니다(HTTP {상태}). 채널에 메시지가 올라갔는지 확인한 뒤 다시 보내 주세요" |
+| 404, 410, 본문 `no_service`·`channel_not_found`·`channel_is_archived` | "웹훅이 없거나 삭제됐습니다(HTTP {상태}: {코드})…" |
+| 403, 본문 `action_prohibited` | "Slack이 이 채널로 보내는 것을 막았습니다(…). Slack 관리자에게 확인해 주세요" |
+| 429 | "Slack 전송 한도를 넘었습니다(HTTP 429)…" |
+| 그 밖의 4xx·5xx (대체 경로의 400 포함) | "Slack 오류: HTTP {상태}: {코드}" |
+
+- **자동 재시도는 없다**: 응답만 잃었을 뿐 Slack에는 이미 올라갔을 수 있어, 다시 보내면 두 번 올라간다. "다시 보내기"는 녹음자의 클릭이다. 위의 S5 대체 경로만 예외다(거부된 요청은 올라가지 않았다). 대체 경로는 400에서만 타고, 확인하지 못한 응답(3xx, 그 밖의 2xx)에서는 타지 않는다.
+- **`send_to_slack`의 순서**: 같은 회의의 전송이 이미 돌고 있으면 바로 거부한다(회의별 잠금, 두 번 누름 방지). `no_speech`이면 거부한다(SUM-10). `save_summary`와 같은 경로로 제목·본문을 먼저 저장한다(`review`에서만). 그래서 보낸 것이 저장된 것이다. 이어서 지난 시도의 `error`를 지운다(새 시도가 시작됐으니 더는 맞지 않는 원인이다. 그사이 다시 연 검토 화면에도 보이지 않는다). 그다음 웹훅 이름 확인 → 12,000자 검사 → 수정 수(7.2) → 키체인 → 요청이다. 성공하면 `store.update`로 `sent`와 `meta.sent`를 쓰고 `error`를 지운 뒤 `last_channel`을 그 웹훅으로 바꾼다(9.1). 삭제된 회의의 늦은 결과는 다른 쓰기와 같이 버려진다(8.3). 실패하면 `review` 그대로 `error`에 원인을 쓰고 원인을 돌려준다. 보냈는데 `sent`를 쓰지 못했으면 "Slack에는 보냈지만 전송 기록을 저장하지 못했습니다"로 알린다(다시 보내면 두 번 올라간다). 회의별 잠금을 쥔 동안 `get_meeting`의 `sending`이 참이고, 끝나면(성공·실패 모두) `send_to_slack`이 `slack://finished`(회의 id)를 보낸다(10.1, 10.2).
 
 ### 7.2 수정 수 계산 (SND-03)
 
-- `summary.generated.md`와 전송본을 줄 단위 LCS로 비교한다(직접 구현, 수십 줄).
-- 추가·삭제·변경된 줄 수를 N으로 한다. 변경은 삭제와 추가가 붙어 있는 경우를 1로 센다.
-- 제목이 바뀌었으면 1을 더한다. 결과는 `meta.json`의 `edit_count`에 기록한다.
+- `summary.generated.md`에서 제목 줄을 뺀 본문(`split_title`)과 전송본을 줄 단위 LCS로 비교한다(직접 구현, 수십 줄).
+- 추가·삭제·변경된 줄 수를 N으로 한다. 변경은 삭제와 추가가 붙어 있는 경우를 1로 센다. 그래서 두 공통 줄 사이에 지운 줄 r개와 더한 줄 d개가 있으면 max(r, d)다.
+- 제목이 바뀌었으면 1을 더한다. LLM 제목도 저장 규칙(`store::one_line`)으로 한 줄로 만든 뒤 비교한다. 공백만 다른 제목은 바뀐 것이 아니다.
+- `summary.generated.md`가 없는 회의는 빈 요약과 비교한다(모든 줄과 비어 있지 않은 제목이 수정).
+- 결과는 `meta.json`의 `sent.edit_count`에 기록하고 꼬리말 "(수정 N곳)"에 쓴다.
 
 ## 8. 저장과 상태
 
@@ -451,6 +473,7 @@ queue.rs ──spawn── 앱 실행 파일 --plan-chunks {회의 폴더} {VAD 
 - 시각은 UTC로 저장한다(`created_at`, id의 시각 부분). 화면에는 로컬 시각으로 보여 준다.
 - `title`은 요약이 끝나면 LLM이 쓴 제목(6.2)이고, 검토 화면에서 고칠 수 있다(`save_summary`). `llm_connection`·`summarize_local`은 6.1, `no_speech`는 6.5다. `no_speech`는 M4에서 더했고 없으면 `false`로 읽는다(스키마 버전은 그대로 1).
 - 검토 화면이 고친 요약 본문은 `summary.md`에 쓴다. `summary.generated.md`는 LLM이 쓴 그대로 두고 M5의 수정 수 계산(7.2)이 비교한다.
+- `sent`(M5)는 보낸 회의에만 있다: `channel`은 웹훅 이름(설정의 `webhooks[].name`, 예: "#회의록"), `at`은 보낸 시각(UTC, `created_at`과 같은 형식), `edit_count`는 7.2의 N이다. `review`의 `error`는 마지막 전송 실패의 원인이다(큐는 요약을 시작할 때 `error`를 지우므로 `review`에서는 전송만 쓴다). 다음 전송이 성공하면 지운다.
 - 쓰기는 항상 임시 파일에 쓴 뒤 이름 바꾸기로 한다. 쓰는 도중 크래시가 나도 파일이 깨지지 않는다.
 - **단일 쓰기 경로**: 기록 스레드, 처리 대기열, UI 명령이 모두 `meta.json`을 고친다. 그래서 모든 변경은 `store.rs`의 회의별 잠금(`Mutex`) 안에서 읽고-고치고-쓴다. 원자적 이름 바꾸기는 파일 손상을 막을 뿐, 서로의 변경을 덮어쓰는 것은 막지 못하기 때문이다.
 - **스키마 버전** (STO-05, eng review D9): `meta.json`과 `settings.json`에 `schema_version`을 둔다. 앱이 아는 버전보다 높으면 그 데이터를 읽기 전용으로 열고 "새 버전 앱에서 만든 데이터입니다"를 보여준다. 낮으면 읽을 때 현재 버전으로 옮긴다.
@@ -541,6 +564,8 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 }
 ```
 
+- `last_channel`은 전송이 쓴다(SND-04): 성공한 전송 뒤 `SettingsStore::set_last_channel`이 이 값만 바꾼다. 설정 화면의 저장(`save_settings`)은 `gpu_failed`처럼 저장돼 있던 값을 그대로 둔다(5.4). 설정 화면이 열려 있는 동안 보낸 전송을 옛 값으로 덮지 않게 하려는 것이다.
+
 ### 9.2 키체인
 
 - 서비스 이름: `com.sije.meeting-summarizer`
@@ -553,7 +578,7 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 - 저장한 연결·웹훅을 지운 뒤 같은 이름을 저장 전에 다시 추가할 수 없다("저장한 뒤 다시 추가하세요"). 옛 키가 1번에서 지워지지 않고 새 항목에 남기 때문이다.
 - 계정 이름: `llm:{연결 이름}`, `slack:{웹훅 이름}`
 - 값: API 키, 웹훅 URL
-- 비밀값을 읽는 것(`settings::get_secret`)은 Rust 안에서 요청을 보내기 직전뿐이다(LLM 요약은 6.1, Slack 전송은 M5). 명령으로 열지 않고, 웹뷰로 돌려주지 않고, 로그에 쓰지 않는다. 대기열 테스트는 이 읽기를 가짜로 바꿔 실제 키체인을 건드리지 않는다.
+- 비밀값을 읽는 것(`settings::get_secret`)은 Rust 안에서 요청을 보내기 직전뿐이다(LLM 요약은 6.1, Slack 전송은 7.1). 명령으로 열지 않고, 웹뷰로 돌려주지 않고, 로그에 쓰지 않는다. 대기열과 Slack 전송의 테스트는 이 읽기를 가짜로 바꿔 실제 키체인을 건드리지 않는다.
 
 ### 9.3 연결 설정 입력 (ONB-04)
 
@@ -570,16 +595,23 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 |---|---|
 | 홈 | 앱을 열 때(설정이 비어 있어도 항상), 헤더의 앱 이름, 다른 화면의 "← 홈으로" |
 | 녹음 중 | 녹음 시작, 헤더의 녹음 칩, 녹음 중일 때 홈의 "녹음 화면으로"와 목록의 녹음 중 회의 |
-| 처리 중 | 녹음 종료 직후, 홈에서 처리 중인 회의 선택 |
+| 처리 중 | 녹음 종료 직후, 홈에서 처리 중인 회의 선택, 실패·자동 종료 알림 클릭(해당 회의) |
 | 검토·전송 | 처리 완료 알림 클릭(해당 회의), 홈에서 회의 선택 |
 | 설정 | 헤더의 설정 버튼, 홈 설정 카드의 항목 버튼(그 항목의 탭이 열린다) |
 
 온보딩 화면은 없다(사용자 결정 2026-10-14, ONB 절).
 
 - **앱 헤더** (APP-07): 모든 화면 위에 붙는 높이 56px 헤더 하나. 왼쪽은 앱 이름과 상태 칩, 오른쪽은 설정 버튼이다. 칩은 `App.tsx`가 들고 있는 `list_meetings` 결과와 회의별 마지막 `meeting://progress`로 센다. 홈 목록과 처리 중 화면도 같은 상태와 같은 판정(`common.tsx`의 `phase`)을 써서 셋이 어긋나지 않는다. 녹음 시간은 `recording://level`의 `elapsed_ms`다.
-  - 목록은 화면이 바뀔 때, `recording://stopped` 때, 진행률 이벤트의 `status`가 바뀔 때 다시 읽는다. 늦게 온 옛 응답은 버린다. 진행률은 이벤트를 먼저 듣고 그다음 `queue_state`로 채운다. 둘이 겹치면 이벤트가 이긴다. 폴링은 하지 않는다.
+  - 목록은 화면이 바뀔 때, `recording://stopped` 때, 진행률 이벤트의 `status`가 바뀔 때, 전송이 끝날 때(`slack://finished`) 다시 읽는다. 늦게 온 옛 응답은 버린다. 진행률은 이벤트를 먼저 듣고 그다음 `queue_state`로 채운다. 둘이 겹치면 이벤트가 이긴다. 폴링은 하지 않는다.
   - 처리 칩: "처리 중 N · 대기 M"(0인 쪽은 뺀다). 처리 중은 `transcribing`·`summarizing`, 대기는 `recorded`·`paused`이거나 대기 순서가 있는 회의다(다시 시도한 `transcribe_failed`·`summarize_failed`, 요약을 기다리는 `transcribed` 포함). 대기 순서가 없는 `transcribed`는 LLM 연결이 없어 멈춘 회의라 세지 않는다(APP-07). 대기열은 끝난 회의의 마지막 이벤트에서 `position`을 비운다. 구간 계획이 나온 회의는 진행률을 붙인다: "처리 중 1 (42%) · 대기 2", 둘이면 "처리 중 2 (42%, 17%)". 요약 중인 회의는 LLM 요청이 둘 이상일 때만 붙인다(요청 하나면 셀 것이 없다). 끝난 회의의 마지막 이벤트(끝난 상태와 마지막 단계의 수)는 목록을 다시 읽기 전이라도 진행률을 붙이지 않는다. 누르면 홈으로 간다. 칩 둘레는 24px 누름 영역이다.
-  - `transcribe://gpu-failed`의 `message`는 녹음 자동 종료 이유와 같은 닫을 수 있는 경고 배너로 보인다.
+  - `transcribe://gpu-failed`의 `message`는 녹음 자동 종료 이유와 같은 닫을 수 있는 경고 배너로 보인다. 녹음 자동 종료만 창이 가려져 있으면 OS 알림으로도 간다(아래 OS 알림).
+- **OS 알림** (APP-03, M5): Rust가 `tauri-plugin-notification`으로 보낸다(웹뷰는 알림을 보내지 않는다).
+  - 보내는 때: 회의가 처리를 마쳐 `review`가 됐을 때("회의 요약이 준비됐습니다: {제목}", `no_speech`면 "음성이 거의 감지되지 않았습니다: {제목}"), `summarize_failed`·`transcribe_failed`가 됐을 때("요약하지 못했습니다: {제목}", "전사하지 못했습니다: {제목}", 제목이 없으면 "제목 없음"), 녹음이 스스로 끝났을 때(`recording://stopped`의 이유 문구). GPU에서 CPU로 바꾼 것은 앱 안 배너로만 알린다: 열 회의가 없고, 알림마다 스레드가 남는다(11.1). macOS에서는 메인 창이 포커스를 얻으면 이 앱의 알림을 알림 센터에서 모두 지운다(11.1). 알림 제목은 "회의 요약"이다(`productName`은 번들용 영문 이름이라 쓰지 않는다). 본문에는 사건과 회의 제목만 쓰고 전사본·요약 글은 넣지 않는다. 녹음·삭제·종료로 멈춘 처리는 알리지 않는다.
+  - 창이 보이고 앞에 있으면 보내지 않는다: 메인 창이 보이고(`is_visible`) 포커스가 있고(`is_focused`) 최소화되지 않았으면(`is_minimized`) 화면이 이미 알려 주므로 건너뛴다. 이 확인은 메인 스레드에서 한다(`run_on_main_thread`). 창 상태를 묻는 호출은 메인 스레드의 답을 기다리는데, 앱 종료(8.5)에서 메인 스레드가 기록 스레드를 기다리는 동안 기록 스레드가 묻으면 서로 기다리게 되기 때문이다.
+  - 클릭: 회의가 있는 알림은 `extra.meeting`에 회의 id를 싣는다. 앱 시작 때 알림을 보내기 전에 Rust의 `Notification::on_action`을 등록한다(플러그인은 처리기가 생긴 뒤에 보인 알림의 클릭만 알려 준다). 클릭(`tap`)이 오면 메인 창을 보이고 앞으로 가져온 뒤 `app://open-meeting`(회의 id)을 보낸다. `App.tsx`는 `get_meeting`으로 지금 상태를 읽어 홈의 회의 열기와 같은 규칙으로 화면을 연다(`review`·`sent`·`archived`는 검토, 그 밖에는 처리 중). 알림 뒤에 보냈거나 다시 실행했을 수 있어서다. 앱을 그냥 열면(트레이 "열기", Dock) 지금처럼 화면을 바꾸지 않는다. OS별 차이는 11.
+- **트레이 상태** (APP-04, M5): 새 이미지 자산 없이 기본 창 아이콘의 RGBA에 색 점을 그린다(`Image::new_owned`). 점은 아이콘 너비의 40%(예: 32px 아이콘이면 12px) 지름으로 오른쪽 아래 구석에 붙고, 지름의 바깥 1/8은 흰 테두리다. macOS 메뉴 막대는 아이콘을 22pt 정도로 그려 작은 점은 보이지 않는다. 우선순위는 녹음 중(`danger`) > 처리 중(`mainBlue`) > 미전송(`warning`)이고, 해당이 없으면 원래 아이콘이다. 툴팁은 "회의 요약 · 녹음 중 · 미전송 3", "회의 요약 · 처리 중 2"처럼 해당하는 것을 모두 적는다. 녹음 중에는 헤더 칩처럼 처리 수를 적지 않는다(녹음이 처리를 멈추므로, TRN-09).
+  - 처리 중 = 대기열에 있는 회의(실행 중 + 대기, `queue_state`의 항목 수). 미전송 = `review` 회의(`sent`·`archived`는 세지 않는다, 설계 문서). 녹음 중 = `Recorder::state`.
+  - 새로 그리는 함수(`refresh_tray`)는 하나이고, `store.list()` 한 번과 녹음기·대기열 상태로 그린다. 폴링하지 않고, 바뀌는 곳에서 부른다: 앱 시작(트레이를 만든 뒤), 녹음 시작(`start_recording`), 녹음 끝(기록 스레드가 대기열에 넣을 때), 대기열에 넣기(`enqueue`, `enqueue_pending`)와 처리 끝(`end`), 전송·"전송 안 함"·삭제. 저장(`save_summary`)은 상태가 바뀌지 않아 부르지 않는다. 세는 일(`store.list()` 포함)은 blocking 스레드(`spawn_blocking`)에서 하고, 메인 스레드에서는 아이콘과 툴팁만 바꾼다(`run_on_main_thread`). 부른 쪽 스레드에서 세지 않는 것은 부른 쪽을 기다리는 잠금 주인이 있을 수 있어서다: `Recorder::start`는 녹음기 잠금을 쥔 채 스스로 끝난 녹음의 기록 스레드를 기다리는데, 그 기록 스레드의 마지막 일(대기열에 넣기)이 이 함수를 부르고, 세려면 그 잠금이 필요하다. 세기는 한 번에 하나씩 하고 각자 그때의 상태를 읽으므로, 마지막으로 센 것이 가장 새 상태로 마지막에 그려진다. 부르는 쪽은 기다리지 않으므로 잠금을 쥐고 불러도 서로 기다리지 않는다.
 - **본문**: 화면별 동작은 본문에 둔다. 홈이 아닌 화면은 본문 맨 위에 "← 홈으로"를 둔다. 본문 폭은 `max-w-3xl`, 설정만 `max-w-5xl`이다.
 - **홈 목록**: 전사 중인 회의는 얇은 진행 막대와 "42% · 약 3분 남음"을 보이고, 구간 계획 전에는 "구간 나누는 중"을 보인다. 요약 중인 회의는 "요약 중"만(막대 없이), LLM 요청이 둘 이상이면 "요약 중 · 요청 2/3"과 막대를 보인다. 기다리는 회의의 배지는 "대기 중 · 2번째"다. `transcribe_failed`는 오류 한 줄(넘치면 말줄임)과 "다시 시도"(`resume_meeting`)를 보인다. `summarize_failed`는 오류 한 줄만 보인다. "요약 다시 실행"은 연결을 골라야 해서 처리 중 화면에 있다. 행 어디를 눌러도 회의가 열린다("다시 시도" 버튼만 빼고).
 - **처리 중 화면**: 진행 막대와 "구간 2/5 · 42% · 약 3분 남음", 또는 "구간 나누는 중", 기다리면 배지 "대기 중 · N번째". 요약 중에는 "요약 중"만(막대 없이), LLM 요청이 둘 이상이면 막대와 "요약 중 · 요청 2/3"이다. 요약의 첫 이벤트는 `chunks`가 0이지만 구간 나누기가 아니므로 `status`로 가른다. "구간" 문구는 `status`가 `transcribing`일 때만 쓰고, 다시 읽기 전에 온 마지막 이벤트(`review`, `summarize_failed` 등)는 진행을 그리지 않는다. `meta.json`의 `backend`가 있으면 처리 장치(GPU/CPU)를 보인다. 상태나 끝난 구간 수가 바뀌면 `get_meeting`을 다시 읽는다. 전사에 실패하면 오류와 "다시 시도".
@@ -596,13 +628,19 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
   - "미정" 강조: 편집란 아래에 "담당자·기한이 미정인 항목 N개"와 "미정"이 든 줄을 일반 텍스트로 나열한다. `warning100` 배경, `warning` 테두리·아이콘, 검은 글자(10.3). 입력할 때마다 바뀌므로 live region이 아니다(`role="note"`).
   - SUM-07: `llm_connection`이 있고 `no_speech`가 아니면 보조 글자로 "전사본을 {이름}(으)로 보내 요약했습니다", 로컬이면(`summarize_local`) "이 PC의 {이름}(으)로 요약했습니다".
   - SUM-10: `no_speech`면 경고 배너 "음성이 거의 감지되지 않았습니다"를 보이고 편집란, "요약 복사", ".md로 저장"은 없다. 전송 버튼은 비활성, 동작은 "전송 안 함"과 삭제만 남는다(6.5). 전사본 보기는 그대로 있다(REV-01).
-  - 요약 본문의 글자 수를 보인다. 전송될 글자 수와 12,000자 검사(REV-02)는 M5의 `slack.rs`와 함께다.
+  - 글자 수는 "{N} / 12,000자 (Slack 전송 기준)"이다(REV-02). N은 입력이 멈추고 200ms 뒤 `slack_length`가 센 값으로, 전송할 `markdown` 블록(머리말 + 본문)의 글자 수다(7.1). 12,000자를 넘으면 경고 배너 "Slack 한도 12,000자를 넘었습니다. N자를 줄여 주세요"를 보이고 전송 버튼을 막는다. 센 값이 늦게 와도 Rust가 보내기 전에 다시 검사한다.
   - "전사본 보기"(`<details>`)는 처음 열 때 `get_transcript`를 읽는다. 목록은 처리 중 화면과 같은 `TranscriptList`다.
   - REV-03 "전송 안 함": 나중에 보낼 수 없다는 확인 창 뒤에 `archive_meeting`, 그리고 홈으로.
   - REV-05: "요약 복사"는 `# 제목`, 빈 줄, 본문을 클립보드에 넣는다. "전사본 복사"(전사본 보기 안)는 `[mm:ss] 텍스트` 줄이다. 결과("복사했습니다" / "클립보드에 복사하지 못했습니다")를 버튼 옆에 잠깐 보인다. `writeText`는 클릭 처리 안에서 바로 부른다(WebKit은 사용자 동작 안의 클립보드 쓰기만 허용한다). 웹뷰에 클립보드가 없거나 거부해도 메시지로 알린다. ".md로 저장"은 `export_markdown`이고, 저장하면 "저장했습니다: {경로}", 취소하면 아무것도 보이지 않는다.
-  - Slack 전송 버튼은 M5까지 비활성이다. 삭제는 그대로다.
+  - **Slack 전송** (SND-01~06, M5): 버튼은 "{채널}(으)로 전송"이다(예: "#회의록(으)로 전송"). 채널 기본값(SND-04)은 `last_channel`이 아직 있으면 그것, 아니면 목록의 첫 번째다(웹훅이 하나면 그것). 웹훅이 둘 이상일 때만 "보낼 채널" 선택(`SelectField`)을 보인다. 그래서 웹훅이 하나면 녹음 시작 → 종료 → 전송이 클릭 3번이다(NFR-04).
+    - 버튼이 막히는 때: `review`가 아님(`archived`, 새 버전 앱의 회의), `no_speech`, 12,000자 초과, 웹훅 없음("Slack으로 전송"과 Slack 설정 탭으로 가는 "웹훅 추가하기" 링크 버튼), 보내는 중("보내는 중…").
+    - 누르면 남은 입력을 먼저 저장하고(`flush`, 저장이 실패하면 멈춘다) `send_to_slack`을 부른다. 보내는 동안 제목·본문은 읽기 전용이고 "전송 안 함"과 삭제도 막는다.
+    - 보내는 중에 홈으로 갔다가 다시 열어도 같다: `get_meeting`의 `sending`(7.1)으로 읽기 전용, "보내는 중…", 전송·"전송 안 함"·삭제 막음을 보인다. 이 회의의 `slack://finished`가 오면 회의를 다시 읽는다. 이벤트를 먼저 듣고 그다음 읽으므로 그 사이에 끝난 전송도 놓치지 않는다. 앱도 같은 이벤트로 목록을 다시 읽어 보낸 회의가 홈에 `검토 대기`로 남지 않는다.
+    - 실패하면(SND-06) 원인을 오류 배너로 보이고 전송 버튼이 "다시 보내기"가 된다. 클립보드 복사는 위의 "요약 복사"를 그대로 쓴다. 원인은 `meta.error`에도 남아, 화면을 다시 열어도 배너와 "다시 보내기"가 보인다.
+    - 성공하면 홈으로 가지 않고 이 화면에 읽기 전용으로 남는다: 어디로 언제 갔고 몇 곳을 고쳤는지 확인하게 하려는 것이다. 홈은 한 번이면 간다. 보낸 회의는 전송 버튼 대신 `전송 완료` 줄 "#회의록(으)로 전송함 · {현지 시각} · 수정 N곳"을 보인다(10.3의 전송 완료 색).
 - 진행률 문구는 일반 텍스트다. 매 틱을 읽어 주는 live region을 두지 않는다. 막대는 `role="progressbar"`와 값을 갖고, 움직임 줄이기 설정이면 전환 애니메이션을 끈다. 보일 값이 없으면(요청이 하나뿐인 요약) 빈 막대를 그리지 않고 문구만 둔다.
 - **설정 카드**: 홈 맨 위에서 빠진 항목을 한 줄씩 보여 준다. 전사 모델 없음(`model_status`에 설치 안 된 파일이 있거나 읽지 못함)이 맨 앞이다. 이 줄의 "모델 받기"는 바로 다운로드를 시작하고(ONB-01), 받는 동안 버튼 대신 "전사 모델을 받는 중 42%"를 보인다. 실패하면 "전사 모델을 받지 못했습니다"와 다시 "모델 받기". 옆의 "전사 설정"은 취소·직접 가져오기·미러 주소가 있는 전사 탭을 연다. 그다음 LLM 연결 없음 → 요약(LLM) 탭, Slack 웹훅 없음 → Slack 탭, 설정 파일을 읽을 수 없음 → 일반 탭(오류와 "기본값으로 다시 시작"). 녹음은 막지 않는다.
+- **일반 탭**: 녹음자 이름과, 알림 권한 안내 한 줄 "알림이 보이지 않으면 OS 알림 설정에서 '회의 요약'을 허용해 주세요"(ONB-03). 데스크톱 알림 권한 API는 항상 허용으로 답해 거부를 알 수 없다.
 - **설정 탭**: 왼쪽 탭 목록(좁은 창에서는 내용 위)과 오른쪽 내용. 탭은 일반, 오디오, 전사, 요약(LLM), Slack이다(ONB-07). 저장 버튼 하나가 모든 탭을 저장한다. 안 보이는 탭도 마운트된 채 숨겨 두므로 탭을 바꿔도 입력이 사라지지 않는다. 비밀값 규칙은 9.2~9.3 그대로다.
 - **전사 탭** (ONB-01, ONB-02, ONB-07): 모델 선택(5.1의 세 모델, 개발용 `tiny`는 고르게 하지 않는다), 파일별 상태(설치됨 / 없음 / 받는 중 X% (받은/전체 MB), 이어받을 `.part`가 있으면 받아 둔 양), 다운로드·취소·직접 가져오기, 모델 다운로드 주소(`model_base_url`), 전사 백엔드, 용어집. 자동 백엔드에서 `gpu_failed`면 "GPU 전사에 실패해 CPU로 처리하고 있습니다"와 GPU로 골라 저장하면 지워진다는 안내를 보인다.
   - 모델과 주소는 다른 설정처럼 저장 버튼으로 저장한다. 다운로드·가져오기는 누르면 바로 돈다. 둘 다 `settings.json`의 모델과 주소를 쓰므로, 저장하지 않은 모델·주소 변경이 있으면 두 버튼을 막고 먼저 저장하라고 안내한다. 화면에 고른 값과 다른 옛 값으로 받는 일이 없게 하려는 것이다. 받는 동안에는 모델 선택도 막는다.
@@ -616,13 +654,13 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 | 명령 (React → Rust) | 이벤트 (Rust → React) |
 |---|---|
 | `start_recording` → `{ id, warnings }` (장치는 캡처 스레드에서 열므로 바로 돌아온다), `stop_recording` → id (두 WAV를 닫고 `recorded`가 된 뒤 돌아온다), `recording_state` → 진행 중인 녹음과 남아 있는 경고 | `recording://level` `{ elapsed_ms, mic, system, mic_bands, system_bands, waiting_permission }` (40ms마다. `mic`·`system`은 트랙별 RMS 0~1, `*_bands`는 트랙별 스펙트럼 24개 대역 0~100, 4.1) |
-| `list_meetings` (항목마다 `interrupted`: 중단된 녹음), `get_meeting(id)` → `{ meta, summary }` (`summary`는 요약 본문: 고친 `summary.md`, 없으면 `summary.generated.md`에서 제목 줄을 뺀 것, 둘 다 없으면 빈 문자열), `get_transcript(id)` → `[{ start_ms, end_ms, text }]` (`transcript.json`의 세그먼트, 읽기 전용. 경로는 `store.rs`의 `dir_for`로만 만든다), `delete_meeting` (녹음 중이면 먼저 녹음을 끝낸다) | `recording://warning` `{ kind, message }` (`disk`, `mic_permission`, `mic_device`, `system_device`, `silence`, `length`, `sleep`. 같은 `kind`는 앞의 경고를 바꾼다) |
+| `list_meetings` (항목마다 `interrupted`: 중단된 녹음), `get_meeting(id)` → `{ meta, summary, sending }` (`summary`는 요약 본문: 고친 `summary.md`, 없으면 `summary.generated.md`에서 제목 줄을 뺀 것, 둘 다 없으면 빈 문자열. `sending`은 이 회의의 Slack 전송이 돌고 있는지, 7.1), `get_transcript(id)` → `[{ start_ms, end_ms, text }]` (`transcript.json`의 세그먼트, 읽기 전용. 경로는 `store.rs`의 `dir_for`로만 만든다), `delete_meeting` (녹음 중이면 먼저 녹음을 끝낸다) | `recording://warning` `{ kind, message }` (`disk`, `mic_permission`, `mic_device`, `system_device`, `silence`, `length`, `sleep`. 같은 `kind`는 앞의 경고를 바꾼다) |
 | `resume_meeting(id)`: 중단된 녹음의 "처리 계속", `transcribe_failed` 재시도. 둘 다 대기열에 넣는다 | `recording://stopped` `{ id, message }` (녹음 종료. 스스로 끝난 경우 `message`에 이유) |
 | `summary_route(id)` → `{ connection, local, local_available, locked }` (`connection`은 요약이 갈 연결(`LlmConnection`, 비밀값 없음), 고를 수 없으면 `null`. 아무것도 보내지 않은 회의(`no_speech`, 또는 `llm_connection` 없이 `review`·`sent`·`archived`가 된 회의)도 `null`이라 SUM-07의 "전송됨"이 거짓으로 뜨지 않는다. `local`은 회의의 "로컬로 요약", `local_available`은 로컬 연결이 있는지, `locked`는 요약이 시작돼 바꿀 수 없는지. 6.1), `set_summarize_local(id, local)` → 같은 값 (잠긴 뒤, 또는 로컬 연결 없이 켜면 실패) | `meeting://progress` `{ id, status, chunk, chunks, percent, eta_secs, position }` (아래). 상태 변경 이벤트는 따로 두지 않는다. 화면은 이 이벤트의 `status`가 바뀔 때 목록을 다시 읽는다 |
 | `save_summary(id, title, body)` → `Meta` (`review`에서만. 본문은 `summary.md`, 제목은 `meta.title`. 제목은 줄바꿈·제어 문자를 공백 하나로 바꿔 한 줄로 저장한다. `.md` 내보내기의 `# 제목` 줄과 파일 이름이 되기 때문이다), `archive_meeting(id)` → `Meta` ("전송 안 함", `review` → `archived`) | `model://download` `{ file, received, total }` (약 1%마다) |
 | `retry_summary(id, connection)` → `Meta` (`summarize_failed`에서만. 고른 연결을 `llm_connection`에 쓰고 대기열에 넣는다, SUM-06), `export_markdown(id)` → 저장한 경로, 취소하면 `null` (REV-05. 저장 대화상자를 Rust가 열어 웹뷰가 쓸 경로를 넘기지 않는다. 파일은 `# 제목`, 요약 본문, `---`, `## 전사본`, `[mm:ss] 텍스트` 줄 순서다. 기본 파일 이름은 제목(없으면 회의 id)에서 경로 구분자, Windows가 거부하는 문자(`\ / : * ? " < > |`), 제어 문자를 `_`로 바꾼 것이다. Rust 쪽 대화상자 API는 웹뷰 권한(capability) 검사를 거치지 않으므로 권한을 더하지 않는다) | `transcribe://gpu-failed` `{ message }` (GPU 크래시 2번 → CPU로 전환, 5.4) |
-| `send_to_slack(id, webhook)` (M5) | |
-| `queue_state` → `meeting://progress`와 같은 항목의 배열. 이벤트가 오기 전 첫 화면용 (실행 중인 회의 먼저, 그다음 대기 순서) | |
+| `slack_length(id, title, body, offset_minutes)` → 글자 수 (REV-02, 7.1. `offset_minutes`는 회의 시작 시각의 현지 UTC 시차(분), JS에서는 `offsetMinutes`), `send_to_slack(id, webhook, title, body, offset_minutes)` → `Meta` (`webhook`은 웹훅 이름. 먼저 `save_summary`처럼 저장하고 보낸다. 성공하면 `sent`, 실패하면 `review` + `error`와 함께 원인을 돌려준다. 같은 회의의 전송이 돌고 있으면 거부한다, 7.1) | `app://open-meeting` (회의 id. 그 회의의 OS 알림을 눌렀다. 창은 이미 보인다, 10.1) |
+| `queue_state` → `meeting://progress`와 같은 항목의 배열. 이벤트가 오기 전 첫 화면용 (실행 중인 회의 먼저, 그다음 대기 순서) | `slack://finished` (회의 id. 그 회의의 전송이 끝났다, 성공이든 실패든. 앱은 목록을, 그 회의의 검토 화면은 회의를 다시 읽는다, 7.1) |
 | `get_settings`, `save_settings`(저장 뒤 대기열에 넣기를 다시 한다. LLM 연결이 생기면 `transcribed` 회의가 요약 대기열에 들어간다, 8.4), `set_secret`, `has_secret`, `delete_secret` (비밀값 자체는 프론트엔드로 돌려주지 않는다) | `app://quit-requested` (진행 중 작업이 있을 때 종료 확인 요청, 8.5) |
 | `confirm_quit` (종료 확인 후 진행 중 작업을 `paused`로 기록하고 종료), `request_quit` (Windows Ctrl+Q 경로) | |
 | `reset_settings` (`settings.json`이 손상됐을 때만: 원본을 `settings.json.bak-<시각>`으로 옮기고 기본값으로 시작) | |
@@ -752,6 +790,11 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 - **엔타이틀먼트** (Hardened Runtime): `com.apple.security.device.audio-input`.
 - **개발 중 주의**: `tauri dev`에서는 권한 요청이 터미널 앱 이름으로 뜰 수 있다. 권한을 초기화하려면 `tccutil reset Microphone com.sije.meeting-summarizer`를 실행한다.
 - **서명**: ad-hoc 서명은 빌드마다 권한을 다시 묻는다. 개발 중에도 Apple Development 인증서처럼 고정된 서명을 쓴다.
+- **OS 알림** (APP-03): 플러그인(`notify-rust` → `mac-notification-sys`)은 `NSUserNotificationCenter`를 쓴다(macOS 14부터 지원 중단 표시가 붙었지만 동작한다). 알림마다 스레드 하나가 클릭이나 닫기를 기다리고, 클릭은 메인 런 루프의 대리자로 온다. `on_action`을 등록했으므로 모든 알림이 그렇다. 배너를 눌러도, 알림 센터에 남은 것을 나중에 눌러도 그 회의로 간다. 앱이 꺼졌다 켜진 뒤에는 이전 알림을 눌러도 회의로 가지 않는다(기다리던 스레드가 없다). `tauri dev`에서는 알림이 터미널 앱 이름으로 뜨고 클릭이 터미널을 연다. 배포 번들에서는 번들 식별자 `com.sije.meeting-summarizer`로 뜬다. OS 알림 설정의 앱 이름은 번들 이름(`productName`, 지금은 `meeting-summarizer`)이다. M6에서 번들 이름을 정하면 일반 탭의 안내 문구("'회의 요약'을 허용")와 맞춘다.
+  - **기다리는 스레드의 비용**: 메인 스레드가 아닌 곳에서 기다리는 알림마다 mac-notification-sys는 메인 런 루프에 0.5초마다 도는 `NSTimer`를 걸어 `deliveredNotifications`를 훑는다. 스레드와 타이머는 알림이 알림 센터에서 사라질 때(클릭, 닫기, 알림 센터에서 지우기)에야 끝난다. 그래서 몇 주씩 켜 두는 트레이 앱에서는 읽지 않은 알림만큼 쌓인다.
+  - 지우면 끝난다: 알림이 `deliveredNotifications`에서 빠지면 다음 타이머가 자동 닫힘으로 처리해 스레드가 돌아온다. 플러그인 2.7.0의 `remove_active`·`remove_all_active`는 macOS·Windows에서 아무것도 하지 않고 mac-notification-sys에도 지우는 API가 없어, objc2-foundation(이미 쓰는 크레이트에 `NSUserNotification`·`NSBundle` 기능만 더했다)으로 직접 지운다.
+  - **포커스 때 지우기**: 메인 창이 포커스를 얻으면(`WindowEvent::Focused(true)`, 메인 스레드에서 온다) `NSUserNotificationCenter::removeAllDeliveredNotifications`를 부른다. 녹음자가 앱을 보고 있으므로 남은 알림은 이미 지난 것이다. 그래서 이 앱의 알림은 앱이 앞으로 올 때마다 알림 센터에서도 사라지고, 0.5초 안에 기다리던 스레드와 타이머가 모두 끝난다. 쌓이는 것은 창을 보지 않는 동안 온 알림뿐이다. 알림을 눌러 앱이 열려도 같다(누른 알림은 그 자리에서 끝나고, 창이 앞으로 오며 나머지가 지워진다). 상한은 두지 않는다: 몇 개 뒤에 완료 알림이 조용히 끊기는 편이 더 나쁘다.
+  - 번들 식별자가 없는 프로세스(그냥 실행한 바이너리, 테스트)에서는 `defaultUserNotificationCenter`가 nil이고, objc2의 바인딩은 그때 패닉한다(릴리스는 `panic = "abort"`라 앱이 꺼진다). 그래서 `NSBundle::mainBundle().bundleIdentifier()`가 있을 때만 부른다. 알림 센터가 쓰는 것도 이 식별자다(mac-notification-sys가 `tauri dev`에서 터미널의 것으로 바꿔 끼운다. 그래서 개발 중에는 터미널 이름으로 온 알림도 함께 지워질 수 있다).
 
 ### 11.2 Windows
 
@@ -759,6 +802,7 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 - **WebView2**: Tauri 기본값(`downloadBootstrapper`)을 그대로 쓴다. Windows 10/11 대부분에는 WebView2가 이미 설치돼 있다. 없는 PC에서는 WebView2 설치에 관리자 권한을 요구할 수 있다(NFR-06의 예외).
 - **Vulkan 로더**: `vulkan-1.dll`을 동봉한다(5.4).
 - **CPU**: AVX2가 없는 CPU는 전사가 4~10배 느리다(Meetily #306). 첫 실행 때 감지해서 "이 PC는 처리가 오래 걸릴 수 있습니다"를 안내한다.
+- **OS 알림** (APP-03): 토스트(`tauri-winrt-notification`)의 클릭은 토스트가 화면에 있는 동안만 앱으로 온다. 알림 센터로 넘어간 뒤 누르면 OS가 앱을 실행하고, 단일 실행(APP-06)이 메인 창만 앞으로 가져온다(회의로 가지 않는다). 토스트의 앱 ID(AUMID)는 설치된 앱에서만 번들 식별자이고, `target\debug`·`target\release`에서 실행하면 PowerShell의 것을 쓴다. 실제 토스트 클릭은 아직 Windows에서 확인하지 않았다(로드맵 M5). 기다리는 스레드는 토스트가 화면에서 사라질 때(`Dismissed`, 시간 초과 포함) 끝나 쌓이지 않으므로, 11.1의 포커스 때 지우기는 Windows에서 하지 않는다.
 
 ## 12. 테스트 전략
 
@@ -777,13 +821,15 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 | 구간 나누기 (`engine.rs`) | 겹친 창의 음성 구간 합치기, 10분에 가장 가까운 무음에서 자름, 5~12분 범위, 무음 없는 연속 발화는 10분에서 자름, 무음·짧은 녹음 |
 | 음성만 잘라 잇기 (`engine.rs` `Speech`) | whisper.cpp와 같은 이어 붙이기(0.1초 겹침, 0.1초 무음), 조각 안은 1:1, 무음 자리에 떨어진 시작은 다음 조각 시작·끝은 앞 조각 끝, 오디오 끝을 넘은 시각, 음성이 없을 때 |
 | 워커 종료 코드 (`engine.rs`) | 인자 오류·녹음 없음 → 2, 모델 없음 → 3 |
-| `settings.rs` | 설정 화면 저장이 `gpu_failed`를 덮어쓰지 않고, 백엔드를 GPU로 바꾸면 지움 |
-| `slack.rs` | 페이로드 형식, 12,000자 경계, mrkdwn 변환 |
-| 수정 수 계산 | 줄 추가·삭제·변경, 제목 변경 |
+| `settings.rs` | 설정 화면 저장이 `gpu_failed`를 덮어쓰지 않고, 백엔드를 GPU로 바꾸면 지움. 전송이 쓴 `last_channel`도 설정 화면의 옛 값으로 덮지 않음 |
+| `slack.rs` | 순수 로직: 머리말(시차, 자정 넘김, 한국어 요일, 길이 "1분 미만"·"42분"·"2시간"·"1시간 5분", 녹음자 이름이 없으면 뺌, 제목이 없으면 "제목 없음"), 페이로드 형식(`text` 이스케이프, `markdown` 블록, 꼬리말), mrkdwn 변환(굵게, 제목, 링크와 링크가 아닌 대괄호, `https`·`http`·`mailto`가 아닌 링크 대상 `!here`·`@U…`·`!channel`·`!subteam^…`·`#C…`·`ftp`는 글자 그대로, 이스케이프), 멘션 무력화(제목·녹음자 이름·본문의 `<!`·`<@`·`<#`가 `markdown` 블록, 대체 경로, `text` 어디에도 남지 않음), 3,000자 section 나누기(줄 경계, 긴 줄 자르기, 이스케이프 뒤에도 한도), 실패 분류(404·410·`no_service`·`channel_not_found`·`channel_is_archived`·403·`action_prohibited`·429·`invalid_blocks`·그 밖, 200 `ok`만 성공이고 HTML이나 빈 본문의 200·204·201·302는 확인하지 못함, 오류 코드 모양의 본문만 문구에 쓰고 URL을 그대로·경로만·잘라서·JSON 이스케이프·퍼센트 인코딩으로 되돌린 본문은 `HTTP {상태}`만), URL 검사(https, `localhost`·loopback IP만 http, `*.localhost`는 거부). 로컬 스텁 서버(`summarize.rs`의 것)로: 응답 없는 서버는 짧은 제한에 "시간 초과"이고 요청 1번, 답 없이 끊는 서버는 "응답을 받지 못했습니다"이고 요청 1번(재시도 없음), 연결 거부는 "연결하지 못했습니다", 연결 거부·시간 초과 어디에도 URL이 나오지 않음, 302(뒤에 200)와 HTML 본문의 200은 둘 다 `review` + "응답을 확인하지 못했습니다"이고 연결·요청이 1번(리다이렉트를 따라가지 않고 대체 경로도 타지 않음). 전송 경로(임시 저장소, 가짜 키체인, 스텁 웹훅, Wry 없이 `Slack::send`): 요청이 도착했을 때 고친 본문이 이미 `summary.md`에 있음, `sent`의 채널·시각·수정 수와 `last_channel`, 꼬리말 "(수정 N곳)", `invalid_blocks` 400이면 요청이 정확히 2번이고 두 번째가 section 블록, 12,000자는 가고 12,001자는 요청 없이 거부(꼬리말은 세지 않음), 실패하면 `review` + `error`이고 다시 보내기가 시작되면 요청이 도는 동안 디스크의 `error`가 이미 비어 있음, 키체인에 URL이 없으면 설정 안내, 보내는 중 두 번째 전송은 거부되고 요청은 1번이며 그동안만 `is_sending`, 멘션을 무력화한 본문은 한 글자 늘어 12,000자 검사에 걸림, `no_speech`와 `review`가 아닌 회의는 요청 없이 거부 |
+| 수정 수 계산 (`slack::edit_count`) | 그대로면 0, 한 줄 변경은 1, 추가와 다른 곳의 삭제는 2, 두 줄을 세 줄로 바꾸면 3, 제목 변경 +1, LLM 제목은 한 줄로 만든 뒤 비교, 생성본이 없으면 빈 요약과 비교 |
+| 트레이와 알림 (`lib.rs`) | 상태 → 점 색과 툴팁(우선순위, 녹음 중에는 처리 수를 뺌), 작은 RGBA 버퍼에 그린 점(오른쪽 아래 40%, 흰 테두리, 나머지 픽셀은 그대로). macOS: 메인 창의 `Focused(true)`만 알림을 지우고(`Focused(false)`, 다른 이벤트, 다른 창은 아님), 번들 식별자가 없는 테스트 바이너리에서 지우기를 불러도 패닉하지 않음 |
 | `store.rs` | 상태 전이, 원자적 쓰기, 동시 갱신 두 개가 모두 남음 (8.2), 복구 분류 (8.4), 중단된 녹음의 처리 계속·삭제 (STO-03), 높은 `schema_version` → 읽기 전용 (D9), 요약 본문(제목 줄 빼기, 고친 본문 우선), `save_summary`는 `review`에서만·`summary.generated.md`는 그대로, "전송 안 함", "로컬로 요약"은 시작 전까지만, 다시 실행은 `summarize_failed`에서만, `no_speech` 없는 M3 `meta.json` |
 | `summarize.rs` | 순수 로직: 토큰 추정, 연결 고르기(6.1), `summary_route`, 30자 경계, 제목 나누기, `.md` 내보내기 형식. 로컬 HTTP 스텁 서버(`TcpListener`)로: 프롬프트·전사본·키 헤더(키가 있을 때만)·`max_tokens`, 클라우드에 키가 없으면 연결 0개, 401·403·429·500 분류(본문 일부, 키 가림)와 재시도 없음, 2xx가 완료 응답이 아니어도 키 가림(Authorization을 되돌려주는 서버), 연결 거부는 로컬이면 "로컬 LLM 미실행"·클라우드면 네트워크, 응답 없는 서버 → 1초 제한에 "시간 초과"와 정확히 한 번 재시도, 답 없이 끊는 서버도 정확히 한 번 재시도, 400 호환 재시도(`max_completion_tokens` 언급, 지원하지 않는 `temperature`)와 `max_tokens + 8,000`, 호환 요청에 다시 400이면 요청 2번 뒤 실패, `<think>` 두 모양(태그가 있을 때, 템플릿이 연 경우)과 빈 답·잘린 답(`length`) 실패, `usage.prompt_tokens`로 입력 잘림 감지, 긴 회의의 모든 요청이 예산 안·줄 경계·긴 줄 자르기·진행률, 한 요청에 들어가는 부분 요약은 바로 최종 요약, 재귀 축약에서 하나짜리 묶음은 다시 요약하지 않음·줄지 않으면 실패·너무 작은 컨텍스트는 요청 없이 실패, 부분 실패의 "구간 n/m", 로컬·loopback 주소는 프록시를 거치지 않음(순수 판정, 그리고 `HTTP_PROXY`를 준 자식 프로세스에서 로컬 연결은 프록시를 거치지 않고 클라우드 호스트만 거침). eval 검사 함수는 준비한 요약으로 확인한다 (12.3) |
-| `model.rs` | 해시 불일치 시 `.part` 삭제, 가져오기는 크기·해시가 맞을 때만 설치. 로컬 HTTP 서버(`TcpListener`)로: `Content-Range` 위치 확인, `Range`에 200이 오면 모델 크기일 때만 덮어씀, 너무 큰 `.part`는 처음부터, 크기는 맞고 해시가 틀린 설치 파일은 다시 받음, 멈춘 다운로드 취소가 바로 끝나고 가져오기를 막지 않음. 해시 확인 중에 취소하면 확인이 끝난 뒤에도 설치하지 않음(256MB 파일), 취소 표시가 켜진 설치는 이름 바꾸기·삭제를 하지 않음, 해시 확인 결과(정상·손상·없음)와 다운로드 중에는 손상 파일을 지우지 않음. 네트워크 시험(`cargo test -- --ignored downloads_and_resumes`): VAD 모델을 받고, 절반으로 자른 `.part`를 `Range`로 이어받음 |
-| 검토 화면 (Vitest) | `<img src=x onerror=...>`가 든 요약이 텍스트로 표시됨 (D6), 빈 녹음 안내와 전송 버튼 비활성화 (D8), "미정" 강조 |
+| `model.rs` | 해시 불일치 시 `.part` 삭제, 가져오기는 크기·해시가 맞을 때만 설치. 로컬 HTTP 서버(`TcpListener`)로: `Content-Range` 위치 확인, `Range`에 200이 오면 모델 크기일 때만 덮어씀, 너무 큰 `.part`는 처음부터, 크기는 맞고 해시가 틀린 설치 파일은 다시 받음, 멈춘 다운로드 취소가 바로 끝나고 가져오기를 막지 않음(받은 2바이트의 진행률이 온 뒤에 취소해, 느린 기계에서도 `.part`가 생기기 전에 취소하지 않는다). 해시 확인 중에 취소하면 확인이 끝난 뒤에도 설치하지 않음(256MB 파일), 취소 표시가 켜진 설치는 이름 바꾸기·삭제를 하지 않음, 해시 확인 결과(정상·손상·없음)와 다운로드 중에는 손상 파일을 지우지 않음. 네트워크 시험(`cargo test -- --ignored downloads_and_resumes`): VAD 모델을 받고, 절반으로 자른 `.part`를 `Range`로 이어받음 |
+| 검토 화면 (Vitest) | `<img src=x onerror=...>`가 든 요약이 텍스트로 표시됨 (D6), 빈 녹음 안내와 전송 버튼 비활성화 (D8), "미정" 강조. Slack(M5): 버튼의 채널 이름과 기본 채널(하나 / 마지막 / 첫 번째), 고른 채널·제목·본문·시차로 `send_to_slack`, 12,000자 초과 안내와 비활성화(`slack_length` 인자), 웹훅이 없으면 비활성화와 Slack 탭 링크, `review`가 아니면 비활성화, 남은 입력을 먼저 저장하고 저장이 실패하면 보내지 않음(보내는 동안 삭제도 막힘), 실패하면 원인·"다시 보내기"·"요약 복사", 다시 연 화면에도 지난 실패, 성공하면 전송 완료 줄과 읽기 전용, 이전 방문의 전송이 돌고 있으면(`sending`) 읽기 전용·"보내는 중…"·전송·"전송 안 함"·삭제 막음이고 다른 회의의 `slack://finished`는 무시하며 이 회의의 것이 오면 다시 읽어 전송 완료 줄 |
+| 앱 (Vitest) | 알림 클릭(`app://open-meeting`)이 그 회의의 지금 상태로 검토 또는 처리 중 화면을 열고, 없는 회의는 배너로 알림. `slack://finished`가 목록을 다시 읽음 |
 | 녹음 화면 (Vitest) | 레벨 이벤트로 경과 시간·스펙트럼 막대 높이·음량 표시, 경고 배너 닫기와 같은 종류가 다시 오면 다시 표시 |
 
 ### 12.2 수동 점검 (릴리스마다)

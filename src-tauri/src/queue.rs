@@ -61,7 +61,8 @@ pub struct Progress {
 }
 
 /// `transcribe://gpu-failed`: the GPU crashed twice on one chunk, so automatic mode now uses the
-/// CPU (architecture 5.4). M5 turns this into an OS notification.
+/// CPU (architecture 5.4). An in-app banner only: there is no meeting for an OS notification to
+/// open (APP-03).
 #[derive(Serialize, Clone, Debug)]
 pub struct Notice {
     pub message: &'static str,
@@ -627,6 +628,7 @@ impl<R: Runtime> Queue<R> {
             }
         }
         self.pump();
+        crate::refresh_tray(&self.app);
     }
 
     /// `resume_meeting`: a continued interrupted recording, or a `transcribe_failed` retry.
@@ -634,6 +636,7 @@ impl<R: Runtime> Queue<R> {
     pub fn enqueue(&self, id: &str, status: Status) {
         self.add(id, status);
         self.pump();
+        crate::refresh_tray(&self.app);
     }
 
     /// Starts whatever may start. Nothing does while a model is missing: meetings wait until a
@@ -1122,6 +1125,7 @@ impl<R: Runtime> Queue<R> {
     /// stop or a missing model keeps the meeting in line.
     fn end(&self, store: &Store, id: &str, end: End) {
         let requeue = matches!(end, End::Stopped(Stop::Recording) | End::Requeue);
+        let finished = matches!(end, End::Done(_) | End::Failed(_));
         let status = match end {
             End::Done(status) => Some(status),
             End::Stopped(Stop::Recording) => {
@@ -1200,6 +1204,25 @@ impl<R: Runtime> Queue<R> {
             self.publish_positions(&mut inner);
         }
         self.pump();
+        // APP-03: done or failed, said with its title; a click opens it.
+        if finished && let Ok(meta) = store.get(id) {
+            let event = match meta.status {
+                Status::Review if meta.no_speech => Some("음성이 거의 감지되지 않았습니다"),
+                Status::Review => Some("회의 요약이 준비됐습니다"),
+                Status::SummarizeFailed => Some("요약하지 못했습니다"),
+                Status::TranscribeFailed => Some("전사하지 못했습니다"),
+                _ => None,
+            };
+            if let Some(event) = event {
+                let title = if meta.title.is_empty() {
+                    "제목 없음"
+                } else {
+                    &meta.title
+                };
+                crate::notify(&self.app, format!("{event}: {title}"), id);
+            }
+        }
+        crate::refresh_tray(&self.app);
     }
 }
 

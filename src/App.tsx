@@ -14,16 +14,20 @@ import {
 import { Button } from "@/components/ui/button";
 import {
   confirmQuit,
+  getMeeting,
   listMeetings,
   onGpuFailed,
   onMeetingProgress,
+  onOpenMeeting,
   onQuitRequested,
   onRecordingLevel,
   onRecordingStopped,
+  onSlackFinished,
   queueState,
   requestQuit,
   SCHEMA_VERSION,
   type MeetingItem,
+  type Meta,
   type Progress,
   type Status,
 } from "@/lib/ipc";
@@ -40,6 +44,11 @@ type Screen =
   | { name: "processing" | "review"; id: string };
 
 const REVIEWABLE: Status[] = ["review", "sent", "archived"];
+/** A meeting's own screen, from where it is now. */
+const screenOf = (m: Meta): Screen =>
+  m.status === "recording"
+    ? { name: "recording" }
+    : { name: REVIEWABLE.includes(m.status) ? "review" : "processing", id: m.id };
 // h-6: a 24px target around the 20px badge (WCAG 2.5.8).
 const CHIP =
   "flex h-6 items-center rounded-4xl outline-none hover:opacity-80 focus-visible:ring-3 focus-visible:ring-ring";
@@ -71,8 +80,8 @@ export default function App() {
   const [quitAsked, setQuitAsked] = useState(false);
   const [quitError, setQuitError] = useState("");
   // Why a recording ended by itself (disk, 4 hours, sleep), the GPU fallback, a progress listener
-  // that would not start, or a review edit that failed to save after its screen closed. OS
-  // notifications come in M5.
+  // that would not start, or a review edit that failed to save after its screen closed. The first
+  // is an OS notification too while the window is hidden or not focused (APP-03).
   const [notice, setNotice] = useState("");
   const home = () => setScreen({ name: "home" });
   const quitFailed = (e: unknown) => setQuitError(`종료하지 못했습니다: ${e}`);
@@ -138,6 +147,30 @@ export default function App() {
       setScreen((s) => (s.name === "recording" ? { name: "processing", id } : s));
     });
     unlisten.catch((e) => setQuitError(`녹음 종료 알림을 준비하지 못했습니다: ${e}`));
+    return () => {
+      unlisten.then((stop) => stop(), () => {});
+    };
+  }, []);
+
+  // A send that ended, maybe after its screen closed: a sent meeting is no longer unsent.
+  useEffect(() => {
+    const unlisten = onSlackFinished(() => refresh());
+    unlisten.catch((e) => setNotice(`전송 결과 알림을 준비하지 못했습니다: ${e}`));
+    return () => {
+      unlisten.then((stop) => stop(), () => {});
+    };
+  }, []);
+
+  // APP-03: a notification click opens its meeting where it is now: done or failed when told, it
+  // may have been sent or retried since.
+  useEffect(() => {
+    const unlisten = onOpenMeeting((id) =>
+      getMeeting(id).then(
+        ({ meta }) => setScreen(screenOf(meta)),
+        (e) => setNotice(`회의를 열지 못했습니다: ${e}`),
+      ),
+    );
+    unlisten.catch((e) => setNotice(`알림 클릭을 준비하지 못했습니다: ${e}`));
     return () => {
       unlisten.then((stop) => stop(), () => {});
     };
@@ -233,13 +266,7 @@ export default function App() {
           progress={progress}
           recording={recording}
           onChanged={refresh}
-          onOpen={(m) =>
-            setScreen(
-              m.status === "recording"
-                ? { name: "recording" }
-                : { name: REVIEWABLE.includes(m.status) ? "review" : "processing", id: m.id },
-            )
-          }
+          onOpen={(m) => setScreen(screenOf(m))}
           onRecord={() => setScreen({ name: "recording" })}
           onSetup={(tab) => setScreen({ name: "settings", tab })}
         />
@@ -258,7 +285,13 @@ export default function App() {
         />
       )}
       {screen.name === "review" && (
-        <Review key={screen.id} id={screen.id} onHome={home} onNotice={setNotice} />
+        <Review
+          key={screen.id}
+          id={screen.id}
+          onHome={home}
+          onNotice={setNotice}
+          onSetup={(tab) => setScreen({ name: "settings", tab })}
+        />
       )}
       {screen.name === "settings" && <Settings tab={screen.tab} onHome={home} />}
 

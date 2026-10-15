@@ -3,7 +3,8 @@ use crate::QUIT_CONFIRMED;
 use crate::audio::{self, AudioDevices, Recorder, RecordingState};
 use crate::queue::{Progress, Queue};
 use crate::settings::{self, LoadedSettings, SecretKind, Settings, SettingsStore};
-use crate::store::{Meta, Status, Store};
+use crate::slack::{self, Slack};
+use crate::store::{Meta, Status, Store, one_line};
 use crate::summarize::{self, SummaryRoute};
 use crate::transcribe::engine::Segment;
 use crate::transcribe::model::{self, ModelState, Models};
@@ -78,11 +79,18 @@ pub fn list_meetings(store: State<'_, Store>) -> Result<Vec<MeetingItem>, String
 pub struct MeetingDetail {
     meta: Meta,
     summary: String,
+    /// A send of it is out, maybe from a review screen since closed (7.1).
+    sending: bool,
 }
 
 #[tauri::command(async)]
-pub fn get_meeting(store: State<'_, Store>, id: String) -> Result<MeetingDetail, String> {
+pub fn get_meeting(
+    store: State<'_, Store>,
+    slack: State<'_, Slack>,
+    id: String,
+) -> Result<MeetingDetail, String> {
     Ok(MeetingDetail {
+        sending: slack.is_sending(&id),
         meta: store.get(&id)?,
         summary: store.summary(&id)?,
     })
@@ -96,6 +104,7 @@ pub fn get_transcript(store: State<'_, Store>, id: String) -> Result<Vec<Segment
 
 #[tauri::command(async)]
 pub fn delete_meeting(
+    app: AppHandle,
     store: State<'_, Store>,
     recorder: State<'_, Recorder>,
     queue: State<'_, Queue>,
@@ -103,7 +112,9 @@ pub fn delete_meeting(
 ) -> Result<(), String> {
     // Delete step 2 (8.3): close the WAV files before the folder goes.
     recorder.stop(Some(&id));
-    store.delete_with(&id, || queue.cancel(&id))
+    let deleted = store.delete_with(&id, || queue.cancel(&id));
+    crate::refresh_tray(&app);
+    deleted
 }
 
 /// "처리 계속" for an interrupted recording, or another try after `transcribe_failed`. Either
@@ -139,13 +150,15 @@ pub fn start_recording(
     recorder: State<'_, Recorder>,
 ) -> Result<RecordingState, String> {
     let settings = settings.load().map(|l| l.settings).unwrap_or_default();
-    recorder.start(
+    let started = recorder.start(
         &app,
         &store,
         settings.input_device,
         settings.output_device,
         settings.summarize_local_by_default,
-    )
+    );
+    crate::refresh_tray(&app);
+    started
 }
 
 /// For the settings' audio tab. Device calls can block inside the OS audio API, so this runs on
@@ -289,8 +302,65 @@ pub fn save_summary(
 
 /// REV-03 "전송 안 함": `review` → `archived`.
 #[tauri::command(async)]
-pub fn archive_meeting(store: State<'_, Store>, id: String) -> Result<Meta, String> {
-    store.set_status(&id, Status::Archived)
+pub fn archive_meeting(
+    app: AppHandle,
+    store: State<'_, Store>,
+    id: String,
+) -> Result<Meta, String> {
+    let archived = store.set_status(&id, Status::Archived);
+    crate::refresh_tray(&app);
+    archived
+}
+
+/// REV-02: the characters of the Slack message block for this title and body, header included,
+/// footer not. `offset_minutes`: the local UTC offset at the meeting's start (`slack::markdown`).
+#[tauri::command(async)]
+pub fn slack_length(
+    store: State<'_, Store>,
+    settings: State<'_, SettingsStore>,
+    id: String,
+    title: String,
+    body: String,
+    offset_minutes: i32,
+) -> Result<usize, String> {
+    let recorder = settings.load()?.settings.recorder_name;
+    let meta = store.get(&id)?;
+    let text = slack::markdown(&one_line(&title), &meta, offset_minutes, &recorder, &body);
+    Ok(text.chars().count())
+}
+
+/// SND-01..06: the reviewed summary to the webhook named `webhook`. Only the send button calls
+/// this (SND-05). `slack://finished` (the id) tells the list and a review screen opened meanwhile
+/// that it ended, sent or not.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn send_to_slack(
+    app: AppHandle,
+    store: State<'_, Store>,
+    settings: State<'_, SettingsStore>,
+    slack: State<'_, Slack>,
+    id: String,
+    webhook: String,
+    title: String,
+    body: String,
+    offset_minutes: i32,
+) -> Result<Meta, String> {
+    let sent = slack
+        .send(
+            &store,
+            &settings,
+            &id,
+            &webhook,
+            &title,
+            &body,
+            offset_minutes,
+        )
+        .await;
+    crate::refresh_tray(&app);
+    if let Err(e) = app.emit("slack://finished", &id) {
+        eprintln!("전송 종료 이벤트 전송 실패: {e}");
+    }
+    sent
 }
 
 /// SUM-06 "요약 다시 실행" after `summarize_failed`, with the connection the recorder picked.

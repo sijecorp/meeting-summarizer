@@ -318,7 +318,13 @@ fn emitter(app: AppHandle, warnings: Arc<Mutex<Vec<Warning>>>) -> Emit {
                 standing.push(warning.clone());
                 app.emit("recording://warning", warning)
             }
-            Event::Stopped(stopped) => app.emit("recording://stopped", stopped),
+            Event::Stopped(stopped) => {
+                // APP-03: a recording that ended by itself is also an OS notification.
+                if let Some(message) = &stopped.message {
+                    crate::notify(&app, message.clone(), &stopped.id);
+                }
+                app.emit("recording://stopped", stopped)
+            }
         };
         if let Err(e) = sent {
             eprintln!("녹음 이벤트 전송 실패: {e}");

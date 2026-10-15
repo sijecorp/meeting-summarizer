@@ -781,19 +781,26 @@ mod tests {
         let mut stalled = reply("200 OK", "", b"hello");
         stalled.truncate(stalled.len() - 3);
         let (url, _server) = serve(vec![stalled], Duration::from_secs(5));
-        let started = Instant::now();
-        let result = std::thread::scope(|s| {
-            s.spawn(|| {
-                std::thread::sleep(Duration::from_millis(300));
+        let (progress, arrived) = std::sync::mpsc::channel();
+        let (result, cancelled) = std::thread::scope(|s| {
+            let canceller = s.spawn(|| {
+                // Once the two bytes are in the `.part`, however long a loaded machine took, the
+                // download only waits. A fixed sleep could cancel before the `.part` existed.
+                let _ = arrived.into_iter().any(|received| received == 2);
                 models.cancel();
+                Instant::now()
             });
-            tauri::async_runtime::block_on(models.download(&url, [&HELLO, &HELLO], |_| {}))
+            let result =
+                tauri::async_runtime::block_on(models.download(&url, [&HELLO, &HELLO], move |p| {
+                    let _ = progress.send(p.received);
+                }));
+            (result, canceller.join().unwrap())
         });
         assert_eq!(result.unwrap_err(), CANCELLED);
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            cancelled.elapsed() < Duration::from_secs(2),
             "{:?}",
-            started.elapsed()
+            cancelled.elapsed()
         );
         assert!(!models.busy.load(Ordering::SeqCst));
         assert_eq!(fs::read(part_of(&models.path(&HELLO))).unwrap(), b"he");

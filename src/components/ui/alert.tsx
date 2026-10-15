@@ -13,6 +13,9 @@ const alertVariants = cva(
           "border-destructive bg-danger100 *:data-[slot=alert-description]:text-foreground *:[svg]:text-destructive",
         warning:
           "border-warning bg-warning100 *:data-[slot=alert-description]:text-foreground *:[svg]:text-warning",
+        // 10.3 전송 완료: green icon and border, green50 background, black text.
+        success:
+          "border-green bg-green50 *:data-[slot=alert-description]:text-foreground *:[svg]:text-green",
       },
     },
     defaultVariants: {
