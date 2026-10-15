@@ -21,6 +21,7 @@ const meta = (patch: Partial<Meta>): Meta => ({
   chunks_done: 2,
   llm_connection: null,
   summarize_local: false,
+  no_speech: false,
   error: null,
   sent: null,
   ...patch,

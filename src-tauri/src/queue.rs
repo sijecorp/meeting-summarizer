@@ -1,15 +1,17 @@
-//! Processing queue (architecture 5.3, 8.4, TRN-01). Up to two meetings transcribe at once; the
-//! rest wait first in, first out. Each running meeting has a thread that starts one worker process
-//! per chunk and saves every finished chunk, so a stopped meeting resumes from the chunk after its
-//! last finished one (STO-03). A fully transcribed meeting ends in `transcribed`; summarizing
-//! comes with M4.
+//! Processing queue (architecture 5.3, 8.4, TRN-01). Up to two meetings are processed at once;
+//! the rest wait first in, first out. Each running meeting has a thread that transcribes and then
+//! summarizes it in the same slot. Transcribing starts one worker process per chunk and saves every
+//! finished chunk, so a stopped meeting resumes from the chunk after its last finished one
+//! (STO-03). A meeting with `transcript.json` is only summarized (architecture 6): a paused
+//! summary, a `summarize_failed` retry. With no LLM connection it stays `transcribed`.
 //!
 //! The decisions are pure and tested without the app: `Sched` (who runs, who waits, places in
 //! line), `ChunkRun` (GPU retry, CPU fallback, TRN-07), `read_partial` (where to resume),
 //! `percent` and `eta_secs`.
 
-use crate::settings::{Backend, Settings, SettingsStore};
+use crate::settings::{self, Backend, SecretKind, Settings, SettingsStore};
 use crate::store::{SCHEMA_VERSION, Status, Store, can_transition, write_atomic};
+use crate::summarize;
 use crate::transcribe::engine::{self, Chunk, Device, Line, Segment};
 use crate::transcribe::filter;
 use crate::transcribe::model::{Check, Models};
@@ -17,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
+use std::future::Future;
 use std::io::{BufRead, BufReader, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -38,17 +41,20 @@ const PARTIAL: &str = "transcript.partial.jsonl";
 const GPU_FAILED: &str = "GPU 처리가 불안정해 CPU로 전환했습니다. 처리 시간이 길어집니다";
 
 /// `meeting://progress`, and one entry of `queue_state`. Sent when a meeting joins the line, its
-/// place changes, it starts, a chunk moves, and when it ends (then with its final status).
+/// place changes, it starts, a chunk or LLM request moves, and when it ends (then with its final
+/// status).
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Progress {
     pub id: String,
     pub status: Status,
-    /// Chunks finished, of `chunks`. `chunks` is 0 until the chunk plan exists.
+    /// Chunks finished, of `chunks`. `chunks` is 0 until the chunk plan exists. While
+    /// `summarizing`: LLM requests done, of the ones known so far (a long meeting adds some).
     pub chunk: u32,
     pub chunks: u32,
     /// While `chunks` is 0, the chunk planning's progress; then 0..100 over the whole recording.
+    /// While `summarizing`, from `chunk` / `chunks`.
     pub percent: u8,
-    /// Remaining time, once this run has done enough to tell.
+    /// Remaining time, once this run has done enough to tell. Never while `summarizing`.
     pub eta_secs: Option<u64>,
     /// 1-based place in line while waiting; `None` while running.
     pub position: Option<u32>,
@@ -99,15 +105,22 @@ impl Sched {
     }
 
     /// TRN-09: a recording started. Running meetings go back to the front of the line, in the
-    /// order they started. Returns them, to be stopped.
-    fn suspend(&mut self) -> Vec<String> {
+    /// order they started, except those `keep` names (cloud summaries, SUM-09). Returns the ones
+    /// to be stopped.
+    fn suspend(&mut self, keep: impl Fn(&str) -> bool) -> Vec<String> {
         self.recording = true;
-        for id in self.running.iter().rev() {
+        let stopped: Vec<String> = self
+            .running
+            .iter()
+            .filter(|id| !keep(id))
+            .cloned()
+            .collect();
+        for id in stopped.iter().rev() {
             if !self.waiting.contains(id) {
                 self.waiting.push_front(id.clone());
             }
         }
-        self.running.clone()
+        stopped
     }
 
     fn finished(&mut self, id: &str) {
@@ -141,6 +154,10 @@ enum Stop {
 struct Job {
     stop: Option<Stop>,
     child: Option<Child>,
+    /// Aborts the summary task in flight.
+    abort: Option<Box<dyn Fn() + Send>>,
+    /// A cloud summary is in flight: a recording lets it run on (SUM-09).
+    cloud: bool,
 }
 
 impl Job {
@@ -151,6 +168,9 @@ impl Job {
         }
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
+        }
+        if let Some(abort) = &self.abort {
+            abort();
         }
     }
 }
@@ -170,10 +190,12 @@ fn lock(inner: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
 }
 
 impl Inner {
-    /// TRN-09: running meetings back in line, their workers killed.
+    /// TRN-09, SUM-09: running meetings back in line, their workers killed and local summaries
+    /// aborted. A cloud summary runs on through the recording.
     fn suspend(&mut self) {
-        for id in self.sched.suspend() {
-            if let Some(job) = self.jobs.get_mut(&id) {
+        let Inner { sched, jobs, .. } = self;
+        for id in sched.suspend(|id| jobs.get(id).is_some_and(|j| j.cloud)) {
+            if let Some(job) = jobs.get_mut(&id) {
                 job.halt(Stop::Recording);
             }
         }
@@ -498,20 +520,27 @@ fn run_worker(
 }
 
 enum End {
-    Done,
+    /// Finished in this status: `review`, or `transcribed` when there is no LLM connection.
+    Done(Status),
     Stopped(Stop),
+    /// `transcribe_failed`, or `summarize_failed` once summarizing started, with the reason.
     Failed(String),
-    /// Not in a state to transcribe (finished meanwhile, being deleted).
+    /// Not in a state to process (finished meanwhile, being deleted).
     Skipped(String),
     /// A model went missing after `pump` checked: back in line until it is there again.
     Requeue,
 }
+
+/// An LLM connection's API key by connection name.
+type Secret = Box<dyn Fn(&str) -> Result<Option<String>, String> + Send + Sync>;
 
 /// Generic over the runtime only so tests can run it on `tauri::test`'s mock runtime.
 pub struct Queue<R: Runtime = Wry> {
     app: AppHandle<R>,
     /// This executable, started with `--plan-chunks` / `--transcribe-worker`.
     exe: PathBuf,
+    /// The keychain; tests put a stand-in here.
+    secret: Secret,
     inner: Mutex<Inner>,
 }
 
@@ -520,6 +549,7 @@ impl<R: Runtime> Queue<R> {
         Self {
             app,
             exe,
+            secret: Box::new(|name| settings::get_secret(SecretKind::Llm, name)),
             inner: Mutex::new(Inner::default()),
         }
     }
@@ -579,16 +609,20 @@ impl<R: Runtime> Queue<R> {
         self.publish_positions(&mut inner);
     }
 
-    /// TRN-01: every `recorded` and `paused` meeting, oldest first. At startup (after recovery
-    /// paused what was transcribing) and when a recording ends.
-    /// M4: a meeting paused while summarizing must go to the summarizer instead.
+    /// TRN-01: every `recorded` and `paused` meeting, oldest first, and the `transcribed` ones
+    /// once there is an LLM connection to summarize them with. At startup (after recovery paused
+    /// what was running), when a recording ends, and when settings are saved.
     pub fn enqueue_pending(&self) {
+        let summarize = !self.settings().llm_connections.is_empty();
         let mut metas = self.app.state::<Store>().list();
         metas.reverse();
         for meta in metas {
-            if meta.schema_version <= SCHEMA_VERSION
-                && matches!(meta.status, Status::Recorded | Status::Paused)
-            {
+            let pending = match meta.status {
+                Status::Recorded | Status::Paused => true,
+                Status::Transcribed => summarize,
+                _ => false,
+            };
+            if meta.schema_version <= SCHEMA_VERSION && pending {
                 self.add(&meta.id, meta.status);
             }
         }
@@ -596,6 +630,7 @@ impl<R: Runtime> Queue<R> {
     }
 
     /// `resume_meeting`: a continued interrupted recording, or a `transcribe_failed` retry.
+    /// `retry_summary`: a `summarize_failed` one.
     pub fn enqueue(&self, id: &str, status: Status) {
         self.add(id, status);
         self.pump();
@@ -603,6 +638,8 @@ impl<R: Runtime> Queue<R> {
 
     /// Starts whatever may start. Nothing does while a model is missing: meetings wait until a
     /// download or import finishes (ONB-01), which calls this again.
+    /// ponytail: that holds back summaries too, which need no model; skip ahead to them if
+    /// switching to a model not yet downloaded leaves summaries waiting in practice.
     pub fn pump(&self) {
         let model = self.settings().model;
         if self.app.state::<Models>().ready(&model).is_none() {
@@ -616,7 +653,7 @@ impl<R: Runtime> Queue<R> {
             let app = self.app.clone();
             let run_id = id.clone();
             let spawned = thread::Builder::new()
-                .name("transcribe".into())
+                .name("process".into())
                 .spawn(move || run(&app, &run_id));
             match spawned {
                 // Detached: `cancel` waits on `running` instead, which `end` clears.
@@ -624,7 +661,7 @@ impl<R: Runtime> Queue<R> {
                     inner.jobs.insert(id, Job::default());
                 }
                 Err(e) => {
-                    eprintln!("전사 스레드를 시작할 수 없습니다 ({id}): {e}");
+                    eprintln!("처리 스레드를 시작할 수 없습니다 ({id}): {e}");
                     inner.sched.finished(&id);
                     inner.progress.remove(&id);
                 }
@@ -633,7 +670,8 @@ impl<R: Runtime> Queue<R> {
         self.publish_positions(&mut inner);
     }
 
-    /// TRN-09: kills every worker at once. Their meetings go back to the front of the line.
+    /// TRN-09, SUM-09: kills every worker and aborts local summaries at once. Their meetings go
+    /// back to the front of the line. Cloud summaries go on.
     pub fn recording_started(&self) {
         let mut inner = lock(&self.inner);
         inner.suspend();
@@ -646,8 +684,9 @@ impl<R: Runtime> Queue<R> {
         self.enqueue_pending();
     }
 
-    /// Delete steps 2–3 (architecture 8.3): out of the line, the worker killed, and returns once
-    /// the meeting's run has ended. A second delete of the same meeting waits here too.
+    /// Delete steps 2–3 (architecture 8.3): out of the line, the worker killed or the summary
+    /// aborted, and returns once the meeting's run has ended. A second delete of the same meeting
+    /// waits here too.
     pub fn cancel(&self, id: &str) {
         {
             let mut inner = lock(&self.inner);
@@ -664,8 +703,9 @@ impl<R: Runtime> Queue<R> {
         }
     }
 
-    /// App exit (architecture 8.5): nothing new starts and every worker is killed. Child processes
-    /// outlive their parent otherwise. `Store::pause_busy` then writes `paused`.
+    /// App exit (architecture 8.5): nothing new starts, every worker is killed and every summary
+    /// aborted. Child processes outlive their parent otherwise. `Store::pause_busy` then writes
+    /// `paused`.
     pub fn shutdown(&self) {
         let mut inner = lock(&self.inner);
         inner.closed = true;
@@ -907,9 +947,175 @@ impl<R: Runtime> Queue<R> {
             Ok(())
         });
         match finished {
-            Ok(_) => End::Done,
+            Ok(_) => End::Done(Status::Transcribed),
             Err(e) => End::Failed(e),
         }
+    }
+
+    /// Transcribes, then summarizes in the same slot (architecture 8.4). A meeting past
+    /// transcribing, or paused while summarizing (`transcript.json` tells), is only summarized.
+    /// The status decides, not the file: a `transcribe_failed` meeting whose `transcript.json` was
+    /// written before its status could be transcribes again.
+    fn process(&self, store: &Store, id: &str) -> End {
+        let status = match store.get(id) {
+            Ok(meta) => meta.status,
+            Err(e) => return End::Skipped(e),
+        };
+        let summary_only = match status {
+            Status::Transcribed | Status::Summarizing | Status::SummarizeFailed => true,
+            Status::Paused => store
+                .dir_for(id)
+                .is_ok_and(|dir| dir.join("transcript.json").exists()),
+            _ => false,
+        };
+        if !summary_only {
+            match self.transcribe(store, id) {
+                End::Done(_) => {}
+                end => return end,
+            }
+            // Nothing to summarize with: it waits in `transcribed` for a connection (8.4).
+            if self.settings().llm_connections.is_empty() {
+                return End::Done(Status::Transcribed);
+            }
+        }
+        self.summarize(store, id)
+    }
+
+    /// Architecture 6. A transcript with almost no speech is not sent anywhere (SUM-10).
+    /// Otherwise the meeting's connection (`summarize::route`) gets it, with its key from the
+    /// keychain, as a task this thread waits on.
+    fn summarize(&self, store: &Store, id: &str) -> End {
+        let started = store.update(id, |m| {
+            // `summarizing` itself too, like `transcribing` above.
+            if m.status != Status::Summarizing && !can_transition(m.status, Status::Summarizing) {
+                return Err(format!("요약할 수 없는 상태입니다: {:?}", m.status));
+            }
+            m.status = Status::Summarizing;
+            m.error = None;
+            Ok(())
+        });
+        if let Err(e) = started {
+            return End::Skipped(e);
+        }
+        self.set_progress(id, |p| {
+            *p = Progress {
+                id: p.id.clone(),
+                status: Status::Summarizing,
+                chunk: 0,
+                chunks: 0,
+                percent: 0,
+                eta_secs: None,
+                position: None,
+            };
+        });
+        let lines: Vec<String> = match store.transcript(id) {
+            Ok(segments) => segments
+                .into_iter()
+                .map(|s| s.text.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect(),
+            Err(e) => return End::Failed(e),
+        };
+        let dir = match store.dir_for(id) {
+            Ok(dir) => dir,
+            Err(e) => return End::Failed(e),
+        };
+        let review = |summary: Option<&str>| {
+            store.update(id, |m| {
+                if m.status != Status::Summarizing {
+                    return Err(format!("요약을 마칠 수 없는 상태입니다: {:?}", m.status));
+                }
+                // The LLM's own text, kept for the edit count (SUM-05).
+                if let Some(summary) = summary {
+                    write_atomic(&dir.join("summary.generated.md"), summary.as_bytes())
+                        .map_err(|e| format!("summary.generated.md 저장 실패: {e}"))?;
+                    if let (Some(title), _) = summarize::split_title(summary) {
+                        m.title = title;
+                    }
+                }
+                m.no_speech = summary.is_none();
+                m.status = Status::Review;
+                Ok(())
+            })
+        };
+        if summarize::too_short(&lines) {
+            return match review(None) {
+                Ok(_) => End::Done(Status::Review),
+                Err(e) => End::Failed(e),
+            };
+        }
+
+        let settings = self.settings();
+        let mut chosen = Err(String::new());
+        let routed = store.update(id, |m| {
+            chosen = summarize::route(&settings, m).cloned();
+            if let Ok(c) = &chosen {
+                m.llm_connection = Some(c.name.clone());
+                m.summarize_local = c.is_local;
+            }
+            Ok(())
+        });
+        let connection = match routed.and(chosen) {
+            Ok(connection) => connection,
+            Err(e) => return End::Failed(e),
+        };
+        let key = match (self.secret)(&connection.name) {
+            Ok(key) => key,
+            Err(e) => return End::Failed(e),
+        };
+        let cloud = !connection.is_local;
+        let (app, run_id, glossary) = (self.app.clone(), id.to_string(), settings.glossary);
+        let task = async move {
+            let on_step = |done: u32, known: u32| {
+                app.state::<Queue<R>>().set_progress(&run_id, |p| {
+                    p.chunk = done;
+                    p.chunks = known;
+                    p.percent = (done * 100 / known.max(1)) as u8;
+                });
+            };
+            summarize::summarize(&connection, key, &glossary, &lines, on_step).await
+        };
+        let summary = match self.request(id, cloud, task) {
+            Ok(Ok(summary)) => summary,
+            Ok(Err(failure)) => return End::Failed(failure.message()),
+            Err(end) => return end,
+        };
+        match review(Some(&summary)) {
+            Ok(_) => End::Done(Status::Review),
+            Err(e) => End::Failed(e),
+        }
+    }
+
+    /// Runs a summary as its own task and waits for it. The task starts under the lock, so a stop
+    /// never misses it: a delete or quit aborts it, and so does a recording unless it is a cloud
+    /// summary (SUM-09).
+    fn request<T: Send + 'static>(
+        &self,
+        id: &str,
+        cloud: bool,
+        task: impl Future<Output = T> + Send + 'static,
+    ) -> Result<T, End> {
+        let task = {
+            let mut inner = lock(&self.inner);
+            let Some(job) = inner.jobs.get_mut(id) else {
+                return Err(End::Stopped(Stop::Delete));
+            };
+            // A recording that started just before has stopped this run already.
+            if let Some(stop) = job.stop {
+                return Err(End::Stopped(stop));
+            }
+            let task = tauri::async_runtime::spawn(task);
+            let abort = task.inner().abort_handle();
+            job.abort = Some(Box::new(move || abort.abort()));
+            job.cloud = cloud;
+            task
+        };
+        let result = tauri::async_runtime::block_on(task);
+        let inner = lock(&self.inner);
+        if let Some(stop) = inner.jobs.get(id).map_or(Some(Stop::Delete), |j| j.stop) {
+            return Err(End::Stopped(stop));
+        }
+        result.map_err(|e| End::Failed(format!("요약 작업이 비정상 종료했습니다: {e}")))
     }
 
     /// Writes how the run ended, frees its slot and starts the next meeting. Only a recording
@@ -917,7 +1123,7 @@ impl<R: Runtime> Queue<R> {
     fn end(&self, store: &Store, id: &str, end: End) {
         let requeue = matches!(end, End::Stopped(Stop::Recording) | End::Requeue);
         let status = match end {
-            End::Done => Some(Status::Transcribed),
+            End::Done(status) => Some(status),
             End::Stopped(Stop::Recording) => {
                 // Nothing on disk claims work that is not running (same as recovery, 8.4).
                 if let Err(e) = store.set_status(id, Status::Paused) {
@@ -927,27 +1133,41 @@ impl<R: Runtime> Queue<R> {
             }
             End::Stopped(Stop::Delete | Stop::Quit) => None,
             End::Failed(message) => {
-                eprintln!("전사 실패 ({id}): {message}");
+                eprintln!("처리 실패 ({id}): {message}");
                 let failed = store.update(id, |m| {
-                    if can_transition(m.status, Status::TranscribeFailed) {
-                        m.status = Status::TranscribeFailed;
+                    let to = if m.status == Status::Summarizing {
+                        Status::SummarizeFailed
+                    } else {
+                        Status::TranscribeFailed
+                    };
+                    if can_transition(m.status, to) {
+                        m.status = to;
                         m.error = Some(message);
                     }
                     Ok(())
                 });
-                if let Err(e) = failed {
-                    eprintln!("실패 상태 기록 실패 ({id}): {e}");
+                match failed {
+                    Ok(m) => Some(m.status),
+                    Err(e) => {
+                        eprintln!("실패 상태 기록 실패 ({id}): {e}");
+                        None
+                    }
                 }
-                Some(Status::TranscribeFailed)
             }
             End::Skipped(reason) => {
-                eprintln!("전사 건너뜀 ({id}): {reason}");
+                eprintln!("처리 건너뜀 ({id}): {reason}");
                 store.get(id).ok().map(|m| m.status)
             }
             End::Requeue => None,
         };
         {
             let mut inner = lock(&self.inner);
+            // A delete or quit that landed after the run stopped wins: no ghost back in line.
+            let halted = matches!(
+                inner.jobs.get(id).and_then(|j| j.stop),
+                Some(Stop::Delete | Stop::Quit)
+            );
+            let requeue = requeue && !halted;
             inner.sched.finished(id);
             inner.jobs.remove(id);
             if !requeue {
@@ -969,7 +1189,7 @@ impl<R: Runtime> Queue<R> {
                     // Out of line, even if a recording put it back before this run could stop.
                     p.position = None;
                 }
-                if status == Status::Transcribed {
+                if matches!(status, Status::Transcribed | Status::Review) {
                     p.percent = 100;
                 }
                 if waiting {
@@ -988,8 +1208,8 @@ fn run<R: Runtime>(app: &AppHandle<R>, id: &str) {
     let queue = app.state::<Queue<R>>();
     let store = app.state::<Store>();
     // A panic still frees the slot and records the failure. (Release builds abort on panic.)
-    let end = panic::catch_unwind(AssertUnwindSafe(|| queue.transcribe(&store, id)))
-        .unwrap_or_else(|_| End::Failed("전사 처리 중 내부 오류가 났습니다".into()));
+    let end = panic::catch_unwind(AssertUnwindSafe(|| queue.process(&store, id)))
+        .unwrap_or_else(|_| End::Failed("처리 중 내부 오류가 났습니다".into()));
     queue.end(&store, id, end);
 }
 
@@ -1032,7 +1252,7 @@ mod tests {
             s.enqueue(id);
         }
         s.start_next();
-        assert_eq!(s.suspend(), ids(&["a", "b"]));
+        assert_eq!(s.suspend(|_| false), ids(&["a", "b"]));
         assert_eq!(
             (s.position("a"), s.position("b"), s.position("c")),
             (Some(1), Some(2), Some(3))
@@ -1047,6 +1267,23 @@ mod tests {
         s.finished("a");
         assert_eq!(s.start_next(), ids(&["a", "b"]));
         assert_eq!(s.position("c"), Some(1));
+    }
+
+    /// SUM-09: a cloud summary keeps its slot through a recording; the freed slot stays empty.
+    #[test]
+    fn a_cloud_summary_keeps_its_slot_through_a_recording() {
+        let mut s = Sched::default();
+        for id in ["a", "b", "c"] {
+            s.enqueue(id);
+        }
+        s.start_next();
+        assert_eq!(s.suspend(|id| id == "b"), ids(&["a"]));
+        assert_eq!(
+            (s.position("a"), s.position("b"), s.position("c")),
+            (Some(1), None, Some(2))
+        );
+        s.finished("b");
+        assert!(s.start_next().is_empty());
     }
 
     #[test]
@@ -1311,13 +1548,18 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
-    /// The queue end to end on the mock runtime, with a shell script as the worker and the
-    /// `tiny` model "installed" as sparse files of the right size.
+    /// The queue end to end on the mock runtime, with a shell script as the worker, the `tiny`
+    /// model "installed" as sparse files of the right size, stub LLM servers and a stand-in
+    /// keychain.
     #[cfg(unix)]
     mod app {
         use super::*;
+        use crate::settings::LlmConnection;
+        use crate::summarize::split_title;
+        use crate::summarize::tests::{SUMMARY, completion, connection, reply, serve};
         use crate::transcribe::model;
         use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
         use tauri::Listener;
         use tauri::test::MockRuntime;
 
@@ -1327,6 +1569,8 @@ mod tests {
         const PLAN: &str = r#"{"type":"plan","len_ms":20000,"chunks":[{"start_ms":0,"end_ms":10000,"speech_ms":5000},{"start_ms":10000,"end_ms":20000,"speech_ms":0}]}"#;
         /// A result echoing the chunk and device, plus a listed hallucination.
         const RESULT: &str = r#"echo '{"type":"progress","pct":40}'; echo "{\"type\":\"result\",\"device\":\"$5\",\"segments\":[{\"start_ms\":$3,\"end_ms\":$4,\"text\":\"구간 $3\"},{\"start_ms\":$3,\"end_ms\":$4,\"text\":\"시청해주셔서 감사합니다.\"}]}""#;
+        /// A result with enough speech to summarize (SUM-10 wants 30 characters).
+        const SPEECH: &str = r#"echo "{\"type\":\"result\",\"device\":\"$5\",\"segments\":[{\"start_ms\":$3,\"end_ms\":$4,\"text\":\"이번 주 배포는 목요일 오후에 하고 릴리스 노트는 민수 씨가 금요일까지 씁니다\"}]}""#;
 
         struct Fixture {
             app: tauri::App<MockRuntime>,
@@ -1362,7 +1606,11 @@ mod tests {
             );
             fs::write(&exe, script).unwrap();
             fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
-            app.manage(Queue::new(app.handle().clone(), exe));
+            // Never the real keychain.
+            app.manage(Queue {
+                secret: Box::new(|_| Ok(Some("sk-test".into()))),
+                ..Queue::new(app.handle().clone(), exe)
+            });
 
             let events = Arc::new(Mutex::new(Vec::new()));
             let seen = events.clone();
@@ -1394,7 +1642,7 @@ mod tests {
             }
 
             fn recorded(&self) -> String {
-                let id = self.store().create("").unwrap().id;
+                let id = self.store().create("", false).unwrap().id;
                 self.store().finish_recording(&id, 0, vec![]).unwrap();
                 id
             }
@@ -1439,6 +1687,25 @@ mod tests {
             fn transcript(&self, id: &str) -> serde_json::Value {
                 let path = self.store().dir_for(id).unwrap().join("transcript.json");
                 serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+            }
+
+            /// What "저장" in the settings does: these connections, the first as the default.
+            fn connect(&self, connections: Vec<LlmConnection>) {
+                let settings = self.app.state::<SettingsStore>();
+                let current = settings.load().unwrap().settings;
+                let default_llm = connections.first().map(|c| c.name.clone());
+                settings
+                    .save(Settings {
+                        llm_connections: connections,
+                        default_llm,
+                        ..current
+                    })
+                    .unwrap();
+            }
+
+            fn generated(&self, id: &str) -> Option<String> {
+                let dir = self.store().dir_for(id).unwrap();
+                fs::read_to_string(dir.join("summary.generated.md")).ok()
             }
 
             fn gpu_failed(&self) -> bool {
@@ -1551,7 +1818,7 @@ mod tests {
             // A recording puts it back in line, but the run finishes before its kill lands.
             queue.recording_started();
             assert_eq!(f.events.lock().unwrap().last().unwrap()["position"], 1);
-            queue.end(&f.store(), &id, End::Done);
+            queue.end(&f.store(), &id, End::Done(Status::Transcribed));
 
             let last = f.events.lock().unwrap().last().cloned().unwrap();
             assert_eq!(
@@ -1637,6 +1904,280 @@ mod tests {
             let inner = lock(&queue.inner);
             assert!(inner.sched.running.is_empty() && inner.jobs.is_empty());
             assert!(f.tmp.path().join("meetings").exists());
+        }
+
+        #[test]
+        fn a_meeting_is_transcribed_then_summarized_in_the_same_slot() {
+            let f = fixture(SPEECH, Backend::Auto);
+            let stub = serve(|_| Some(completion(SUMMARY)));
+            f.connect(vec![connection(&stub.url, "내 Ollama", true)]);
+            let id = f.recorded();
+            f.queue().enqueue_pending();
+            f.wait("done", || f.queue().snapshot().is_empty());
+
+            let meta = f.store().get(&id).unwrap();
+            assert_eq!(
+                (meta.status, meta.title.as_str(), meta.no_speech),
+                (Status::Review, "주간 회의", false)
+            );
+            assert_eq!(
+                (meta.llm_connection.as_deref(), meta.summarize_local),
+                (Some("내 Ollama"), true)
+            );
+            // The LLM's text as it came (SUM-05); the body without its title for the review.
+            assert_eq!(f.generated(&id).unwrap(), SUMMARY);
+            assert_eq!(f.store().summary(&id).unwrap(), split_title(SUMMARY).1);
+            let requests = stub.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let user = requests[0].body["messages"][1]["content"].as_str().unwrap();
+            assert!(user.ends_with(
+                "\n이번 주 배포는 목요일 오후에 하고 릴리스 노트는 민수 씨가 금요일까지 씁니다"
+            ));
+
+            let events = f.events.lock().unwrap();
+            // Straight on from transcribing: never back in line in between.
+            assert!(!events.iter().any(|e| e["status"] == "transcribed"));
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e["status"] == "summarizing" && e["chunks"] == 1)
+            );
+            let last = events.last().unwrap();
+            assert_eq!(
+                (&last["status"], &last["chunk"], &last["percent"]),
+                (&"review".into(), &1.into(), &100.into())
+            );
+        }
+
+        #[test]
+        fn without_a_connection_it_waits_transcribed_until_one_is_saved() {
+            let f = fixture(SPEECH, Backend::Auto);
+            let id = f.recorded();
+            f.queue().enqueue_pending();
+            f.wait("transcribed", || f.queue().snapshot().is_empty());
+            assert_eq!(f.status(&id), Status::Transcribed);
+            // A recording ending or the app starting changes nothing while there is no LLM.
+            f.queue().enqueue_pending();
+            assert!(f.queue().snapshot().is_empty());
+
+            let stub = serve(|_| Some(completion(SUMMARY)));
+            f.connect(vec![connection(&stub.url, "회사 클라우드", false)]);
+            f.queue().enqueue_pending();
+            f.wait("review", || f.status(&id) == Status::Review);
+            // Summarized from the transcript, not transcribed again.
+            assert_eq!(f.runs(&id), ["gpu"]);
+            let requests = stub.requests.lock().unwrap();
+            assert!(requests[0].head.contains("authorization: bearer sk-test"));
+            assert!(!f.store().get(&id).unwrap().summarize_local);
+        }
+
+        /// SUM-10: no LLM request at all.
+        #[test]
+        fn too_little_speech_goes_to_review_without_asking_the_llm() {
+            let f = fixture(RESULT, Backend::Auto);
+            let stub = serve(|_| Some(completion(SUMMARY)));
+            f.connect(vec![connection(&stub.url, "내 Ollama", true)]);
+            let id = f.recorded();
+            f.queue().enqueue_pending();
+            f.wait("done", || f.queue().snapshot().is_empty());
+
+            let meta = f.store().get(&id).unwrap();
+            assert_eq!(
+                (meta.status, meta.no_speech, meta.llm_connection),
+                (Status::Review, true, None)
+            );
+            assert!(f.generated(&id).is_none());
+            assert_eq!(stub.connections.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn an_llm_error_fails_the_summary_and_a_retry_takes_another_connection() {
+            let f = fixture(SPEECH, Backend::Auto);
+            let broken = serve(|_| Some(reply("500 Internal Server Error", "model overloaded")));
+            let working = serve(|_| Some(completion(SUMMARY)));
+            let chosen = connection(&working.url, "정상", true);
+            f.connect(vec![connection(&broken.url, "고장", true), chosen.clone()]);
+            let id = f.recorded();
+            f.queue().enqueue_pending();
+            f.wait("failed", || f.queue().snapshot().is_empty());
+
+            let meta = f.store().get(&id).unwrap();
+            assert_eq!(meta.status, Status::SummarizeFailed);
+            let error = meta.error.unwrap();
+            assert!(
+                error.contains("HTTP 500") && error.contains("model overloaded"),
+                "{error}"
+            );
+            // SUM-06: the transcript stays.
+            assert!(f.store().transcript(&id).is_ok());
+            let last = f.events.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(last["status"], "summarize_failed");
+
+            let meta = f.store().retry_summary(&id, &chosen).unwrap();
+            f.queue().enqueue(&id, meta.status);
+            f.wait("review", || f.status(&id) == Status::Review);
+            let meta = f.store().get(&id).unwrap();
+            assert_eq!(
+                (meta.llm_connection.as_deref(), meta.error),
+                (Some("정상"), None)
+            );
+            assert_eq!(f.runs(&id), ["gpu"]);
+        }
+
+        /// SUM-09: a local summary stops for a recording and runs again from the transcript after.
+        #[test]
+        fn a_recording_aborts_a_local_summary_which_runs_again_after_it() {
+            let f = fixture(SPEECH, Backend::Auto);
+            // The first request is never answered.
+            let calls = AtomicUsize::new(0);
+            let stub = serve(move |_| {
+                (calls.fetch_add(1, Ordering::SeqCst) > 0).then(|| completion(SUMMARY))
+            });
+            f.connect(vec![connection(&stub.url, "내 Ollama", true)]);
+            let id = f.recorded();
+            f.queue().enqueue_pending();
+            f.wait("requested", || stub.requests.lock().unwrap().len() == 1);
+
+            let started = Instant::now();
+            f.queue().recording_started();
+            f.wait("paused", || f.status(&id) == Status::Paused);
+            assert!(started.elapsed() < Duration::from_secs(1));
+            {
+                let queue = f.queue();
+                let inner = lock(&queue.inner);
+                assert_eq!(inner.sched.position(&id), Some(1));
+            }
+
+            f.queue().recording_finished();
+            f.wait("review", || f.status(&id) == Status::Review);
+            assert_eq!(f.runs(&id), ["gpu"]);
+            assert_eq!(stub.requests.lock().unwrap().len(), 2);
+        }
+
+        /// SUM-09: a cloud summary is not stopped by a recording.
+        #[test]
+        fn a_cloud_summary_runs_on_through_a_recording() {
+            let f = fixture(SPEECH, Backend::Auto);
+            let gate = Arc::new(AtomicBool::new(false));
+            let open = gate.clone();
+            let stub = serve(move |_| {
+                while !open.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Some(completion(SUMMARY))
+            });
+            f.connect(vec![connection(&stub.url, "회사 클라우드", false)]);
+            let id = f.recorded();
+            f.queue().enqueue_pending();
+            f.wait("requested", || stub.requests.lock().unwrap().len() == 1);
+
+            f.queue().recording_started();
+            thread::sleep(Duration::from_millis(200));
+            {
+                let queue = f.queue();
+                let inner = lock(&queue.inner);
+                assert!(inner.sched.running.contains(&id));
+                assert_eq!(inner.sched.position(&id), None);
+            }
+            assert_eq!(f.status(&id), Status::Summarizing);
+
+            gate.store(true, Ordering::SeqCst);
+            f.wait("review", || f.status(&id) == Status::Review);
+            assert!(lock(&f.queue().inner).sched.recording);
+            assert_eq!(stub.requests.lock().unwrap().len(), 1);
+            f.queue().recording_finished();
+        }
+
+        /// Quit stops even a cloud summary; `pause_busy` leaves it `paused` for the next start.
+        #[test]
+        fn quit_aborts_a_cloud_summary_and_leaves_it_paused() {
+            let f = fixture(SPEECH, Backend::Auto);
+            let stub = serve(|_| None);
+            f.connect(vec![connection(&stub.url, "회사 클라우드", false)]);
+            let id = f.recorded();
+            f.queue().enqueue_pending();
+            f.wait("requested", || stub.requests.lock().unwrap().len() == 1);
+
+            let started = Instant::now();
+            // What `confirm_quit` and the exit handler do.
+            f.queue().shutdown();
+            f.store().pause_busy();
+            f.wait("run ended", || lock(&f.queue().inner).jobs.is_empty());
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert_eq!(f.status(&id), Status::Paused);
+            assert!(lock(&f.queue().inner).sched.running.is_empty());
+        }
+
+        /// The status decides what runs: a `transcribe_failed` meeting is transcribed again even
+        /// with a `transcript.json` there (written before its status could be, disk full).
+        #[test]
+        fn a_transcribe_failed_meeting_with_a_transcript_file_is_transcribed_again() {
+            let f = fixture(SPEECH, Backend::Auto);
+            let stub = serve(|_| Some(completion(SUMMARY)));
+            f.connect(vec![connection(&stub.url, "내 Ollama", true)]);
+            let id = f.recorded();
+            let dir = f.store().dir_for(&id).unwrap();
+            fs::write(dir.join("transcript.json"), r#"{"segments":[]}"#).unwrap();
+            f.store()
+                .update(&id, |m| {
+                    m.status = Status::TranscribeFailed;
+                    Ok(())
+                })
+                .unwrap();
+            f.queue().enqueue(&id, Status::TranscribeFailed);
+            f.wait("review", || f.status(&id) == Status::Review);
+            assert_eq!(f.runs(&id), ["gpu"]);
+            assert!(!f.store().get(&id).unwrap().no_speech);
+        }
+
+        /// A delete landing after a recording stopped the run, before its end is written: the
+        /// meeting does not come back in line.
+        #[test]
+        fn a_delete_after_a_recording_stop_leaves_no_ghost_in_line() {
+            let f = fixture(RESULT, Backend::Auto);
+            let id = f.recorded();
+            let queue = f.queue();
+            queue.add(&id, Status::Recorded);
+            {
+                // Started without a thread, so the test drives its end.
+                let mut inner = lock(&queue.inner);
+                inner.sched.start_next();
+                inner.jobs.insert(id.clone(), Job::default());
+            }
+            queue.recording_started();
+            thread::scope(|s| {
+                let deleting = s.spawn(|| queue.cancel(&id));
+                f.wait("delete landed", || {
+                    lock(&queue.inner).jobs.get(&id).and_then(|j| j.stop) == Some(Stop::Delete)
+                });
+                queue.end(&f.store(), &id, End::Stopped(Stop::Recording));
+                deleting.join().unwrap();
+            });
+            let inner = lock(&queue.inner);
+            assert_eq!(inner.sched.position(&id), None);
+            assert!(inner.sched.running.is_empty() && inner.jobs.is_empty());
+        }
+
+        /// Delete (and quit) stop even a cloud summary.
+        #[test]
+        fn delete_aborts_a_summary_in_flight() {
+            let f = fixture(SPEECH, Backend::Auto);
+            let stub = serve(|_| None);
+            f.connect(vec![connection(&stub.url, "회사 클라우드", false)]);
+            let id = f.recorded();
+            let dir = f.store().dir_for(&id).unwrap();
+            f.queue().enqueue_pending();
+            f.wait("requested", || stub.requests.lock().unwrap().len() == 1);
+
+            let started = Instant::now();
+            f.store()
+                .delete_with(&id, || f.queue().cancel(&id))
+                .unwrap();
+            assert!(!dir.exists());
+            assert!(started.elapsed() < Duration::from_secs(2));
+            let queue = f.queue();
+            let inner = lock(&queue.inner);
+            assert!(inner.sched.running.is_empty() && inner.jobs.is_empty());
         }
     }
 }

@@ -277,6 +277,16 @@ pub fn has_secret(kind: SecretKind, name: &str) -> Result<bool, String> {
     }
 }
 
+/// The secret itself, for the LLM request in Rust. Never a command: secrets do not go back to the
+/// webview (architecture 9.3), and never into a log.
+pub fn get_secret(kind: SecretKind, name: &str) -> Result<Option<String>, String> {
+    match entry(kind, name)?.get_password() {
+        Ok(secret) => Ok(Some(secret)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("키체인 읽기 실패: {e}")),
+    }
+}
+
 pub fn delete_secret(kind: SecretKind, name: &str) -> Result<(), String> {
     match entry(kind, name)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),

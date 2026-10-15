@@ -4,19 +4,22 @@ use crate::audio::{self, AudioDevices, Recorder, RecordingState};
 use crate::queue::{Progress, Queue};
 use crate::settings::{self, LoadedSettings, SecretKind, Settings, SettingsStore};
 use crate::store::{Meta, Status, Store};
+use crate::summarize::{self, SummaryRoute};
 use crate::transcribe::engine::Segment;
 use crate::transcribe::model::{self, ModelState, Models};
 use serde::Serialize;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, State};
+use tauri_plugin_dialog::DialogExt;
 
 #[tauri::command(async)]
 pub fn get_settings(settings: State<'_, SettingsStore>) -> Result<LoadedSettings, String> {
     settings.load()
 }
 
-/// A new model or backend may let a waiting meeting start.
+/// A new model or backend may let a waiting meeting start, and a first LLM connection queues the
+/// `transcribed` meetings for their summaries.
 #[tauri::command(async)]
 pub fn save_settings(
     settings: State<'_, SettingsStore>,
@@ -24,7 +27,7 @@ pub fn save_settings(
     value: Settings,
 ) -> Result<(), String> {
     settings.save(value)?;
-    queue.pump();
+    queue.enqueue_pending();
     Ok(())
 }
 
@@ -85,7 +88,7 @@ pub fn get_meeting(store: State<'_, Store>, id: String) -> Result<MeetingDetail,
     })
 }
 
-/// The processing screen shows the transcript until summarizing comes (M4).
+/// `transcript.json`, for the processing and review screens.
 #[tauri::command(async)]
 pub fn get_transcript(store: State<'_, Store>, id: String) -> Result<Vec<Segment>, String> {
     store.transcript(&id)
@@ -127,7 +130,7 @@ pub fn resume_meeting(
 }
 
 /// Pinned devices come from settings; unreadable settings must not block a recording.
-/// Running transcriptions stop inside `Recorder::start` (TRN-09).
+/// Running transcriptions and local summaries stop inside `Recorder::start` (TRN-09, SUM-09).
 #[tauri::command(async)]
 pub fn start_recording(
     app: AppHandle,
@@ -136,7 +139,13 @@ pub fn start_recording(
     recorder: State<'_, Recorder>,
 ) -> Result<RecordingState, String> {
     let settings = settings.load().map(|l| l.settings).unwrap_or_default();
-    recorder.start(&app, &store, settings.input_device, settings.output_device)
+    recorder.start(
+        &app,
+        &store,
+        settings.input_device,
+        settings.output_device,
+        settings.summarize_local_by_default,
+    )
 }
 
 /// For the settings' audio tab. Device calls can block inside the OS audio API, so this runs on
@@ -238,4 +247,131 @@ pub fn import_model(
     models.import(Path::new(&path), &model::needed(&settings.model)?)?;
     queue.pump();
     models.state(&settings.model)
+}
+
+/// Where this meeting's summary goes (SUM-07) and whether "로컬로 요약" can still change (SUM-08).
+#[tauri::command(async)]
+pub fn summary_route(
+    store: State<'_, Store>,
+    settings: State<'_, SettingsStore>,
+    id: String,
+) -> Result<SummaryRoute, String> {
+    let settings = settings.load()?.settings;
+    Ok(SummaryRoute::of(&settings, &store.get(&id)?))
+}
+
+/// SUM-08 "로컬로 요약", until summarizing starts.
+#[tauri::command(async)]
+pub fn set_summarize_local(
+    store: State<'_, Store>,
+    settings: State<'_, SettingsStore>,
+    id: String,
+    local: bool,
+) -> Result<SummaryRoute, String> {
+    let settings = settings.load()?.settings;
+    if local && !settings.llm_connections.iter().any(|c| c.is_local) {
+        return Err("로컬 LLM 연결이 없습니다".into());
+    }
+    let meta = store.set_summarize_local(&id, local)?;
+    Ok(SummaryRoute::of(&settings, &meta))
+}
+
+/// REV-01: the edited title and summary body, in `review` only.
+#[tauri::command(async)]
+pub fn save_summary(
+    store: State<'_, Store>,
+    id: String,
+    title: String,
+    body: String,
+) -> Result<Meta, String> {
+    store.save_summary(&id, &title, &body)
+}
+
+/// REV-03 "전송 안 함": `review` → `archived`.
+#[tauri::command(async)]
+pub fn archive_meeting(store: State<'_, Store>, id: String) -> Result<Meta, String> {
+    store.set_status(&id, Status::Archived)
+}
+
+/// SUM-06 "요약 다시 실행" after `summarize_failed`, with the connection the recorder picked.
+#[tauri::command(async)]
+pub fn retry_summary(
+    store: State<'_, Store>,
+    settings: State<'_, SettingsStore>,
+    queue: State<'_, Queue>,
+    id: String,
+    connection: String,
+) -> Result<Meta, String> {
+    let settings = settings.load()?.settings;
+    let chosen = settings
+        .llm_connections
+        .iter()
+        .find(|c| c.name == connection)
+        .ok_or_else(|| format!("LLM 연결 '{connection}'을(를) 찾을 수 없습니다"))?;
+    let meta = store.retry_summary(&id, chosen)?;
+    queue.enqueue(&id, meta.status);
+    Ok(meta)
+}
+
+/// REV-05: saves the summary and the transcript as one `.md` file. The save dialog opens here, so
+/// the webview never names a path to write. `None` when the recorder cancels.
+#[tauri::command]
+pub async fn export_markdown(
+    app: AppHandle,
+    store: State<'_, Store>,
+    id: String,
+) -> Result<Option<String>, String> {
+    let meta = store.get(&id)?;
+    let title = if meta.title.trim().is_empty() {
+        id.clone()
+    } else {
+        meta.title.trim().to_string()
+    };
+    let text = summarize::markdown(&title, &store.summary(&id)?, &store.transcript(&id)?);
+    let name = file_name(&title);
+    // Blocks until the recorder answers, so not on an async worker.
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_file_name(format!("{name}.md"))
+            .add_filter("Markdown", &["md"])
+            .blocking_save_file()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some(path) = picked else {
+        return Ok(None);
+    };
+    let path = path.into_path().map_err(|e| e.to_string())?;
+    std::fs::write(&path, text).map_err(|e| format!("파일을 저장하지 못했습니다: {e}"))?;
+    Ok(Some(path.display().to_string()))
+}
+
+/// The save dialog's suggested name: path separators, characters Windows refuses in a file name,
+/// and control characters become `_`.
+fn file_name(title: &str) -> String {
+    title
+        .chars()
+        .map(|c| {
+            if c.is_control() || r#"\/:*?"<>|"#.contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_file_name_cannot_leave_the_folder_or_upset_windows() {
+        assert_eq!(file_name("주간 회의"), "주간 회의");
+        assert_eq!(
+            file_name("../a\\b:c*d?\"e<f>g|h\u{7}"),
+            ".._a_b_c_d__e_f_g_h_"
+        );
+    }
 }

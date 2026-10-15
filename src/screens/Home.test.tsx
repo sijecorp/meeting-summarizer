@@ -55,6 +55,7 @@ const meeting = (id: string, status: Status, error: string | null = null): Meeti
   chunks_done: 0,
   llm_connection: null,
   summarize_local: false,
+  no_speech: false,
   error,
   sent: null,
   interrupted: false,
@@ -93,6 +94,7 @@ test("rows show the running bar and time left, chunk planning, and places in lin
       meeting("c", "recorded"),
       meeting("d", "transcribe_failed"),
       meeting("e", "transcribed"),
+      meeting("f", "transcribed"),
     ],
     [
       progress("a", { chunk: 1, chunks: 3, percent: 42, eta_secs: 170 }),
@@ -101,8 +103,10 @@ test("rows show the running bar and time left, chunk planning, and places in lin
       progress("c", { status: "recorded", position: 1 }),
       // A retried failure waits in line instead of offering 다시 시도 again.
       progress("d", { status: "transcribe_failed", position: 2 }),
-      // Finished: an old place in line must not keep it "waiting".
+      // In line for its summary.
       progress("e", { status: "transcribed", position: 3 }),
+      // No place in line: stopped here for want of an LLM connection.
+      progress("f", { status: "transcribed" }),
     ],
   );
 
@@ -115,7 +119,7 @@ test("rows show the running bar and time left, chunk planning, and places in lin
   expect(screen.getByText("구간 나누는 중")).toBeTruthy();
   expect(screen.getByText("대기 중 · 1번째")).toBeTruthy();
   expect(screen.getByText("대기 중 · 2번째")).toBeTruthy();
-  expect(screen.queryByText("대기 중 · 3번째")).toBeNull();
+  expect(screen.getByText("대기 중 · 3번째")).toBeTruthy();
   expect(screen.getByText("전사 완료")).toBeTruthy();
   expect(screen.queryByRole("button", { name: /^다시 시도/ })).toBeNull();
 });

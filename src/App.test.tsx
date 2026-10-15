@@ -129,6 +129,7 @@ const meeting = (id: string, status: Status, interrupted = false): MeetingItem =
   chunks_done: 0,
   llm_connection: null,
   summarize_local: false,
+  no_speech: false,
   error: null,
   sent: null,
   interrupted,
@@ -174,8 +175,10 @@ test("header chip counts meetings being processed and waiting", async () => {
       return [
         meeting("a", "transcribing"),
         meeting("b", "recorded"),
-        // M3 stops here; it waits again once summarizing exists (M4).
+        // No place in line: it stopped here for want of an LLM connection.
         meeting("c", "transcribed"),
+        // In line for its summary (APP-07).
+        meeting("j", "transcribed"),
         meeting("d", "paused"),
         meeting("e", "review"),
         // Not in line until 다시 시도.
@@ -187,11 +190,12 @@ test("header chip counts meetings being processed and waiting", async () => {
         { ...meeting("i", "recording"), schema_version: 2 },
       ];
     }
+    if (cmd === "queue_state") return [progress("j", { status: "transcribed", position: 1 })];
   });
 
   render(<App />);
 
-  expect(await screen.findByText("처리 중 1 · 대기 2")).toBeTruthy();
+  expect(await screen.findByText("처리 중 1 · 대기 3")).toBeTruthy();
   expect(screen.queryByRole("button", { name: /^녹음 중/ })).toBeNull();
 });
 

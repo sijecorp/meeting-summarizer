@@ -3,6 +3,7 @@ mod commands;
 mod queue;
 mod settings;
 mod store;
+mod summarize;
 mod transcribe;
 
 pub use transcribe::engine::worker_main;
@@ -91,7 +92,8 @@ pub fn run() {
                 app.handle().clone(),
                 std::env::current_exe()?,
             ));
-            // TRN-01: what recovery left `recorded` or `paused` goes back in line, oldest first.
+            // TRN-01: what recovery left `recorded` or `paused` goes back in line, oldest first,
+            // and `transcribed` too once an LLM connection exists.
             app.state::<queue::Queue>().enqueue_pending();
 
             let tray_menu = Menu::with_items(
@@ -144,6 +146,12 @@ pub fn run() {
             commands::download_models,
             commands::cancel_model_download,
             commands::import_model,
+            commands::summary_route,
+            commands::set_summarize_local,
+            commands::save_summary,
+            commands::archive_meeting,
+            commands::retry_summary,
+            commands::export_markdown,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -185,7 +193,7 @@ mod tests {
     fn confirmed_quit_is_not_blocked_by_a_meeting_that_cannot_be_paused() {
         let tmp = tempfile::tempdir().unwrap();
         let store = store::Store::new(tmp.path().join("meetings")).unwrap();
-        let id = store.create("녹음 중인 회의").unwrap().id;
+        let id = store.create("녹음 중인 회의", false).unwrap().id;
         // meta.json can no longer be rewritten: the temp file path is taken by a folder.
         std::fs::create_dir(tmp.path().join("meetings").join(&id).join("meta.json.tmp")).unwrap();
 

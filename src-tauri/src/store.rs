@@ -1,3 +1,5 @@
+use crate::settings::LlmConnection;
+use crate::summarize::split_title;
 use crate::transcribe::engine::Segment;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -63,10 +65,26 @@ pub struct Meta {
     pub llm_connection: Option<String>,
     #[serde(default)]
     pub summarize_local: bool,
+    /// SUM-10: too little speech to summarize, so no LLM was asked and there is nothing to send.
+    #[serde(default)]
+    pub no_speech: bool,
     #[serde(default)]
     pub error: Option<String>,
     #[serde(default)]
     pub sent: Option<Sent>,
+}
+
+impl Meta {
+    /// Summarizing has started, so where it goes is settled (SUM-08): a connection was chosen, or
+    /// the meeting is past the stages before summarizing.
+    pub fn summary_started(&self) -> bool {
+        use Status::*;
+        self.llm_connection.is_some()
+            || !matches!(
+                self.status,
+                Recording | Recorded | Transcribing | Transcribed | Paused | TranscribeFailed
+            )
+    }
 }
 
 /// Architecture 8.3. Moving to `Deleting` is allowed from any state.
@@ -234,7 +252,8 @@ impl Store {
         write_atomic(&path, &bytes).map_err(|e| format!("meta.json 저장 실패: {e}"))
     }
 
-    pub fn create(&self, title: &str) -> Result<Meta, String> {
+    /// `summarize_local`: "로컬로 요약" starts as the settings' default (SUM-08).
+    pub fn create(&self, title: &str, summarize_local: bool) -> Result<Meta, String> {
         let now = time::OffsetDateTime::now_utc();
         // UTC: std/time cannot read the local offset safely; the UI formats it in local time.
         let id = format!(
@@ -265,7 +284,8 @@ impl Store {
             backend: None,
             chunks_done: 0,
             llm_connection: None,
-            summarize_local: false,
+            summarize_local,
+            no_speech: false,
             error: None,
             sent: None,
         };
@@ -279,13 +299,15 @@ impl Store {
         self.read(id)
     }
 
-    /// `summary.md` (edited) if present, else `summary.generated.md`, else empty.
+    /// The summary body: `summary.md` (the recorder's edit) if present, else
+    /// `summary.generated.md` without its `# 제목` line (that is `meta.title`), else empty.
     /// Only a missing file falls through; any other read error is reported.
     pub fn summary(&self, id: &str) -> Result<String, String> {
         let dir = self.dir_for(id)?;
         for name in ["summary.md", "summary.generated.md"] {
             match fs::read_to_string(dir.join(name)) {
-                Ok(text) => return Ok(text),
+                Ok(text) if name == "summary.md" => return Ok(text),
+                Ok(text) => return Ok(split_title(&text).1),
                 Err(e) if e.kind() == ErrorKind::NotFound => {}
                 Err(e) => return Err(format!("{name}을 읽을 수 없습니다: {e}")),
             }
@@ -351,6 +373,49 @@ impl Store {
 
     pub fn set_status(&self, id: &str, to: Status) -> Result<Meta, String> {
         self.update(id, |meta| transition(meta, to))
+    }
+
+    /// REV-01: the recorder's title and summary. `summary.generated.md` stays as the LLM wrote it
+    /// (SUM-05). The title is kept to one line: it heads the `.md` export and names its file.
+    pub fn save_summary(&self, id: &str, title: &str, body: &str) -> Result<Meta, String> {
+        let path = self.dir_for(id)?.join("summary.md");
+        let title = title
+            .split(|c: char| c.is_control() || c.is_whitespace())
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.update(id, |meta| {
+            if meta.status != Status::Review {
+                return Err("검토 중인 회의만 저장할 수 있습니다".into());
+            }
+            write_atomic(&path, body.as_bytes())
+                .map_err(|e| format!("summary.md 저장 실패: {e}"))?;
+            meta.title = title;
+            Ok(())
+        })
+    }
+
+    /// SUM-08 "로컬로 요약", until summarizing starts.
+    pub fn set_summarize_local(&self, id: &str, local: bool) -> Result<Meta, String> {
+        self.update(id, |meta| {
+            if meta.summary_started() {
+                return Err("요약이 이미 시작돼 바꿀 수 없습니다".into());
+            }
+            meta.summarize_local = local;
+            Ok(())
+        })
+    }
+
+    /// SUM-06 "요약 다시 실행" with the connection the recorder picked. The caller queues it.
+    pub fn retry_summary(&self, id: &str, connection: &LlmConnection) -> Result<Meta, String> {
+        self.update(id, |meta| {
+            if meta.status != Status::SummarizeFailed {
+                return Err("요약에 실패한 회의가 아닙니다".into());
+            }
+            meta.llm_connection = Some(connection.name.clone());
+            meta.summarize_local = connection.is_local;
+            Ok(())
+        })
     }
 
     /// Architecture 8.3 delete procedure, for a meeting no work runs on.
@@ -553,7 +618,7 @@ mod tests {
 
     /// Writes a meeting in the given state directly, bypassing transitions.
     fn put(store: &Store, status: Status) -> Meta {
-        let meta = store.create("테스트 회의").unwrap();
+        let meta = store.create("테스트 회의", false).unwrap();
         let meta = Meta { status, ..meta };
         store.write(&meta).unwrap();
         meta
@@ -780,9 +845,97 @@ mod tests {
         assert_eq!(store.summary(&id).unwrap(), "");
         fs::write(dir.join("summary.generated.md"), "생성본").unwrap();
         assert_eq!(store.summary(&id).unwrap(), "생성본");
+        // The generated title line is `meta.title`, not part of the body.
+        fs::write(
+            dir.join("summary.generated.md"),
+            "# 주간 회의\n\n## 결정사항\n- 없음",
+        )
+        .unwrap();
+        assert_eq!(store.summary(&id).unwrap(), "## 결정사항\n- 없음");
         // An unreadable summary.md must not silently show the generated text instead.
         fs::create_dir(dir.join("summary.md")).unwrap();
         assert!(store.summary(&id).is_err());
+    }
+
+    #[test]
+    fn saving_a_summary_keeps_the_generated_one_and_works_only_in_review() {
+        let (_tmp, store) = store();
+        let id = put(&store, Review).id;
+        let generated = store.dir.join(&id).join("summary.generated.md");
+        fs::write(&generated, "# 생성 제목\n- 생성본").unwrap();
+        let meta = store.save_summary(&id, "고친 제목", "- 고친 본문").unwrap();
+        assert_eq!(meta.title, "고친 제목");
+        assert_eq!(store.summary(&id).unwrap(), "- 고친 본문");
+        assert_eq!(
+            fs::read_to_string(&generated).unwrap(),
+            "# 생성 제목\n- 생성본"
+        );
+        // One line, however it was typed or pasted.
+        let meta = store
+            .save_summary(&id, " 주간\r\n회의\t\u{7}정리  ", "- 고친 본문")
+            .unwrap();
+        assert_eq!(meta.title, "주간 회의 정리");
+
+        // REV-03 "전송 안 함" ends the review; nothing is saved after that.
+        assert_eq!(store.set_status(&id, Archived).unwrap().status, Archived);
+        assert!(store.save_summary(&id, "x", "y").is_err());
+        assert_eq!(store.summary(&id).unwrap(), "- 고친 본문");
+        let transcribed = put(&store, Transcribed).id;
+        assert!(store.set_status(&transcribed, Archived).is_err());
+    }
+
+    #[test]
+    fn summarize_local_changes_only_until_summarizing_starts() {
+        let (_tmp, store) = store();
+        let id = put(&store, Transcribed).id;
+        assert!(
+            store
+                .set_summarize_local(&id, true)
+                .unwrap()
+                .summarize_local
+        );
+        store
+            .update(&id, |m| {
+                m.llm_connection = Some("내 Ollama".into());
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.set_summarize_local(&id, false).is_err());
+        let review = put(&store, Review).id;
+        assert!(store.set_summarize_local(&review, true).is_err());
+        assert!(!store.get(&review).unwrap().summarize_local);
+    }
+
+    #[test]
+    fn retry_summary_takes_the_picked_connection_only_after_a_failure() {
+        let (_tmp, store) = store();
+        let local = LlmConnection {
+            name: "내 Ollama".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            model: "m".into(),
+            context_tokens: 8192,
+            is_local: true,
+            timeout_secs: 900,
+        };
+        let failed = put(&store, SummarizeFailed).id;
+        let meta = store.retry_summary(&failed, &local).unwrap();
+        assert_eq!(
+            (meta.llm_connection.as_deref(), meta.summarize_local),
+            (Some("내 Ollama"), true)
+        );
+        let review = put(&store, Review).id;
+        assert!(store.retry_summary(&review, &local).is_err());
+    }
+
+    #[test]
+    fn an_m3_meta_reads_without_no_speech() {
+        let (_tmp, store) = store();
+        let id = put(&store, Transcribed).id;
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(meta_path(&store, &id)).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("no_speech");
+        fs::write(meta_path(&store, &id), value.to_string()).unwrap();
+        assert!(!store.get(&id).unwrap().no_speech);
     }
 
     #[test]
@@ -947,7 +1100,7 @@ mod tests {
         let crashed = put(&store, Recording).id;
         let crashed_too = put(&store, Recording).id;
         store.recover();
-        let live = store.create("").unwrap().id;
+        let live = store.create("", false).unwrap().id;
 
         assert!(store.is_interrupted(&crashed));
         assert!(!store.is_interrupted(&live));

@@ -1,8 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
-// Mirrors src-tauri/src/store.rs, settings.rs, commands.rs, audio/mod.rs, queue.rs and
-// transcribe/model.rs.
+// Mirrors src-tauri/src/store.rs, settings.rs, commands.rs, audio/mod.rs, queue.rs, summarize.rs
+// and transcribe/model.rs.
 
 export const SCHEMA_VERSION = 1;
 export const NEWER_VERSION = "새 버전 앱에서 만든 데이터입니다";
@@ -49,8 +49,11 @@ export type Meta = {
   gaps: { at_ms: number; len_ms: number; reason: string }[];
   backend: string | null;
   chunks_done: number;
+  /** The connection chosen when summarizing started (or by a retry); null before. */
   llm_connection: string | null;
   summarize_local: boolean;
+  /** SUM-10: too little speech, so no LLM was asked: nothing to send. */
+  no_speech: boolean;
   error: string | null;
   sent: { channel: string; at: string; edit_count: number } | null;
 };
@@ -58,6 +61,7 @@ export type Meta = {
 /** A listed meeting. `interrupted`: left in `recording` by a crash, offered as 처리 계속 / 삭제 (STO-03). */
 export type MeetingItem = Meta & { interrupted: boolean };
 
+/** `summary`: the body (`summary.md` if edited, else the generated one without its title line). */
 export type MeetingDetail = { meta: Meta; summary: string };
 
 export type Backend = "auto" | "gpu" | "cpu";
@@ -121,6 +125,37 @@ export const deleteMeeting = (id: string) => invoke<void>("delete_meeting", { id
 /** "처리 계속" for an interrupted recording, or a retry after `transcribe_failed`: queues it. */
 export const resumeMeeting = (id: string) => invoke<Meta>("resume_meeting", { id });
 
+// Summaries and review (architecture 6, 10.2).
+
+/** Where a meeting's summary goes (SUM-07) and whether "로컬로 요약" can still change (SUM-08). */
+export type SummaryRoute = {
+  /** null without connections, when the meeting's choice cannot be met, or when nothing was sent
+   * (`no_speech`, or reviewed without a connection). No secret in it. */
+  connection: LlmConnection | null;
+  /** The meeting's "로컬로 요약". */
+  local: boolean;
+  /** Some connection is local, so the toggle is offered. */
+  local_available: boolean;
+  /** Summarizing has started: the route no longer changes. */
+  locked: boolean;
+};
+export const summaryRoute = (id: string) => invoke<SummaryRoute>("summary_route", { id });
+/** Fails once the route is locked, or when asked for local without a local connection. */
+export const setSummarizeLocal = (id: string, local: boolean) =>
+  invoke<SummaryRoute>("set_summarize_local", { id, local });
+/** REV-01, in `review` only. The title is stored as one line. `summary.generated.md` stays as the
+ * LLM wrote it. */
+export const saveSummary = (id: string, title: string, body: string) =>
+  invoke<Meta>("save_summary", { id, title, body });
+/** REV-03 "전송 안 함": `review` → `archived`. */
+export const archiveMeeting = (id: string) => invoke<Meta>("archive_meeting", { id });
+/** SUM-06 "요약 다시 실행" after `summarize_failed`, with the connection picked by name: queues it. */
+export const retrySummary = (id: string, connection: string) =>
+  invoke<Meta>("retry_summary", { id, connection });
+/** REV-05: summary and transcript as one `.md` file, through a save dialog. The saved path, or null
+ * when cancelled. */
+export const exportMarkdown = (id: string) => invoke<string | null>("export_markdown", { id });
+
 // Recording (architecture 4, 10.2).
 
 /** A newer warning of the same kind replaces the older one. */
@@ -159,21 +194,24 @@ export const requestQuit = () => invoke<void>("request_quit");
 export const onQuitRequested = (handler: () => void) =>
   listen("app://quit-requested", handler);
 
-// Transcription queue and models (architecture 5, 10.2).
+// Processing queue and models (architecture 5, 6, 10.2).
 
 /**
  * `meeting://progress`. Sent when a meeting joins the line, its place changes, it starts, a chunk
- * moves, and when it ends (with its final status: `transcribed`, `transcribe_failed`, `paused`).
+ * or LLM request moves, and when it ends (with its final status: `review`, `transcribed` when there
+ * is no LLM connection, `transcribe_failed`, `summarize_failed`, `paused`).
  */
 export type Progress = {
   id: string;
   status: Status;
-  /** Chunks finished, of `chunks`. `chunks` is 0 until the chunk plan exists. */
+  /** Chunks finished, of `chunks`. `chunks` is 0 until the chunk plan exists. While `summarizing`:
+   * LLM requests done, of the ones known so far (a long meeting adds some). */
   chunk: number;
   chunks: number;
-  /** While `chunks` is 0, the chunk planning's progress; then 0..100 over the whole recording. */
+  /** While `chunks` is 0, the chunk planning's progress; then 0..100 over the whole recording.
+   * While `summarizing`, from `chunk` / `chunks`. */
   percent: number;
-  /** Remaining seconds, once this run has done enough to tell. */
+  /** Remaining seconds, once this run has done enough to tell. Always null while `summarizing`. */
   eta_secs: number | null;
   /** 1-based place in line while waiting; null while running. */
   position: number | null;

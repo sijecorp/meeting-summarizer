@@ -25,6 +25,7 @@ test("renders HTML in a summary as text", async () => {
       chunks_done: 0,
       llm_connection: null,
       summarize_local: false,
+      no_speech: false,
       error: null,
       sent: null,
     },

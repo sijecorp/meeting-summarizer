@@ -628,7 +628,7 @@ mod tests {
         mpsc::Sender<Source>,
         Events,
     ) {
-        let id = store.create("").unwrap().id;
+        let id = store.create("", false).unwrap().id;
         let dir = store.dir_for(&id).unwrap();
         let [mic, system] =
             [("mic.wav", budgets[0]), ("system.wav", budgets[1])].map(|(name, left)| {

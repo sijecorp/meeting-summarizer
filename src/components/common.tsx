@@ -70,8 +70,9 @@ export function StatusBadge({ recording, children }: { recording?: boolean; chil
 }
 
 const RUNNING: Status[] = ["transcribing", "summarizing"];
-// A meeting waits while it has a place in line, which is how a retried `transcribe_failed` one
-// waits too. M4: revisit `transcribed` here and in `phase` once the summarizer queues it (APP-07).
+// A meeting also waits while it has a place in line: a retried `transcribe_failed` or
+// `summarize_failed` one, and a `transcribed` one waiting for its summary (APP-07). Without a place,
+// `transcribed` is where a meeting stops when there is no LLM connection.
 const WAITING: Status[] = ["recorded", "paused"];
 
 /** Running, waiting or neither. The header chip, Home and the processing screen all ask this, so
@@ -80,8 +81,6 @@ export function phase(meta: Meta, progress: Progress | undefined) {
   // A meeting from a newer app version is read-only and never runs here (like `busy_ids`).
   if (meta.schema_version > SCHEMA_VERSION) return null;
   if (RUNNING.includes(meta.status)) return "running";
-  // Finished in M3, whatever an old place in line says.
-  if (meta.status === "transcribed") return null;
   if (progress?.position != null || WAITING.includes(meta.status)) return "waiting";
   return null;
 }
