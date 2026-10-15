@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Mic } from "lucide-react";
 import {
+  badgeKind,
   Banner,
   DeleteButton,
   Page,
@@ -233,11 +234,11 @@ export default function Home({
                   // error below it open the meeting too, without nesting them in the button.
                   <li key={m.id} className="relative hover:bg-accent">
                     <button
-                      className="flex w-full items-center justify-between gap-4 px-4 py-3 text-left outline-none after:absolute after:inset-0 focus-visible:after:ring-3 focus-visible:after:ring-ring focus-visible:after:ring-inset"
+                      className="flex w-full items-center justify-between gap-4 px-4 py-3 text-left outline-hidden after:absolute after:inset-0 focus-visible:after:ring-2 focus-visible:after:ring-ring focus-visible:after:ring-inset"
                       onClick={() => onOpen(m)}
                     >
                       <Title meeting={m} />
-                      <StatusBadge recording={m.status === "recording"}>{statusLabel(m, p)}</StatusBadge>
+                      <StatusBadge kind={badgeKind(m, p)}>{statusLabel(m, p)}</StatusBadge>
                     </button>
                     {now === "running" && p && (
                       <div className="px-4 pb-3">

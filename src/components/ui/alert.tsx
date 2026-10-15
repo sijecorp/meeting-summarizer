@@ -1,21 +1,20 @@
 import * as React from "react"
 import { cva, type VariantProps } from "class-variance-authority"
-import { cn } from "cn"
+import { cn } from "@/lib/utils"
 
 const alertVariants = cva(
-  "group/alert relative grid w-full gap-0.5 rounded-lg border px-2.5 py-2 text-left text-sm has-data-[slot=alert-action]:relative has-data-[slot=alert-action]:pr-18 has-[>svg]:grid-cols-[auto_1fr] has-[>svg]:gap-x-2 *:[svg]:row-span-2 *:[svg]:translate-y-0.5 *:[svg]:text-current *:[svg:not([class*='size-'])]:size-4",
+  "group/alert relative grid w-full gap-0.5 rounded-control border px-3.5 py-3 text-left text-body has-data-[slot=alert-action]:relative has-data-[slot=alert-action]:pr-12 has-[>svg]:grid-cols-[auto_1fr] has-[>svg]:gap-x-2.5 *:[svg]:row-span-2 *:[svg]:translate-y-[3px] *:[svg]:text-current *:[svg:not([class*='size-'])]:size-4",
   {
     variants: {
       variant: {
-        default: "bg-card text-card-foreground",
-        // Architecture 10.3 banners: tinted background, colored border and icon, black text.
+        default: "border-line bg-surface text-ink",
+        // Design-system 3: a *-bg background, *-line border and icon, ink text. Never *-line text.
         destructive:
-          "border-destructive bg-danger100 *:data-[slot=alert-description]:text-foreground *:[svg]:text-destructive",
+          "border-danger-line bg-danger-bg text-ink *:data-[slot=alert-description]:text-ink *:[svg]:text-danger-line",
         warning:
-          "border-warning bg-warning100 *:data-[slot=alert-description]:text-foreground *:[svg]:text-warning",
-        // 10.3 전송 완료: green icon and border, green50 background, black text.
+          "border-warn-line bg-warn-bg text-ink *:data-[slot=alert-description]:text-ink *:[svg]:text-warn-line",
         success:
-          "border-green bg-green50 *:data-[slot=alert-description]:text-foreground *:[svg]:text-green",
+          "border-ok-line bg-ok-bg text-ink *:data-[slot=alert-description]:text-ink *:[svg]:text-ok-line",
       },
     },
     defaultVariants: {
@@ -44,7 +43,7 @@ function AlertTitle({ className, ...props }: React.ComponentProps<"div">) {
     <div
       data-slot="alert-title"
       className={cn(
-        "font-medium group-has-[>svg]/alert:col-start-2 [&_a]:underline [&_a]:underline-offset-3 [&_a]:hover:text-foreground",
+        "font-semibold group-has-[>svg]/alert:col-start-2 [&_a]:underline [&_a]:underline-offset-3 [&_a]:hover:text-foreground",
         className
       )}
       {...props}
@@ -60,7 +59,7 @@ function AlertDescription({
     <div
       data-slot="alert-description"
       className={cn(
-        "text-sm text-balance text-muted-foreground md:text-pretty [&_a]:underline [&_a]:underline-offset-3 [&_a]:hover:text-foreground [&_p:not(:last-child)]:mb-4",
+        "text-body text-pretty text-ink-2 [&_a]:underline [&_a]:underline-offset-3 [&_a]:hover:text-foreground [&_p:not(:last-child)]:mb-4",
         className
       )}
       {...props}
@@ -72,7 +71,7 @@ function AlertAction({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
       data-slot="alert-action"
-      className={cn("absolute top-2 right-2", className)}
+      className={cn("absolute top-2.5 right-2.5", className)}
       {...props}
     />
   )

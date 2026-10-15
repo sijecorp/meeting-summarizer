@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
+import { MotionGlobalConfig } from "motion/react";
 import { afterEach, expect, test } from "vitest";
 import App from "./App";
 import type {
@@ -327,6 +328,29 @@ test("header chip adds the running percent, follows progress events and goes hom
   expect(await screen.findByRole("heading", { level: 1, name: "회의" })).toBeTruthy();
 });
 
+// Design-system 6.1: the logo's bars move only while something is transcribed or summarized.
+test("the header logo moves only while a meeting is being processed", async () => {
+  let list = [meeting("a", "recorded")];
+  mock((cmd) => {
+    if (cmd === "list_meetings") return list;
+  });
+
+  const { container } = render(<App />);
+  expect(await screen.findByText("대기 1")).toBeTruthy();
+  const live = () => container.querySelector("header [data-live]")?.getAttribute("data-live");
+  expect(live()).toBe("false");
+
+  list = [meeting("a", "transcribing")];
+  await act(() => emit("meeting://progress", progress("a")));
+  expect(await screen.findByText("처리 중 1 (42%)")).toBeTruthy();
+  expect(live()).toBe("true");
+
+  list = [meeting("a", "review")];
+  await act(() => emit("meeting://progress", progress("a", { status: "review" })));
+  await waitFor(() => expect(screen.queryByText(/처리 중/)).toBeNull());
+  expect(live()).toBe("false");
+});
+
 // While summarizing, `percent` is requests done; one request has nothing to count.
 test("header chip counts a summary as running, with a percent only past one request", async () => {
   const summarizing = { status: "summarizing" as const, eta_secs: null };
@@ -393,7 +417,8 @@ test("a GPU fallback shows a dismissible warning", async () => {
 
   expect(await screen.findByText(message)).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "닫기" }));
-  expect(screen.queryByText(message)).toBeNull();
+  // Gone once its exit has run (instant in tests).
+  await waitFor(() => expect(screen.queryByText(message)).toBeNull());
 });
 
 // APP-03: the meeting as it is now decides the screen; it may have moved on since the notification.
@@ -418,4 +443,41 @@ test("a notification click opens its meeting: review when ready, processing when
 
   await act(() => emit("app://open-meeting", "gone"));
   expect(await screen.findByText("회의를 열지 못했습니다: Error: 회의를 찾을 수 없습니다: gone")).toBeTruthy();
+});
+
+// A leaving screen stays mounted for its exit. Processing's read that lands then (here as
+// `review`) must not take the recorder from Home to 검토.
+test("a screen on its way out cannot move the app", async () => {
+  MotionGlobalConfig.skipAnimations = false;
+  try {
+    let status: Status = "summarizing";
+    let hold = false;
+    const held: ((detail: unknown) => void)[] = [];
+    mock((cmd) => {
+      if (cmd === "list_meetings") return [meeting("느린 회의", status)];
+      if (cmd === "get_meeting") {
+        if (hold) return new Promise((resolve) => held.push(resolve));
+        return { meta: meeting("느린 회의", status), summary: "", sending: false };
+      }
+      if (cmd === "summary_route") return { connection: null, local: false, local_available: false, locked: true };
+      if (cmd === "get_transcript") return [];
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByText("느린 회의"));
+    expect(await screen.findByRole("heading", { level: 1, name: "처리 중" })).toBeTruthy();
+    hold = true;
+    await act(() => emit("meeting://progress", progress("느린 회의", { status: "summarizing", eta_secs: null })));
+    await waitFor(() => expect(held.length).toBe(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "홈으로" }));
+    status = "review";
+    await act(async () => held.forEach((resolve) => resolve({ meta: meeting("느린 회의", "review"), summary: "" })));
+    // Past the exit (208 ms).
+    await act(() => new Promise((resolve) => setTimeout(resolve, 400)));
+
+    expect(screen.getAllByRole("heading", { level: 1 }).map((h) => h.textContent)).toEqual(["회의"]);
+  } finally {
+    MotionGlobalConfig.skipAnimations = true;
+  }
 });

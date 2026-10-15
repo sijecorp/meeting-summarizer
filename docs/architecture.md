@@ -38,8 +38,10 @@
 |---|---|---|
 | 앱 셸 | Tauri 2 | 기존 템플릿. Tauri 3는 알파라 쓰지 않는다 |
 | 프론트엔드 | React 19, TypeScript 6, Vite 8, bun | 기존 템플릿 |
-| 스타일 | Tailwind CSS v4 (`@tailwindcss/vite`) | 회사 색상 토큰을 `@theme`으로 이식 (10.3) |
-| UI 컴포넌트 | shadcn/ui (CLI 4.21.x, base: Radix, 프리셋 `radix-nova`) + `lucide-react` 아이콘 + `tw-animate-css`. CLI가 `radix-ui`, `class-variance-authority`, `cn`(shadcn의 `cn` 패키지)을 함께 설치한다 | 사용자 결정(2026-10-14). 컴포넌트 소스는 `src/components/ui/`에 복사돼 우리 코드가 된다. shadcn 테마 변수에 회사 색상을 연결한다 (10.3) |
+| 스타일 | Tailwind CSS v4 (`@tailwindcss/vite`) | Paper & Pulse 토큰을 `@theme`에 둔다 ([디자인 시스템](design-system.md), 10.3) |
+| UI 컴포넌트 | shadcn/ui (CLI 4.21.x, base: Radix, 프리셋 `radix-nova`) + `lucide-react` 아이콘 + `tw-animate-css`. CLI가 `radix-ui`, `class-variance-authority`, `cn`(shadcn의 `cn` 패키지)을 함께 설치한다 | 사용자 결정(2026-10-14). 컴포넌트 소스는 `src/components/ui/`에 복사돼 우리 코드가 된다. shadcn 테마 변수를 Paper & Pulse 토큰에 연결한다 (10.3) |
+| 모션 | `motion` 13.4.6 (`motion/react`, MIT) | 디자인 시스템 5. `motion`은 `framer-motion`을 `^`로 받아 공개 2주가 안 된 13.5.x가 들어오므로, `package.json`의 `overrides`로 `framer-motion` 13.4.6, `motion-dom` 13.4.5, `motion-utils` 13.3.0에 고정한다. `motion`을 올릴 때는 이 `overrides`를 지우거나 같은 버전으로 함께 올린다 |
+| 글꼴 | `pretendard` 1.3.9, `@fontsource/instrument-serif` 5.3.0, `@fontsource-variable/noto-serif-kr` 5.3.0 (모두 OFL-1.1) | 본문·UI는 Pretendard, 제목은 세리프(라틴·숫자 Instrument Serif, 한글 Noto Serif KR, 디자인 시스템 2). 앱에 번들한다(10.3). 고지는 `THIRD_PARTY_NOTICES.md`(M6) |
 | 오디오 캡처 | `cpal` >= 0.18.2, macOS는 `objc2-core-audio` 0.3 | 마이크는 양쪽 OS 모두 cpal. 시스템 오디오는 Windows가 cpal WASAPI 루프백, macOS가 직접 만든 Core Audio tap(4.3). 0.18.0에서 `name()`이 제거됐고, 0.18.2부터 `DeviceId`가 재시작 후에도 유지된다 |
 | 링 버퍼 | `rtrb` | 오디오 콜백 → 기록 스레드. 락·할당 없는 SPSC |
 | WAV 기록 | `hound` | |
@@ -78,15 +80,18 @@ src-tauri/src/
     hallucinations.ko.txt   환각 문구 목록 (한 줄에 하나)
 src-tauri/tests/fixtures/   요약 eval 고정 전사본과 expected.json (12.3)
 src/
-  main.tsx, App.tsx  화면 전환 (라우터 라이브러리 없이 상태 하나로)
+  main.tsx, App.tsx  화면 전환 (라우터 라이브러리 없이 상태 하나로). main.tsx가 `MotionConfig`로 감싼다
   screens/           Home, Recording, Processing, Review, Settings
   components/ui/     shadcn이 생성한 컴포넌트(button, input, textarea, card, alert, alert-dialog, select, switch, badge, tooltip, progress)
   components/        앱 전용 컴포넌트(common.tsx: Page, StatusBadge, Banner, Field, SelectField, DeleteButton 등. 검토 화면의 채널 선택도 SelectField다. 녹음 화면의 Spectrum은 Recording.tsx에 둔다)
   lib/ipc.ts         invoke·이벤트 타입 래퍼
-  lib/utils.ts       shadcn `cn()` (`export { cn } from "cn"`, CLI 4.21 기본)
-  test-setup.ts      Vitest jsdom 보완 코드(Radix용)
-  styles/theme.css   Tailwind 진입점 + 회사 색상 토큰 + shadcn 테마 변수 연결 (10.3)
+  lib/motion.ts      모션 토큰(spring, duration, ease, stagger)과 화면·배너 전환 (디자인 시스템 5)
+  lib/utils.ts       테마의 글자 크기·모서리·그림자를 아는 `cn()` (10.3). 컴포넌트는 `"cn"` 대신 이것을 쓴다
+  preview/           개발용 미리보기(디자인 시스템 7): main.tsx(실제 App + 시나리오 패널), fixtures.ts(`ipc.ts`가 부르는 모든 명령과 이벤트를 흉내. 처리기는 그 명령을 보내는 `ipc.ts` 함수의 반환 타입에 묶인다), preview.css(테마 + 패널 클래스. `theme.css`는 이 폴더를 스캔하지 않는다). 빌드에 들어가지 않는다
+  test-setup.ts      Vitest jsdom 보완 코드(Radix용), 모션 건너뛰기
+  styles/theme.css   Tailwind 진입점 + 글꼴 + Paper & Pulse 토큰 + shadcn 테마 변수 연결 (10.3)
 components.json     shadcn 설정 (style, base radix, alias @/)
+preview.html        개발용 미리보기 진입점. `bun run dev` → `/preview.html`. `vite build`는 `index.html`만 읽는다
 ```
 
 화면은 5개뿐이라 라우터 라이브러리를 쓰지 않는다. `App.tsx`가 현재 화면과 선택된 회의 id를 상태로 들고 있다.
@@ -601,7 +606,7 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 
 온보딩 화면은 없다(사용자 결정 2026-10-14, ONB 절).
 
-- **앱 헤더** (APP-07): 모든 화면 위에 붙는 높이 56px 헤더 하나. 왼쪽은 앱 이름과 상태 칩, 오른쪽은 설정 버튼이다. 칩은 `App.tsx`가 들고 있는 `list_meetings` 결과와 회의별 마지막 `meeting://progress`로 센다. 홈 목록과 처리 중 화면도 같은 상태와 같은 판정(`common.tsx`의 `phase`)을 써서 셋이 어긋나지 않는다. 녹음 시간은 `recording://level`의 `elapsed_ms`다.
+- **앱 헤더** (APP-07): 모든 화면 위에 붙는 높이 48px 헤더 하나(디자인 시스템 6.1). 왼쪽은 로고(세 막대, 처리 중인 회의가 있을 때만 움직인다)와 앱 이름, 상태 칩, 오른쪽은 설정 버튼이다. 칩은 `App.tsx`가 들고 있는 `list_meetings` 결과와 회의별 마지막 `meeting://progress`로 센다. 홈 목록과 처리 중 화면도 같은 상태와 같은 판정(`common.tsx`의 `phase`)을 써서 셋이 어긋나지 않는다. 녹음 시간은 `recording://level`의 `elapsed_ms`다.
   - 목록은 화면이 바뀔 때, `recording://stopped` 때, 진행률 이벤트의 `status`가 바뀔 때, 전송이 끝날 때(`slack://finished`) 다시 읽는다. 늦게 온 옛 응답은 버린다. 진행률은 이벤트를 먼저 듣고 그다음 `queue_state`로 채운다. 둘이 겹치면 이벤트가 이긴다. 폴링은 하지 않는다.
   - 처리 칩: "처리 중 N · 대기 M"(0인 쪽은 뺀다). 처리 중은 `transcribing`·`summarizing`, 대기는 `recorded`·`paused`이거나 대기 순서가 있는 회의다(다시 시도한 `transcribe_failed`·`summarize_failed`, 요약을 기다리는 `transcribed` 포함). 대기 순서가 없는 `transcribed`는 LLM 연결이 없어 멈춘 회의라 세지 않는다(APP-07). 대기열은 끝난 회의의 마지막 이벤트에서 `position`을 비운다. 구간 계획이 나온 회의는 진행률을 붙인다: "처리 중 1 (42%) · 대기 2", 둘이면 "처리 중 2 (42%, 17%)". 요약 중인 회의는 LLM 요청이 둘 이상일 때만 붙인다(요청 하나면 셀 것이 없다). 끝난 회의의 마지막 이벤트(끝난 상태와 마지막 단계의 수)는 목록을 다시 읽기 전이라도 진행률을 붙이지 않는다. 누르면 홈으로 간다. 칩 둘레는 24px 누름 영역이다.
   - `transcribe://gpu-failed`의 `message`는 녹음 자동 종료 이유와 같은 닫을 수 있는 경고 배너로 보인다. 녹음 자동 종료만 창이 가려져 있으면 OS 알림으로도 간다(아래 OS 알림).
@@ -609,10 +614,10 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
   - 보내는 때: 회의가 처리를 마쳐 `review`가 됐을 때("회의 요약이 준비됐습니다: {제목}", `no_speech`면 "음성이 거의 감지되지 않았습니다: {제목}"), `summarize_failed`·`transcribe_failed`가 됐을 때("요약하지 못했습니다: {제목}", "전사하지 못했습니다: {제목}", 제목이 없으면 "제목 없음"), 녹음이 스스로 끝났을 때(`recording://stopped`의 이유 문구). GPU에서 CPU로 바꾼 것은 앱 안 배너로만 알린다: 열 회의가 없고, 알림마다 스레드가 남는다(11.1). macOS에서는 메인 창이 포커스를 얻으면 이 앱의 알림을 알림 센터에서 모두 지운다(11.1). 알림 제목은 "회의 요약"이다(`productName`은 번들용 영문 이름이라 쓰지 않는다). 본문에는 사건과 회의 제목만 쓰고 전사본·요약 글은 넣지 않는다. 녹음·삭제·종료로 멈춘 처리는 알리지 않는다.
   - 창이 보이고 앞에 있으면 보내지 않는다: 메인 창이 보이고(`is_visible`) 포커스가 있고(`is_focused`) 최소화되지 않았으면(`is_minimized`) 화면이 이미 알려 주므로 건너뛴다. 이 확인은 메인 스레드에서 한다(`run_on_main_thread`). 창 상태를 묻는 호출은 메인 스레드의 답을 기다리는데, 앱 종료(8.5)에서 메인 스레드가 기록 스레드를 기다리는 동안 기록 스레드가 묻으면 서로 기다리게 되기 때문이다.
   - 클릭: 회의가 있는 알림은 `extra.meeting`에 회의 id를 싣는다. 앱 시작 때 알림을 보내기 전에 Rust의 `Notification::on_action`을 등록한다(플러그인은 처리기가 생긴 뒤에 보인 알림의 클릭만 알려 준다). 클릭(`tap`)이 오면 메인 창을 보이고 앞으로 가져온 뒤 `app://open-meeting`(회의 id)을 보낸다. `App.tsx`는 `get_meeting`으로 지금 상태를 읽어 홈의 회의 열기와 같은 규칙으로 화면을 연다(`review`·`sent`·`archived`는 검토, 그 밖에는 처리 중). 알림 뒤에 보냈거나 다시 실행했을 수 있어서다. 앱을 그냥 열면(트레이 "열기", Dock) 지금처럼 화면을 바꾸지 않는다. OS별 차이는 11.
-- **트레이 상태** (APP-04, M5): 새 이미지 자산 없이 기본 창 아이콘의 RGBA에 색 점을 그린다(`Image::new_owned`). 점은 아이콘 너비의 40%(예: 32px 아이콘이면 12px) 지름으로 오른쪽 아래 구석에 붙고, 지름의 바깥 1/8은 흰 테두리다. macOS 메뉴 막대는 아이콘을 22pt 정도로 그려 작은 점은 보이지 않는다. 우선순위는 녹음 중(`danger`) > 처리 중(`mainBlue`) > 미전송(`warning`)이고, 해당이 없으면 원래 아이콘이다. 툴팁은 "회의 요약 · 녹음 중 · 미전송 3", "회의 요약 · 처리 중 2"처럼 해당하는 것을 모두 적는다. 녹음 중에는 헤더 칩처럼 처리 수를 적지 않는다(녹음이 처리를 멈추므로, TRN-09).
+- **트레이 상태** (APP-04, M5): 새 이미지 자산 없이 기본 창 아이콘의 RGBA에 색 점을 그린다(`Image::new_owned`). 점은 아이콘 너비의 40%(예: 32px 아이콘이면 12px) 지름으로 오른쪽 아래 구석에 붙고, 지름의 바깥 1/8은 흰 테두리다. macOS 메뉴 막대는 아이콘을 22pt 정도로 그려 작은 점은 보이지 않는다. 우선순위는 녹음 중(#F65959, 디자인 시스템 `rec`) > 처리 중(#5550FF, brand) > 미전송(#FF9B3F, `warn-line`)이고(`lib.rs`의 `*_DOT`), 해당이 없으면 원래 아이콘이다. 툴팁은 "회의 요약 · 녹음 중 · 미전송 3", "회의 요약 · 처리 중 2"처럼 해당하는 것을 모두 적는다. 녹음 중에는 헤더 칩처럼 처리 수를 적지 않는다(녹음이 처리를 멈추므로, TRN-09).
   - 처리 중 = 대기열에 있는 회의(실행 중 + 대기, `queue_state`의 항목 수). 미전송 = `review` 회의(`sent`·`archived`는 세지 않는다, 설계 문서). 녹음 중 = `Recorder::state`.
   - 새로 그리는 함수(`refresh_tray`)는 하나이고, `store.list()` 한 번과 녹음기·대기열 상태로 그린다. 폴링하지 않고, 바뀌는 곳에서 부른다: 앱 시작(트레이를 만든 뒤), 녹음 시작(`start_recording`), 녹음 끝(기록 스레드가 대기열에 넣을 때), 대기열에 넣기(`enqueue`, `enqueue_pending`)와 처리 끝(`end`), 전송·"전송 안 함"·삭제. 저장(`save_summary`)은 상태가 바뀌지 않아 부르지 않는다. 세는 일(`store.list()` 포함)은 blocking 스레드(`spawn_blocking`)에서 하고, 메인 스레드에서는 아이콘과 툴팁만 바꾼다(`run_on_main_thread`). 부른 쪽 스레드에서 세지 않는 것은 부른 쪽을 기다리는 잠금 주인이 있을 수 있어서다: `Recorder::start`는 녹음기 잠금을 쥔 채 스스로 끝난 녹음의 기록 스레드를 기다리는데, 그 기록 스레드의 마지막 일(대기열에 넣기)이 이 함수를 부르고, 세려면 그 잠금이 필요하다. 세기는 한 번에 하나씩 하고 각자 그때의 상태를 읽으므로, 마지막으로 센 것이 가장 새 상태로 마지막에 그려진다. 부르는 쪽은 기다리지 않으므로 잠금을 쥐고 불러도 서로 기다리지 않는다.
-- **본문**: 화면별 동작은 본문에 둔다. 홈이 아닌 화면은 본문 맨 위에 "← 홈으로"를 둔다. 본문 폭은 `max-w-3xl`, 설정만 `max-w-5xl`이다.
+- **본문**: 화면별 동작은 본문에 둔다. 홈이 아닌 화면은 본문 맨 위에 "← 홈으로"를 둔다. 본문 폭은 디자인 시스템 4대로 검토 680px, 설정 960px, 나머지 760px이다(`Page`의 `width`). 화면이 바뀌면 앞으로 갈 때는 새 화면이 아래에서, 홈으로 돌아갈 때는 위에서 들어오고, 나가는 화면은 흐름에서 빠져 겹쳐 사라진다(`AnimatePresence` `popLayout`). 앱 배너는 `layout` 애니메이션으로 밀고 들어오고 나간다.
 - **홈 목록**: 전사 중인 회의는 얇은 진행 막대와 "42% · 약 3분 남음"을 보이고, 구간 계획 전에는 "구간 나누는 중"을 보인다. 요약 중인 회의는 "요약 중"만(막대 없이), LLM 요청이 둘 이상이면 "요약 중 · 요청 2/3"과 막대를 보인다. 기다리는 회의의 배지는 "대기 중 · 2번째"다. `transcribe_failed`는 오류 한 줄(넘치면 말줄임)과 "다시 시도"(`resume_meeting`)를 보인다. `summarize_failed`는 오류 한 줄만 보인다. "요약 다시 실행"은 연결을 골라야 해서 처리 중 화면에 있다. 행 어디를 눌러도 회의가 열린다("다시 시도" 버튼만 빼고).
 - **처리 중 화면**: 진행 막대와 "구간 2/5 · 42% · 약 3분 남음", 또는 "구간 나누는 중", 기다리면 배지 "대기 중 · N번째". 요약 중에는 "요약 중"만(막대 없이), LLM 요청이 둘 이상이면 막대와 "요약 중 · 요청 2/3"이다. 요약의 첫 이벤트는 `chunks`가 0이지만 구간 나누기가 아니므로 `status`로 가른다. "구간" 문구는 `status`가 `transcribing`일 때만 쓰고, 다시 읽기 전에 온 마지막 이벤트(`review`, `summarize_failed` 등)는 진행을 그리지 않는다. `meta.json`의 `backend`가 있으면 처리 장치(GPU/CPU)를 보인다. 상태나 끝난 구간 수가 바뀌면 `get_meeting`을 다시 읽는다. 전사에 실패하면 오류와 "다시 시도".
   - 전사본은 `transcript.json`이 있는 동안(`transcribed`, `summarizing`, `summarize_failed`, 요약하다 멈춘 `paused`) `get_transcript`로 `mm:ss` 시각과 함께 읽기 전용 텍스트로 보인다(10.4). 전사 중에 멈춘 `paused`는 파일이 없으므로 읽기 오류를 보이지 않는다.
@@ -625,7 +630,7 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
   - `review`이고 스키마가 현재 버전이면 제목(`Input`)과 요약 본문(`textarea`)을 일반 텍스트로 고칠 수 있다(10.4). `sent`, `archived`, 새 버전 앱의 회의는 읽기 전용이다.
   - 자동 저장: 마지막 입력 800ms 뒤 `save_summary`를 부르고 "저장 중…" / "저장됨"을 보인다. 저장은 한 번에 하나씩 순서대로 보내 옛 본문이 새 본문을 덮지 않고, 마지막 저장의 결과만 화면에 반영한다. 실패하면 오류 배너를 보이고 입력한 글은 그대로 두며, 다음 저장 때 다시 보낸다. 화면을 떠날 때와 "전송 안 함"·".md로 저장" 전에 남은 입력을 바로 저장한다(저장이 실패하면 둘은 멈춘다). 돌아온 `meta.title`(한 줄로 고친 제목)은 그 사이 더 입력하지 않았을 때만 반영하고, 입력한 제목이 공백으로 끝났으면 공백 하나를 붙여 둔다(멈췄다 이어 치는 공백을 지우지 않게).
   - 저장 상태(아직 저장하지 못한 입력과 마지막 저장)는 회의 id별로 모듈 변수에 두어 화면보다 오래 산다(모델 받기 상태와 같은 방식). 다시 연 검토 화면은 이전 방문의 마지막 저장이 끝난 뒤에 `get_meeting`을 읽고, 저장하지 못한 입력이 남아 있으면 그것을 입력란에 되돌려 다시 저장한다. 화면을 떠난 뒤 저장이 실패하면 앱의 닫을 수 있는 경고 배너에 "검토 화면에서 고친 내용을 저장하지 못했습니다: …"를 보인다. 삭제하면 저장할 것을 버린다.
-  - "미정" 강조: 편집란 아래에 "담당자·기한이 미정인 항목 N개"와 "미정"이 든 줄을 일반 텍스트로 나열한다. `warning100` 배경, `warning` 테두리·아이콘, 검은 글자(10.3). 입력할 때마다 바뀌므로 live region이 아니다(`role="note"`).
+  - "미정" 강조: 편집란 아래에 "담당자·기한이 미정인 항목 N개"와 "미정"이 든 줄을 일반 텍스트로 나열한다. `warn-bg` 바탕, `warn-line` 테두리·아이콘, `ink` 글자(10.3). 입력할 때마다 바뀌므로 live region이 아니다(`role="note"`).
   - SUM-07: `llm_connection`이 있고 `no_speech`가 아니면 보조 글자로 "전사본을 {이름}(으)로 보내 요약했습니다", 로컬이면(`summarize_local`) "이 PC의 {이름}(으)로 요약했습니다".
   - SUM-10: `no_speech`면 경고 배너 "음성이 거의 감지되지 않았습니다"를 보이고 편집란, "요약 복사", ".md로 저장"은 없다. 전송 버튼은 비활성, 동작은 "전송 안 함"과 삭제만 남는다(6.5). 전사본 보기는 그대로 있다(REV-01).
   - 글자 수는 "{N} / 12,000자 (Slack 전송 기준)"이다(REV-02). N은 입력이 멈추고 200ms 뒤 `slack_length`가 센 값으로, 전송할 `markdown` 블록(머리말 + 본문)의 글자 수다(7.1). 12,000자를 넘으면 경고 배너 "Slack 한도 12,000자를 넘었습니다. N자를 줄여 주세요"를 보이고 전송 버튼을 막는다. 센 값이 늦게 와도 Rust가 보내기 전에 다시 검사한다.
@@ -681,89 +686,37 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 
 ### 10.3 색상 토큰
 
-회사 서비스의 Tailwind 설정(monolis 공용 preset과 fni 확장)에서 앱이 쓰는 토큰만 **같은 키 이름으로** 복사한다. 원본에는 형식이 잘못된 값(`greenDark: "##1BA75C"`, `#`이 빠진 `warning900`·`success50`)이 있다. 이 토큰들은 지금 쓰지 않아 복사하지 않고, 나중에 쓰게 되면 고친 값으로 가져온다.
-
-원본은 `pulse` 키프레임을 덮어써서 Tailwind 기본 `animate-pulse`의 동작까지 바꾼다. 이 앱에서는 키프레임 이름을 `pulse-faster`로 따로 두어 기본값을 건드리지 않는다.
+색·글꼴·모양·모션 토큰과 대비 수치의 기준은 [디자인 시스템 2~5](design-system.md#2-타이포그래피)다(Paper & Pulse, 2026-10-15). 회사 서비스에서 이식했던 토큰(`mainBlue`, `cool700` 등)은 리디자인 0단계에서 새 토큰으로 바꾸고 지웠다. 여기에는 코드가 지킬 연결 규칙만 둔다.
 
 `src/styles/theme.css`:
 
-```css
-@import "tailwindcss";
+- **`@theme`**: 디자인 시스템 토큰을 같은 이름으로 둔다. 색(`bg-paper`, `text-ink-2`, `border-line-strong` …), 글자 크기(`text-display-m`, `text-body` …, 줄 높이·자간·굵기 포함. 글꼴은 `font-display`로 따로 고른다), 모서리 `rounded-control`(10px)·`rounded-float`(16px), 그림자 `shadow-float`, 본문 폭 `max-w-doc`·`max-w-home`·`max-w-wide`, CSS 전환 곡선 `ease-out`·`ease-in`(`lib/motion.ts`와 같은 값), 지금 일어나는 일을 알리는 키프레임(`animate-breathe`, `animate-bar`, `animate-dot`, `animate-shimmer`).
+- **이름 충돌**: 디자인 시스템의 `accent`(#5550FF)는 Tailwind에서 `primary`(shadcn 컴포넌트) 또는 `brand`(우리 코드)다. Tailwind의 `accent`는 shadcn 뜻 그대로 hover 바탕(= `sunken`)이다. `accent-press`, `accent-tint`는 디자인 시스템 이름 그대로 쓴다.
+- **shadcn 의미 변수** (`:root`): `background` → `paper`, `card`·`popover` → `surface`, `muted`·`secondary`·`accent` → `sunken`, `muted-foreground` → `ink-2`, `border` → `line`(장식용 구분선), `input` → `line-strong`(입력란·셀렉트·스위치 경계, WCAG 1.4.11), `primary`·`ring` → brand, `destructive` → `danger-line`. chart·sidebar 매핑은 쓰지 않아 뺀다.
+- **`cn`**: shadcn의 `cn` 패키지는 테마에 새로 넣은 글자 크기를 모르면 `text-body`를 색으로 읽어, `cn("text-body", "text-ink")`에서 크기를 버린다. 그래서 `lib/utils.ts`가 테마의 글자 크기·모서리·그림자를 알려 준 `cn`을 만들고, 컴포넌트는 `"cn"`이 아니라 `@/lib/utils`에서 가져온다. `shadcn add`로 넣은 컴포넌트는 import를 고친다(`lib/utils.test.ts`가 잡는다).
+- **라이트 모드만**: `.dark` 변수 블록을 두지 않고, `@custom-variant dark (&:where(.dark, .dark *));`를 정의한다. 앱은 `.dark` 클래스를 쓰지 않으므로 생성된 컴포넌트의 `dark:` 클래스는 절대 적용되지 않는다. Tailwind 기본 `dark` 변형은 OS 다크 모드를 따르므로, 이 정의가 없으면 OS 다크 모드에서 화면이 반쯤 바뀐다.
+- **스캔 범위**: `@import "tailwindcss" source("../");`로 `src/`만 스캔한다. 그러지 않으면 `docs/`에 적힌 클래스명까지 CSS에 들어간다. 개발용 미리보기도 `@source not "../preview";`로 뺀다(미리보기 패널의 클래스는 개발 서버에서만 생긴다).
+- **포커스 표시**: `:focus-visible`에 2px brand 윤곽선과 2px 간격을 전역으로 건다(WCAG 2.4.7). 조작 요소는 `outline-none`을 쓰지 않는다. 예외는 둘이고, 둘 다 `outline-hidden`이라 Windows 고대비 모드에서는 윤곽선이 남는다: 홈 목록 행은 행 전체를 감싸는 `after:` 링을, 셀렉트 항목은 키보드로 옮길 때 안쪽 2px 링(`focus:inset-ring-2`)을 쓴다(hover 바탕만으로는 1.2:1이다).
+- **글꼴**: Pretendard Variable(본문·UI), Instrument Serif(제목의 라틴·숫자, 400과 이탤릭), Noto Serif KR Variable(제목의 한글)을 패키지 CSS로 불러와, Vite가 `unicode-range`로 나뉜 파일을 `dist/assets/`에 번들한다. 외부 폰트 주소는 없다(CSP `default-src 'self'`가 막는다). `font-display`는 `"Instrument Serif", "Noto Serif KR Variable", serif`다. Instrument Serif에는 굵기가 하나뿐이라 `html`에 `font-synthesis: style`을 걸어 가짜 굵게를 막는다(한글 제목만 600). 세리프 두 폰트에는 `tnum`이 없어 타이머는 Pretendard의 `tabular-nums`로 쓴다.
+- **종이 질감**과 아이콘: `body` 바탕에 SVG 노이즈(`data:` URL, CSP `img-src data:`)를 3%로 깔고, lucide 아이콘의 획 두께를 1.75로 맞춘다.
+- **모션**: 토큰은 `lib/motion.ts`에만 둔다. 나가는 화면과 배너는 나가는 동안(약 208ms) 마운트된 채라 `inert`로 감싸 탭 순서·접근성 트리·클릭에서 뺀다(`App.tsx`의 `Present`). 그 사이 끝난 읽기가 화면을 옮기지 못하게, 처리 중 화면의 `onReview`는 지금 화면이 그 회의의 처리 중일 때만 검토로 넘긴다. `main.tsx`가 `<MotionConfig reducedMotion="user">`로 감싸고, 테스트는 `test-setup.ts`의 `MotionGlobalConfig.skipAnimations`로 애니메이션을 건너뛴다. CSS 키프레임은 `motion-safe:` 뒤에만 건다(shadcn 대화상자·셀렉트·툴팁의 `animate-in`/`animate-out` 포함).
+- Radix는 위치 계산에 인라인 style을, motion의 `popLayout`은 `<style>` 요소를 쓴다. 둘 다 CSP의 `style-src 'unsafe-inline'`로 허용된다.
 
-@theme {
-  /* 회사 색상 토큰 (monolis 공용 preset + fni 확장에서 이식) */
-  --color-mainBlue: #5550ff;
-  --color-blue50: #f6f6ff;
-  --color-blue100: #eeedff;
-  --color-blue900: #4440cc;
-  --color-danger: #f65959;
-  --color-dangerDark: #dd5050;
-  --color-danger100: #feeeee;
-  --color-warning: #ff9b3f;
-  --color-warning100: #fff5ec;
-  --color-green: #1eba66;
-  --color-green50: #f4fcf7;
-  --color-mint: #5ec9e0;
-  --color-black: #24232e;
-  --color-white: #ffffff;
-  --color-blueGray: #f9fafb;
-  --color-cool200: #e3e9ef;
-  --color-cool500: #a1aab2;
-  --color-cool600: #838c94;
-  --color-cool700: #69727a;
-
-  --animate-pulse-faster: pulse-faster 1s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-  @keyframes pulse-faster {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0; }
-  }
-}
-```
-
-**shadcn 테마 변수 연결** (사용자 결정 2026-10-14: UI는 shadcn + Tailwind v4)
-
-shadcn 컴포넌트는 `--primary` 같은 의미 변수를 쓴다. `theme.css`의 `:root`에서 이 변수들에 회사 색상 값을 넣고, shadcn 기본 `@theme inline` 매핑을 둔다(chart·sidebar 매핑은 쓰지 않아 뺀다). 회사 토큰 클래스(`bg-mainBlue` 등)도 함께 쓸 수 있다.
-
-- **라이트 모드만**: `.dark` 변수 블록을 두지 않고, `@custom-variant dark (&:where(.dark, .dark *));`를 정의한다. 앱은 `.dark` 클래스를 쓰지 않으므로 생성된 컴포넌트의 `dark:` 클래스는 절대 적용되지 않는다. Tailwind 기본 `dark` 변형은 OS 다크 모드를 따르므로, 이 정의가 없으면 OS 다크 모드에서 화면이 반쯤 바뀐다. 이 방식이면 `shadcn add`로 컴포넌트를 추가할 때 손댈 것이 없다.
-- **스캔 범위**: `@import "tailwindcss" source("../");`로 `src/`만 스캔한다. 그러지 않으면 `docs/`에 적힌 클래스명까지 CSS에 들어간다.
-- **버튼 눌림·hover**: 주요 버튼은 `hover:bg-blue900`을 쓴다(흰 글자 7.4:1). shadcn 기본 `hover:bg-primary/80`은 3.7:1이라 쓰지 않는다.
-- **포커스 표시**: 모든 조작 요소는 `ring`(mainBlue) 기반의 보이는 포커스 링을 둔다(WCAG 2.4.7).
-
-| shadcn 변수 | 회사 토큰 |
-|---|---|
-| `--background` | `blueGray` #F9FAFB |
-| `--foreground`, `--card-foreground`, `--popover-foreground` | `black` #24232E |
-| `--card`, `--popover` | `white` |
-| `--primary` / `--primary-foreground` | `mainBlue` / `white` |
-| `--secondary`, `--accent` / 글자 | `blue50` / `black` |
-| `--muted` / `--muted-foreground` | `blueGray` / `cool700` |
-| `--border` (카드·구분선 등 장식용 경계) | `cool200` |
-| `--input` (입력란·셀렉트·스위치처럼 조작 대상을 알아보는 데 필요한 경계) | `cool600` #838C94 (흰 배경 3.4:1, WCAG 1.4.11의 3:1 충족) |
-| `--ring` | `mainBlue` |
-| `--destructive` | `dangerDark` (아래 변형 규칙과 함께) |
-
-- **`destructive` 버튼 변형은 바꾼다.** shadcn 기본(빨간 배경 + 작은 흰 글자)은 대비가 3.2:1이라 NFR-09에 어긋난다. 그래서 `danger100` 배경 + `dangerDark` 테두리·아이콘 + `black` 글자로 바꾼다. 녹음 종료 버튼만 아래 표의 예외(흰 글자, 굵게 18.66px 이상)를 쓴다.
-- 외부 폰트(Google Fonts 등)를 불러오지 않는다. CSP가 `default-src 'self'`라 막히기 때문이다. 시스템 폰트를 쓰고, 필요하면 폰트 파일을 앱에 번들한다.
-- Radix는 위치 계산에 인라인 style을 쓴다. CSP의 `style-src 'unsafe-inline'`로 허용된다.
-
-**쓰임새와 대비 규칙** (NFR-09). 대비는 흰 배경 기준으로 계산했다.
+**쓰임새와 대비 규칙** (NFR-09). 수치는 디자인 시스템 3의 표다.
 
 | 용도 | 토큰 | 규칙 |
 |---|---|---|
-| 본문 글자 | `black` (15.5:1) | `danger100`·`warning100`·`green50` 배경 위에서도 13.7:1 이상 |
-| 보조 글자 | `cool700` (4.9:1) | `blueGray` 배경 위에서도 4.7:1 |
-| 비활성 글자 | `cool500` | 비활성 요소라 대비 기준 예외 |
-| 주요 버튼 | 배경 `mainBlue`, 글자 `white` (5.3:1), 눌림 `blue900` | |
-| 선택 상태 | 배경 `blue50` / `blue100` | |
-| 녹음 중 표시 | `danger` 점 + `animate-pulse-faster` | 점에만 색을 쓴다. 녹음 화면의 큰 점은 `motion-safe:animate-pulse`로 느리게 깜박인다 |
-| 녹음 종료 버튼 | 배경 `danger`, 글자 `white` (3.2:1) | 큰 글자 기준(3:1)만 충족하므로 **굵게 14pt(18.66px) 이상** |
-| 에러 배너 | 배경 `danger100`, 테두리·아이콘 `dangerDark`, 글자 `black` | `dangerDark` 글자는 3.9:1이라 쓰지 않는다 |
-| 경고 배너, "미정" | 배경 `warning100`, 테두리·아이콘 `warning`, 글자 `black` | `warning` 글자는 2.1:1이라 쓰지 않는다 |
-| 전송 완료 | 아이콘 `green`, 배경 `green50`, 글자 `black` | `green` 글자는 2.5:1이라 쓰지 않는다 |
-| 스펙트럼 | 마이크 `mainBlue`, 시스템 오디오 `mint` | 막대는 장식(`aria-hidden`). 음량은 화면 읽기 프로그램용 `meter`로 따로 둔다 |
-| 경계선 / 앱 배경 | `cool200` / `blueGray` | |
-
-기존 템플릿의 `src/App.css`는 지우고 이 파일로 바꾼다.
+| 본문 글자 | `ink` | `paper`·`surface`·`sunken`·`*-bg` 어디서나 13:1 이상 |
+| 보조 글자 | `ink-2` | `paper` 5.2:1, `sunken` 4.8:1 |
+| 비활성 글자 | `ink-3` (2.7:1) | 비활성일 때만. 정보를 싣지 않아 대비 기준 예외 |
+| placeholder | `ink-2` | "새 연결 이름", "바꾸려면 새로 입력…"처럼 안내를 담으므로 본문 기준(4.5:1)을 지킨다 |
+| 주요 버튼 | 바탕 brand, 흰 글자 5.3:1, hover·눌림 `accent-press` 7.4:1 | shadcn 기본 `hover:bg-primary/80`은 3.7:1이라 쓰지 않는다 |
+| 녹음 시작·종료 버튼 | Button `ink` 변형: `ink` 바탕, 흰 글자. 종료는 빨간 사각 아이콘 | 빨간 바탕 흰 글자(3.2:1) 예외는 없어졌다 |
+| 오류 / 경고 / 전송 완료 | `danger-bg`·`warn-bg`·`ok-bg` 바탕, `*-line` 테두리·아이콘, `ink` 글자 | `*-line` 색은 글자에 쓰지 않는다. Alert `destructive`·`warning`·`success`, Button·Badge `destructive` 변형 |
+| 녹음 중 표시 | `rec` 점 + `motion-safe:animate-breathe` | 점에만 쓴다 |
+| 처리 상태 | 알약 배지 + 글자, 움직이는 표시(전사 세 막대, 요약 반짝임, 대기 점) | 색이나 움직임만으로 알리지 않는다. 요약 반짝임은 글자 아래로 지나가 대비를 떨어뜨리지 않는다 |
+| 스펙트럼 | 마이크 `mic`, 시스템 오디오 `system` | 막대는 장식(`aria-hidden`). 음량은 화면 읽기 프로그램용 `meter`로 따로 둔다 |
+| 선택 / 진행 막대 | `accent-tint` 바탕, 막대는 brand | |
 
 ### 10.4 LLM 출력 표시 안전 규칙 (eng review D6)
 

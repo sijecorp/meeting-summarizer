@@ -5,11 +5,11 @@
 
 ## 1. 방향
 
-사용자 결정(2026-10-15): Granola의 UI/UX를 참고하되 폰트와 색은 따르지 않는다. "AI가 만든 티"를 없애고, 폰트와 애니메이션을 적극적으로 써서 스타트업 제품처럼 보이게 한다.
+사용자 결정(2026-10-15): Granola의 UI/UX를 참고하되 색은 따르지 않는다. "AI가 만든 티"를 없애고, 폰트와 애니메이션을 적극적으로 써서 스타트업 제품처럼 보이게 한다. 같은 날 갱신: 제목은 Granola처럼 세리프로 한다(처음 고른 Wanted Sans는 뺐다).
 
 | 결정 | 내용 |
 |---|---|
-| 폰트 | 제목·숫자 Wanted Sans, 본문·UI Pretendard |
+| 폰트 | 제목·큰 숫자는 세리프(라틴·숫자 Instrument Serif, 한글 Noto Serif KR), 본문·UI Pretendard |
 | 색 | 회사 `mainBlue`는 포인트에만 쓴다. 바탕은 따뜻한 종이색 중성색을 새로 둔다 |
 | 구조 | 홈은 날짜별 타임라인, 검토는 테두리 없는 문서형 에디터, 녹음 상태는 어느 화면에서나 아래에 떠 있는 녹음 독 |
 
@@ -22,30 +22,34 @@
 
 ## 2. 타이포그래피
 
-폰트 파일은 앱에 넣는다(CSP가 외부 폰트를 막는다). 두 폰트 모두 SIL OFL 1.1이라 `THIRD_PARTY_NOTICES.md`(M6)에 넣는다.
+폰트 파일은 앱에 넣는다(CSP가 외부 폰트를 막는다). 세 폰트 모두 SIL OFL 1.1이라 `THIRD_PARTY_NOTICES.md`(M6)에 넣는다.
 
 | 역할 | 폰트 | 패키지 (정확한 버전 고정) |
 |---|---|---|
-| Display: 화면 제목, 회의 제목, 타이머, 큰 숫자 | Wanted Sans Variable | `wanted-sans@1.0.3` (`fonts/webfonts/variable/split/WantedSansVariable.css`) |
-| Text: 본문, UI, 레이블 | Pretendard Variable | `pretendard@1.3.9` (`dist/web/variable/pretendardvariable-dynamic-subset.css`) |
+| Display 라틴·숫자: 화면 제목, 회의 제목, 큰 숫자 | Instrument Serif (400과 이탤릭만) | `@fontsource/instrument-serif@5.3.0` (기본 CSS + `400-italic.css`) |
+| Display 한글 | Noto Serif KR Variable (굵기 200~900) | `@fontsource-variable/noto-serif-kr@5.3.0` (기본 CSS) |
+| Text: 본문, UI, 레이블, 타이머 | Pretendard Variable | `pretendard@1.3.9` (`dist/web/variable/pretendardvariable-dynamic-subset.css`) |
 
-- 두 CSS 모두 `unicode-range`로 나뉜 woff2를 쓴다. Vite가 파일을 번들에 넣고, 화면에 쓰인 글자 범위만 읽는다.
-- 숫자: 시간·진행률·글자 수는 `tabular-nums`로 폭을 고정한다. 바뀔 때 글자가 흔들리지 않게 하려는 것이다.
+- 세 CSS 모두 `unicode-range`로 나뉜 woff2를 쓴다. Vite가 파일을 번들에 넣고, 화면에 쓰인 글자 범위만 읽는다.
+- Display는 `"Instrument Serif", "Noto Serif KR Variable", serif`다. Instrument Serif에는 한글이 없어 한글은 Noto Serif KR로 넘어간다. 크기 토큰의 굵기는 한글(Noto Serif KR) 기준이고, Instrument Serif는 한 굵기뿐이라 가짜 굵게를 만들지 않는다(`font-synthesis: style`).
+- 숫자: 시간·진행률·글자 수는 `tabular-nums`로 폭을 고정한다. 바뀔 때 글자가 흔들리지 않게 하려는 것이다. Instrument Serif와 Noto Serif KR에는 고정폭 숫자(`tnum`)가 없다(번들 파일을 fontTools로 확인). 그래서 타이머처럼 바뀌는 숫자는 Pretendard 고정폭 숫자로 쓴다.
+- **이탤릭 숫자**: Instrument Serif 이탤릭 숫자는 시그니처 포인트다. 큰 개수와 타임라인의 시각처럼 바뀌지 않는 숫자에 `font-display italic`으로 쓴다. 숫자만 감싼다(Noto Serif KR에는 이탤릭이 없어 한글은 기울기만 흉내 낸다).
 - 대체 폰트: `"Pretendard Variable", Pretendard, -apple-system, "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif`.
 
 **크기 단계** (px / 줄 높이 / 굵기 / 자간)
 
 | 토큰 | 크기 | 줄 높이 | 굵기 | 자간 | 쓰는 곳 |
 |---|---|---|---|---|---|
-| `display-xl` | 72 | 1.0 | 700 | -0.04em | 녹음 화면 타이머 |
-| `display-l` | 40 | 1.15 | 750 | -0.03em | 검토 문서 제목 |
-| `display-m` | 28 | 1.2 | 700 | -0.025em | 화면 제목, 빈 화면 문구 |
-| `title` | 18 | 1.35 | 650 | -0.015em | 날짜 그룹, 섹션 제목 (Wanted Sans) |
+| `display-xl` | 80 | 1.0 | 500 | -0.02em | 녹음 화면 타이머(Pretendard 고정폭 숫자), 큰 이탤릭 숫자 |
+| `display-l` | 44 | 1.2 | 600 | -0.02em | 검토 문서 제목 (세리프) |
+| `display-m` | 32 | 1.25 | 600 | -0.02em | 화면 제목, 빈 화면 문구 (세리프) |
+| `title` | 20 | 1.35 | 600 | -0.01em | 날짜 그룹, 섹션 제목, 워드마크 (세리프) |
 | `body-doc` | 16 | 1.75 | 400 | 0 | 요약 본문, 전사본 |
 | `body` | 15 | 1.55 | 400 | -0.005em | UI 기본 |
 | `label` | 13 | 1.4 | 550 | 0 | 레이블, 칩, 버튼 보조 |
 | `caption` | 12 | 1.4 | 500 | 0.01em | 시각, 메타 정보 |
 
+- 세리프는 같은 크기에서 산세리프보다 작아 보여 Display 단계를 한 칸씩 키웠다(72/40/28/18 → 80/44/32/20).
 - 본문 글자는 13px 미만으로 쓰지 않는다. `caption`은 시각·메타처럼 짧은 정보에만 쓴다.
 
 ## 3. 색
@@ -59,7 +63,7 @@
 | `sunken` | `#EFECE5` | 행 hover, 선택된 탭, 옅은 채움 | |
 | `ink` | `#1F1D1A` | 본문 글자 | `paper` 위 15.4:1 |
 | `ink-2` | `#6B665C` | 보조 글자, 시각 | `paper` 5.2:1, `sunken` 4.8:1, `surface` 5.7:1 |
-| `ink-3` | `#A39E93` | 비활성, placeholder (정보를 싣지 않음) | 기준 예외 |
+| `ink-3` | `#A39E93` | 비활성 글자만 (정보를 싣지 않음). placeholder는 안내를 담을 수 있어 `ink-2`다 | 기준 예외 (2.7:1) |
 | `line` | `#E6E2D9` | 장식용 구분선 | |
 | `line-strong` | `#8F897D` | 입력란·스위치 경계 (WCAG 1.4.11) | `surface` 3.5:1, `paper` 3.2:1 |
 | `accent` | `#5550FF` (회사 `mainBlue`) | 주요 버튼, 링크, 포커스 링, 선택 표시 | 흰 글자 5.3:1, `paper` 위 글자 4.8:1 |
@@ -114,7 +118,7 @@
 ## 6. 화면별 설계
 
 ### 6.1 앱 셸
-- **헤더** (48px, 바탕은 `paper` 92% + 뒤 흐림, 아래 `line`): 왼쪽 워드마크 "회의 요약"(Wanted Sans 700, 앞에 작은 파형 로고 3막대: 처리 중일 때만 움직인다), 오른쪽에 처리 표시("처리 중 2 · 대기 1", 작은 원형 진행 표시와 함께)와 설정 버튼. 녹음 상태는 헤더가 아니라 녹음 독이 보인다.
+- **헤더** (48px, 바탕은 `paper` 92% + 뒤 흐림, 아래 `line`): 왼쪽 워드마크 "회의 요약"(Display 세리프 `title`, 앞에 작은 파형 로고 3막대: 처리 중일 때만 움직인다), 오른쪽에 처리 표시("처리 중 2 · 대기 1", 작은 원형 진행 표시와 함께)와 설정 버튼. 녹음 상태는 헤더가 아니라 녹음 독이 보인다.
 - **화면 전환**: 앞으로 가는 이동(홈 → 회의)은 새 화면이 아래 8px에서 떠오르며 나타나고(320ms), 뒤로 가는 이동은 반대로 내려간다. 회의 제목은 홈 목록과 문서 사이에서 `layoutId`로 이어져, 목록의 제목이 문서 제목 자리로 커지며 옮겨 간다.
 - **배너와 알림**: 배너는 높이 `layout` 애니메이션으로 밀려 들어오고 나간다. "복사했습니다", "저장됨" 같은 짧은 확인은 버튼 옆 작은 알약으로 나타났다 사라진다(3초).
 
@@ -189,11 +193,21 @@
 
 | 단계 | 내용 |
 |---|---|
-| 0. 기반 | 폰트·색·그림자·모션 토큰, `MotionConfig`, shadcn 컴포넌트 재스타일(button, input, textarea, select, switch, badge, alert, alert-dialog, progress, tooltip), 앱 셸·헤더·화면 전환, 개발용 미리보기(아래) |
+| 0. 기반 (완료 2026-10-15) | 폰트·색·그림자·모션 토큰, `MotionConfig`, shadcn 컴포넌트 재스타일(button, input, textarea, select, switch, badge, alert, alert-dialog, progress, tooltip), 앱 셸·헤더·화면 전환, 개발용 미리보기(아래) |
 | 1. 홈·녹음 | 날짜별 타임라인, 상태 표시, 빈 홈, 녹음 독, 녹음 화면 |
 | 2. 처리·검토 | 파이프라인, 뼈대 반짝임, 문서형 검토, 미정 형광펜, 전사본 패널, 보내기 막대 |
 | 3. 설정·마감 | 설정 탭, 저장 막대, 마이크로 인터랙션, 움직임 줄이기·키보드·대비 점검 |
 
 **개발용 미리보기** (`preview.html`, 배포에 들어가지 않음): `@tauri-apps/api/mocks`로 IPC를 가짜로 바꾸고, 여러 상태의 회의(녹음 중, 전사 중, 요약 중, 대기, 검토, 보냄, 실패, 음성 없음)와 녹음 레벨·진행률 이벤트를 흉내 낸다. 녹음하지 않고도 브라우저(`bun run dev` → `/preview.html`)에서 모든 화면과 움직임을 볼 수 있다.
+- 왼쪽 아래 패널에서 시나리오(빈 홈 / 여러 상태 / 녹음 중 / 설정 없음)를 고르면 고정 데이터를 처음 상태로 되돌리고 앱을 다시 띄운다. "GPU 경고", "종료 확인"은 Rust가 스스로 보내는 이벤트를 흉내 내 배너와 대화상자를 띄운다.
+- 명령은 고정 데이터를 그럴듯하게 바꾼다: 진행률이 오르고 끝나면 다음 회의가 대기열에서 시작하며, 보내기는 1초 뒤 `sent`가 되고, 녹음을 시작하면 40ms마다 레벨이 온다. 명령마다 처리기를 `ipc.ts`에서 그 명령을 보내는 함수의 반환 타입에 묶어 두어, 응답 모양이 어긋나면 `tsc`가 잡는다. 인자는 묶지 않았다(이름이 `ipc.ts` 안에서 바뀌므로).
+- 단순화: "여러 상태"는 실행 중 상태를 한 화면에 모두 보이려고 셋을 동시에 돌린다(실제 대기열은 둘, 아키텍처 8.4).
+
+**0단계에서 정한 것**
+- 토큰 이름: 이 문서의 `accent`는 Tailwind에서 `primary`(shadcn 컴포넌트)와 `brand`(우리 코드)다. Tailwind의 `accent`는 shadcn 뜻 그대로 hover 바탕(= `sunken`)으로 남긴다. `accent-press`, `accent-tint`와 나머지 색은 이 문서 이름 그대로다.
+- 글자는 `font-display text-display-m`처럼 크기 토큰(줄 높이·자간·굵기 포함)과 글꼴을 따로 쓴다. 모서리는 `rounded-control`(10px)·`rounded-float`(16px)·`rounded-full`, 본문 폭은 `max-w-doc`·`max-w-home`·`max-w-wide`다(녹음·처리 중 화면은 760px).
+- 세리프 두 폰트에 `tnum`이 없어 타이머는 Pretendard 고정폭 숫자로 쓴다. 이탤릭 숫자는 바뀌지 않는 숫자에만 쓴다(2).
+- 버튼 눌림은 CSS(`motion-safe:active:scale-[0.97]`, 120ms, `transform`만)로, 스위치 손잡이는 CSS 전환으로 했다. `spring.snappy`로 바꾸는 것은 3단계다.
+- 화면 전환은 `AnimatePresence`의 `popLayout`이다: 나가는 화면은 흐름에서 빠져 겹쳐 사라지고(들어오는 시간의 65%), 들어오는 화면은 바로 자리를 잡아 레이아웃이 흔들리지 않는다.
 
 단계마다 기존 Vitest 테스트를 바뀐 구조에 맞게 고치고, 동작 테스트(자동 저장, 전송, 고지, D6·D8)는 그대로 통과해야 한다.

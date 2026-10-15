@@ -1,0 +1,4 @@
+/* The app's theme plus the panel's classes. theme.css leaves this folder out so the build never
+   carries them; a file named here wins over that folder-wide `not`. */
+@import "../styles/theme.css";
+@source "./main.tsx";

@@ -1,67 +1,151 @@
-/* Scan only src/ for class names: docs/ and the rest of the repo must not add utilities. */
+/* Scan only src/ for class names: docs/ and the rest of the repo must not add utilities, and the
+   dev preview's must stay out of the build. */
 @import "tailwindcss" source("../");
+@source not "../preview";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
+/* Bundled fonts (design-system 2): the CSP blocks external ones. Each splits its files by
+   unicode-range, so only the ranges on screen are read. */
+@import "pretendard/dist/web/variable/pretendardvariable-dynamic-subset.css";
+@import "@fontsource/instrument-serif";
+@import "@fontsource/instrument-serif/400-italic.css";
+@import "@fontsource-variable/noto-serif-kr";
 
 /* Light only (architecture 10.3): `dark:` follows a `.dark` class the app never sets, never the
-   OS prefers-color-scheme, so a `dark:` class from a newly added component can never apply.
-   Fonts: Tailwind's system font stack; external fonts are blocked by the CSP. */
+   OS prefers-color-scheme, so a `dark:` class from a newly added component can never apply. */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* Paper & Pulse tokens: docs/design-system.md 2-5 is the source of truth. */
 @theme {
-  /* 회사 색상 토큰 (monolis 공용 preset + fni 확장에서 이식) */
-  --color-mainBlue: #5550ff;
-  --color-blue50: #f6f6ff;
-  --color-blue100: #eeedff;
-  --color-blue900: #4440cc;
-  --color-danger: #f65959;
-  --color-dangerDark: #dd5050;
-  --color-danger100: #feeeee;
-  --color-warning: #ff9b3f;
-  --color-warning100: #fff5ec;
-  --color-green: #1eba66;
-  --color-green50: #f4fcf7;
-  --color-mint: #5ec9e0;
-  --color-black: #24232e;
-  --color-white: #ffffff;
-  --color-blueGray: #f9fafb;
-  --color-cool200: #e3e9ef;
-  --color-cool500: #a1aab2;
-  --color-cool600: #838c94;
-  --color-cool700: #69727a;
+  --font-sans: "Pretendard Variable", Pretendard, -apple-system, "Apple SD Gothic Neo", "Malgun Gothic",
+    system-ui, sans-serif;
+  /* Serif titles and big numbers: Instrument Serif has no Hangul, so Hangul falls through to Noto
+     Serif KR. Neither has tabular figures (tnum): timers stay on Pretendard's. */
+  --font-display: "Instrument Serif", "Noto Serif KR Variable", serif;
 
-  --animate-pulse-faster: pulse-faster 1s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-  @keyframes pulse-faster {
+  /* The weights are Noto Serif KR's: Instrument Serif has only 400 and is never made bold (html
+     below). */
+  --text-display-xl: 5rem;
+  --text-display-xl--line-height: 1;
+  --text-display-xl--letter-spacing: -0.02em;
+  --text-display-xl--font-weight: 500;
+  --text-display-l: 2.75rem;
+  --text-display-l--line-height: 1.2;
+  --text-display-l--letter-spacing: -0.02em;
+  --text-display-l--font-weight: 600;
+  --text-display-m: 2rem;
+  --text-display-m--line-height: 1.25;
+  --text-display-m--letter-spacing: -0.02em;
+  --text-display-m--font-weight: 600;
+  --text-title: 1.25rem;
+  --text-title--line-height: 1.35;
+  --text-title--letter-spacing: -0.01em;
+  --text-title--font-weight: 600;
+  --text-body-doc: 1rem;
+  --text-body-doc--line-height: 1.75;
+  --text-body-doc--letter-spacing: 0;
+  --text-body-doc--font-weight: 400;
+  --text-body: 0.9375rem;
+  --text-body--line-height: 1.55;
+  --text-body--letter-spacing: -0.005em;
+  --text-body--font-weight: 400;
+  --text-label: 0.8125rem;
+  --text-label--line-height: 1.4;
+  --text-label--letter-spacing: 0;
+  --text-label--font-weight: 550;
+  --text-caption: 0.75rem;
+  --text-caption--line-height: 1.4;
+  --text-caption--letter-spacing: 0.01em;
+  --text-caption--font-weight: 500;
+
+  /* Color (design-system 3). Status colors (rec, *-line, system) never go on text (NFR-09). */
+  --color-paper: #f7f5f0;
+  --color-surface: #ffffff;
+  --color-sunken: #efece5;
+  --color-ink: #1f1d1a;
+  --color-ink-2: #6b665c;
+  --color-ink-3: #a39e93;
+  --color-line: #e6e2d9;
+  --color-line-strong: #8f897d;
+  /* The design system's `accent`. Tailwind's `accent` stays shadcn's hover surface, so the brand
+     color is `primary` (shadcn) or `brand` (our own code). */
+  --color-brand: #5550ff;
+  --color-accent-press: #4440cc;
+  --color-accent-tint: #eeedff;
+  --color-dock: #1f1d1a;
+  --color-dock-2: #b8b2a7;
+  --color-rec: #f65959;
+  --color-marker: #ffe3b8;
+  --color-danger-line: #dd5050;
+  --color-danger-bg: #feeeee;
+  --color-warn-line: #ff9b3f;
+  --color-warn-bg: #fff5ec;
+  --color-ok-line: #1eba66;
+  --color-ok-bg: #f4fcf7;
+  --color-mic: #5550ff;
+  --color-system: #5ec9e0;
+
+  /* Shape and depth (design-system 4). Pills use rounded-full. */
+  --radius-control: 0.625rem;
+  --radius-float: 1rem;
+  --shadow-float: 0 1px 2px rgb(31 29 26 / 0.06), 0 12px 32px -8px rgb(31 29 26 / 0.18);
+  --container-doc: 680px;
+  --container-home: 760px;
+  --container-wide: 960px;
+
+  /* CSS transitions use the same curves as src/lib/motion.ts. */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in: cubic-bezier(0.55, 0, 1, 0.45);
+
+  /* Keyframes for things that are happening right now. Always behind `motion-safe:`. */
+  --animate-breathe: breathe 1.6s ease-in-out infinite;
+  --animate-bar: bar 0.9s ease-in-out infinite;
+  --animate-dot: dot 1.2s ease-in-out infinite;
+  --animate-shimmer: shimmer 1.6s var(--ease-out) infinite;
+  @keyframes breathe {
     0%, 100% { opacity: 1; }
-    50% { opacity: 0; }
+    50% { opacity: 0.35; }
+  }
+  @keyframes bar {
+    0%, 100% { transform: scaleY(0.35); }
+    50% { transform: scaleY(1); }
+  }
+  @keyframes dot {
+    0%, 100% { opacity: 0.25; }
+    40% { opacity: 1; }
+  }
+  /* `translate`, not `transform`: it takes over the sweep's resting -translate-x-full. */
+  @keyframes shimmer {
+    from { translate: -100% 0; }
+    to { translate: 100% 0; }
   }
 }
 
-/* shadcn semantic variables → company tokens (architecture 10.3 table). */
+/* shadcn semantic variables → Paper & Pulse tokens (design-system 3). */
 :root {
-  --background: #f9fafb; /* blueGray */
-  --foreground: #24232e; /* black */
-  --card: #ffffff;
-  --card-foreground: #24232e;
-  --popover: #ffffff;
-  --popover-foreground: #24232e;
-  --primary: #5550ff; /* mainBlue */
+  --background: #f7f5f0; /* paper */
+  --foreground: #1f1d1a; /* ink */
+  --card: #ffffff; /* surface */
+  --card-foreground: #1f1d1a;
+  --popover: #ffffff; /* surface */
+  --popover-foreground: #1f1d1a;
+  --primary: #5550ff; /* brand */
   --primary-foreground: #ffffff;
-  --secondary: #f6f6ff; /* blue50 */
-  --secondary-foreground: #24232e;
-  --muted: #f9fafb; /* blueGray */
-  --muted-foreground: #69727a; /* cool700 */
-  --accent: #f6f6ff; /* blue50 */
-  --accent-foreground: #24232e;
-  --destructive: #dd5050; /* dangerDark: borders and icons only, never text */
-  --border: #e3e9ef; /* cool200 */
-  --input: #838c94; /* cool600: control boundaries, 3.4:1 on white (WCAG 1.4.11) */
-  --ring: #5550ff;
+  --secondary: #efece5; /* sunken */
+  --secondary-foreground: #1f1d1a;
+  --muted: #efece5; /* sunken */
+  --muted-foreground: #6b665c; /* ink-2: 5.2:1 on paper, 4.8:1 on sunken */
+  --accent: #efece5; /* sunken: hover surfaces, not the brand color */
+  --accent-foreground: #1f1d1a;
+  --destructive: #dd5050; /* danger-line: borders and icons only, never text */
+  --border: #e6e2d9; /* line */
+  --input: #8f897d; /* line-strong: control boundaries, 3.5:1 on surface (WCAG 1.4.11) */
+  --ring: #5550ff; /* brand */
   --radius: 0.625rem;
 }
 
 @theme inline {
-  --font-heading: var(--font-sans);
+  --font-heading: var(--font-display);
   --color-ring: var(--ring);
   --color-input: var(--input);
   --color-border: var(--border);
@@ -91,12 +175,26 @@
 
 @layer base {
   * {
-    @apply border-border outline-ring/50;
+    @apply border-border;
   }
-  body {
-    @apply bg-background text-foreground;
+  /* WCAG 2.4.7 on every control: a 2px brand ring, 2px off whatever is behind it. */
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
   }
+  /* No faux bold: Instrument Serif keeps its one weight beside a 600 Hangul title. Italic may still
+     be slanted, but only Instrument Serif's numerals are set in italic. */
   html {
     @apply font-sans;
+    font-synthesis: style;
+  }
+  /* Paper grain: fractal noise at 3%, decoration only. Stitched tiles, so no seams show. */
+  body {
+    @apply bg-background text-body text-foreground antialiased;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+  }
+  /* Lucide icons at one stroke weight (design-system 1). */
+  .lucide {
+    stroke-width: 1.75;
   }
 }

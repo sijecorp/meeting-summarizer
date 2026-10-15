@@ -30,32 +30,36 @@ import {
   type SummaryRoute,
 } from "@/lib/ipc";
 
+/** Body widths (design-system 4): the review document, Home's timeline (and the screens without
+ * their own), settings. With `box-content` the side padding sits outside, so text gets all of it. */
+export const WIDTH = { doc: "max-w-doc", home: "max-w-home", wide: "max-w-wide" };
+
 /** Every screen's body under the app header: one width, one title style, the back link. */
 export function Page({
   title,
   action,
   onHome,
-  wide,
+  width = "home",
   children,
 }: {
   title: string;
   /** Shown at the right of the title, e.g. Home's 녹음 시작. */
   action?: ReactNode;
   onHome?: () => void;
-  wide?: boolean;
+  width?: keyof typeof WIDTH;
   children: ReactNode;
 }) {
   return (
-    <main className={`mx-auto w-full space-y-6 px-6 py-8 ${wide ? "max-w-5xl" : "max-w-3xl"}`}>
-      <div className="space-y-1">
+    <main className={`mx-auto box-content space-y-6 px-8 py-8 ${WIDTH[width]}`}>
+      <div className="space-y-2">
         {onHome && (
-          <Button variant="link" className="px-0" onClick={onHome}>
+          <Button variant="ghost" size="sm" className="-ml-3 text-ink-2 hover:text-ink" onClick={onHome}>
             <ArrowLeft aria-hidden />
             홈으로
           </Button>
         )}
         <div className="flex flex-wrap items-center justify-between gap-4">
-          <h1 className="text-2xl font-bold">{title}</h1>
+          <h1 className="font-display text-display-m">{title}</h1>
           {action}
         </div>
       </div>
@@ -64,11 +68,49 @@ export function Page({
   );
 }
 
-/** One look for a status in the meeting list, on the processing screen and in the app header. */
-export function StatusBadge({ recording, children }: { recording?: boolean; children: ReactNode }) {
+/** The logo's three bars, also the sign of transcribing. They move only while `live`; the
+ * attribute says which, for tests. */
+export function Bars({ live, className = "" }: { live: boolean; className?: string }) {
   return (
-    <Badge variant="secondary">
-      {recording && <span className="size-2 rounded-full bg-danger motion-safe:animate-pulse-faster" aria-hidden />}
+    <span aria-hidden data-live={live} className={`flex items-end gap-[2px] ${className}`}>
+      {[0.55, 1, 0.75].map((height, i) => (
+        <span
+          key={i}
+          className={`w-[3px] origin-bottom rounded-full bg-current ${live ? "motion-safe:animate-bar" : ""}`}
+          // Out of step, so the three never rise together.
+          style={{ height: `${height * 100}%`, animationDelay: `${i * -0.3}s` }}
+        />
+      ))}
+    </span>
+  );
+}
+
+/** What a badge shows moving (design-system 6.4). */
+export type BadgeKind = "recording" | "transcribing" | "summarizing" | "waiting";
+
+// The sweep starts out of sight and only moves without Reduce Motion. It passes under the text
+// (`isolate` + `-z-10`), so the words keep their contrast.
+const SHIMMER =
+  "relative isolate after:pointer-events-none after:absolute after:inset-0 after:-z-10 after:-translate-x-full after:bg-linear-to-r after:from-transparent after:via-surface/70 after:to-transparent motion-safe:after:animate-shimmer";
+
+/** One look for a status in the meeting list, on the processing screen and in the app header. A
+ * state that is happening moves, and its words always say it too: never color or motion alone. */
+export function StatusBadge({ kind, children }: { kind?: BadgeKind; children: ReactNode }) {
+  return (
+    <Badge variant="secondary" className={kind === "summarizing" ? SHIMMER : undefined}>
+      {kind === "recording" && <span aria-hidden className="size-2 rounded-full bg-rec motion-safe:animate-breathe" />}
+      {kind === "transcribing" && <Bars live className="h-3 text-brand" />}
+      {kind === "waiting" && (
+        <span aria-hidden className="flex gap-[3px]">
+          {[0, 1, 2].map((i) => (
+            <span
+              key={i}
+              className="size-1 rounded-full bg-ink-2 motion-safe:animate-dot"
+              style={{ animationDelay: `${i * 0.2}s` }}
+            />
+          ))}
+        </span>
+      )}
       {children}
     </Badge>
   );
@@ -88,6 +130,20 @@ export function phase(meta: Meta, progress: Progress | undefined) {
   if (RUNNING.includes(meta.status)) return "running";
   if (progress?.position != null || WAITING.includes(meta.status)) return "waiting";
   return null;
+}
+
+/** A meeting's badge, by the same reading as `phase`. */
+export function badgeKind(meta: Meta, progress: Progress | undefined): BadgeKind | undefined {
+  const now = phase(meta, progress);
+  return meta.status === "recording"
+    ? "recording"
+    : now === "waiting"
+      ? "waiting"
+      : now === "running"
+        ? meta.status === "summarizing"
+          ? "summarizing"
+          : "transcribing"
+        : undefined;
 }
 
 /** A waiting meeting shows its place in line instead of its stored status. */
@@ -146,13 +202,9 @@ export function ProcessProgress({
   return (
     <div className="grid gap-1.5">
       {(!summarizing || p.chunks > 1) && (
-        <ProgressBar
-          value={p.percent}
-          aria-label={`${label}${name ? ` (${name})` : ""}`}
-          className="bg-cool200"
-        />
+        <ProgressBar value={p.percent} aria-label={`${label}${name ? ` (${name})` : ""}`} />
       )}
-      <span className="text-sm text-muted-foreground">{text}</span>
+      <span className="text-sm text-muted-foreground tabular-nums">{text}</span>
     </div>
   );
 }
@@ -239,7 +291,7 @@ export function RouteNotice({ id, status }: { id: string; status?: Status }) {
   );
 }
 
-/** Error and warning banners (architecture 10.3): colored border and icon, black text. */
+/** Error and warning banners (design-system 3): a *-line border and icon, ink text. */
 export function Banner({
   kind,
   children,

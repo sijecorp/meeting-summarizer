@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { RotateCcw } from "lucide-react";
 import {
+  badgeKind,
   Banner,
   DeleteButton,
   host,
@@ -130,7 +131,7 @@ export default function Processing({
               <dl className="grid grid-cols-[auto_1fr] items-center gap-x-6 gap-y-2 text-base">
                 <dt className="text-muted-foreground">상태</dt>
                 <dd>
-                  <StatusBadge>{statusLabel(meta, progress)}</StatusBadge>
+                  <StatusBadge kind={badgeKind(meta, progress)}>{statusLabel(meta, progress)}</StatusBadge>
                 </dd>
                 {now === "running" && progress && (
                   <>

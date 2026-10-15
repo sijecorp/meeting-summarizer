@@ -304,7 +304,7 @@ export default function Review({
     .filter((line) => line.includes("미정"));
 
   return (
-    <Page title="검토" onHome={onHome}>
+    <Page title="검토" onHome={onHome} width="doc">
       {error && <Banner kind="error">{error}</Banner>}
       {saveError && <Banner kind="error">{saveError}</Banner>}
       {meta && (
@@ -393,7 +393,7 @@ export default function Review({
               }
             }}
           >
-            <summary className="cursor-pointer rounded-lg px-4 py-3 font-medium outline-none focus-visible:ring-3 focus-visible:ring-ring">
+            <summary className="cursor-pointer rounded-lg px-4 py-3 font-medium">
               전사본 보기
             </summary>
             <div className="space-y-4 border-t px-4 py-3">

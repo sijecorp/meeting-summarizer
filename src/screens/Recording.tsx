@@ -131,7 +131,7 @@ export default function Recording({
           <Card className="gap-6 p-6">
             <div className="flex flex-col items-center gap-2">
               <p className="flex items-center gap-3">
-                <span className="size-3.5 rounded-full bg-danger motion-safe:animate-pulse" aria-hidden />
+                <span className="size-3.5 rounded-full bg-rec motion-safe:animate-breathe" aria-hidden />
                 <span className="text-5xl font-bold tabular-nums">
                   {formatElapsed(level?.elapsed_ms ?? 0)}
                 </span>
@@ -146,13 +146,13 @@ export default function Recording({
               label="내 마이크"
               bands={level?.mic_bands ?? SILENT}
               rms={level?.mic ?? 0}
-              color="bg-mainBlue"
+              color="bg-mic"
             />
             <Spectrum
               label="시스템 오디오"
               bands={level?.system_bands ?? SILENT}
               rms={level?.system ?? 0}
-              color="bg-mint"
+              color="bg-system"
             />
           </Card>
           <RouteNotice id={id} />
@@ -162,13 +162,14 @@ export default function Recording({
               권장합니다.
             </p>
           )}
-          {/* White on danger is 3.2:1, so this label stays bold and at least 18.66px (NFR-09). */}
+          {/* White on ink with a red square (design-system 3): no small-text contrast exception. */}
           <Button
-            className="h-auto self-center bg-danger px-8 py-3 text-xl font-bold text-white hover:bg-dangerDark"
+            variant="ink"
+            className="h-auto self-center px-8 py-3 text-xl font-bold"
             disabled={stopping}
             onClick={stop}
           >
-            <Square aria-hidden className="fill-current" />
+            <Square aria-hidden className="fill-current text-rec" />
             녹음 종료
           </Button>
         </div>

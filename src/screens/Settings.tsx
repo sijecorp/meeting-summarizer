@@ -192,7 +192,7 @@ export default function Settings({
   if (!draft || !persisted) {
     // Unreadable settings.json: the old file is kept as a backup before starting over.
     return (
-      <Page title="설정" onHome={onHome} wide>
+      <Page title="설정" onHome={onHome} width="wide">
         {error && (
           <>
             <Banner kind="error">{error}</Banner>
@@ -429,14 +429,14 @@ export default function Settings({
   ];
 
   return (
-    <Page title="설정" onHome={onHome} wide>
+    <Page title="설정" onHome={onHome} width="wide">
       <div className="flex flex-col gap-6 md:flex-row md:items-start">
         <nav aria-label="설정 메뉴" className="flex flex-wrap gap-1 md:w-48 md:shrink-0 md:flex-col">
           {TABS.map((t) => (
             <button
               key={t.value}
               aria-current={tab === t.value ? "page" : undefined}
-              className="rounded-lg px-3 py-2 text-left text-sm font-medium outline-none hover:bg-accent focus-visible:ring-3 focus-visible:ring-ring aria-[current=page]:bg-blue100 aria-[current=page]:font-bold"
+              className="rounded-lg px-3 py-2 text-left text-sm font-medium hover:bg-accent aria-[current=page]:bg-accent-tint aria-[current=page]:font-bold"
               onClick={() => setTab(t.value)}
             >
               {t.label}

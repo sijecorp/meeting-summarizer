@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Settings as SettingsIcon } from "lucide-react";
-import { Banner, mmss, phase, StatusBadge } from "@/components/common";
+import { AnimatePresence, motion, useIsPresent } from "motion/react";
+import { Banner, Bars, mmss, phase, StatusBadge, WIDTH } from "@/components/common";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -12,6 +13,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { bannerVariants, screenVariants } from "@/lib/motion";
 import {
   confirmQuit,
   getMeeting,
@@ -49,9 +51,16 @@ const screenOf = (m: Meta): Screen =>
   m.status === "recording"
     ? { name: "recording" }
     : { name: REVIEWABLE.includes(m.status) ? "review" : "processing", id: m.id };
-// h-6: a 24px target around the 20px badge (WCAG 2.5.8).
-const CHIP =
-  "flex h-6 items-center rounded-4xl outline-none hover:opacity-80 focus-visible:ring-3 focus-visible:ring-ring";
+// Every app banner enters, shows and leaves alike.
+const BANNER = { variants: bannerVariants, initial: "enter", animate: "show", exit: "exit" };
+// h-6: a 24px target around the badge (WCAG 2.5.8).
+const CHIP = "flex h-6 items-center rounded-full hover:opacity-80";
+
+/** A screen or banner on its way out stays mounted for its exit: out of the tab order, the
+ * accessibility tree and hit-testing meanwhile. */
+function Present({ children }: { children: ReactNode }) {
+  return <div inert={!useIsPresent()}>{children}</div>;
+}
 
 /** Listens to levels itself and keeps whole seconds, so only the chip re-renders, once a second. */
 function RecordingChip({ onClick }: { onClick: () => void }) {
@@ -65,7 +74,7 @@ function RecordingChip({ onClick }: { onClick: () => void }) {
   }, []);
   return (
     <button className={CHIP} onClick={onClick}>
-      <StatusBadge recording>{`녹음 중 ${mmss(s * 1000)}`}</StatusBadge>
+      <StatusBadge kind="recording">{`녹음 중 ${mmss(s * 1000)}`}</StatusBadge>
     </button>
   );
 }
@@ -203,15 +212,17 @@ export default function App() {
     return counted ? [`${p.percent}%`] : [];
   });
   const banners = [quitError, listError].filter(Boolean);
+  const width = WIDTH[screen.name === "settings" ? "wide" : screen.name === "review" ? "doc" : "home"];
+  // Forward from Home rises, back to Home sinks (design-system 6.1).
+  const direction = screen.name === "home" ? -1 : 1;
 
   return (
     <div className="min-h-screen">
-      <header className="sticky top-0 z-10 flex h-14 items-center justify-between gap-4 border-b bg-card px-6">
+      <header className="sticky top-0 z-10 flex h-12 items-center justify-between gap-4 border-b border-line bg-paper/92 px-6 backdrop-blur-md">
         <div className="flex min-w-0 items-center gap-3">
-          <button
-            className="rounded-md text-base font-bold outline-none focus-visible:ring-3 focus-visible:ring-ring"
-            onClick={home}
-          >
+          <button className="flex items-center gap-2 rounded-md font-display text-title" onClick={home}>
+            {/* Still unless something is being transcribed or summarized. */}
+            <Bars live={running.length > 0} className="h-3.5 text-brand" />
             회의 요약
           </button>
           {recording ? (
@@ -232,68 +243,88 @@ export default function App() {
             )
           )}
         </div>
-        <Button
-          variant="ghost"
-          size="icon-lg"
-          className="hover:bg-accent"
-          aria-label="설정"
-          onClick={() => setScreen({ name: "settings" })}
-        >
+        <Button variant="ghost" size="icon" aria-label="설정" onClick={() => setScreen({ name: "settings" })}>
           <SettingsIcon aria-hidden className="size-5" />
         </Button>
       </header>
 
-      {(banners.length > 0 || notice) && (
-        <div
-          className={`mx-auto space-y-3 px-6 pt-6 ${screen.name === "settings" ? "max-w-5xl" : "max-w-3xl"}`}
-        >
+      {/* A leaving banner pops out of the flow at once, so the screen's `layout` slides it up in
+          the same render instead of jumping when the fade ends. */}
+      <div className={`relative mx-auto box-content px-8 ${width}`}>
+        <AnimatePresence initial={false} mode="popLayout">
           {banners.map((b) => (
-            <Banner key={b} kind="error">
-              {b}
-            </Banner>
+            <motion.div key={b} layout="position" className="pt-4" {...BANNER}>
+              <Present>
+                <Banner kind="error">{b}</Banner>
+              </Present>
+            </motion.div>
           ))}
           {notice && (
-            <Banner kind="warning" onDismiss={() => setNotice("")}>
-              {notice}
-            </Banner>
+            <motion.div key="notice" layout="position" className="pt-4" {...BANNER}>
+              <Present>
+                <Banner kind="warning" onDismiss={() => setNotice("")}>
+                  {notice}
+                </Banner>
+              </Present>
+            </motion.div>
           )}
-        </div>
-      )}
+        </AnimatePresence>
+      </div>
 
-      {screen.name === "home" && (
-        <Home
-          meetings={meetings}
-          progress={progress}
-          recording={recording}
-          onChanged={refresh}
-          onOpen={(m) => setScreen(screenOf(m))}
-          onRecord={() => setScreen({ name: "recording" })}
-          onSetup={(tab) => setScreen({ name: "settings", tab })}
-        />
-      )}
-      {screen.name === "recording" && (
-        <Recording onHome={home} onStopped={(id) => setScreen({ name: "processing", id })} />
-      )}
-      {screen.name === "processing" && (
-        <Processing
-          key={screen.id}
-          id={screen.id}
-          progress={progress[screen.id]}
-          onHome={home}
-          onReview={(id) => setScreen({ name: "review", id })}
-          onSetup={(tab) => setScreen({ name: "settings", tab })}
-        />
-      )}
-      {screen.name === "review" && (
-        <Review
-          key={screen.id}
-          id={screen.id}
-          onHome={home}
-          onNotice={setNotice}
-          onSetup={(tab) => setScreen({ name: "settings", tab })}
-        />
-      )}
-      {screen.name === "settings" && <Settings tab={screen.tab} onHome={home} />}
+      {/* The leaving screen pops out of the flow too: the two cross without a layout shift. */}
+      <div className="relative">
+        <AnimatePresence initial={false} mode="popLayout" custom={direction}>
+          <motion.div
+            key={"id" in screen ? `${screen.name}:${screen.id}` : screen.name}
+            layout="position"
+            custom={direction}
+            variants={screenVariants}
+            initial="enter"
+            animate="show"
+            exit="exit"
+          >
+            <Present>
+              {screen.name === "home" && (
+                <Home
+                  meetings={meetings}
+                  progress={progress}
+                  recording={recording}
+                  onChanged={refresh}
+                  onOpen={(m) => setScreen(screenOf(m))}
+                  onRecord={() => setScreen({ name: "recording" })}
+                  onSetup={(tab) => setScreen({ name: "settings", tab })}
+                />
+              )}
+              {screen.name === "recording" && (
+                <Recording onHome={home} onStopped={(id) => setScreen({ name: "processing", id })} />
+              )}
+              {screen.name === "processing" && (
+                <Processing
+                  key={screen.id}
+                  id={screen.id}
+                  progress={progress[screen.id]}
+                  onHome={home}
+                  // Only from its own screen: one on its way out may still finish a read.
+                  onReview={(id) =>
+                    setScreen((s) => (s.name === "processing" && s.id === id ? { name: "review", id } : s))
+                  }
+                  onSetup={(tab) => setScreen({ name: "settings", tab })}
+                />
+              )}
+              {screen.name === "review" && (
+                <Review
+                  key={screen.id}
+                  id={screen.id}
+                  onHome={home}
+                  onNotice={setNotice}
+                  onSetup={(tab) => setScreen({ name: "settings", tab })}
+                />
+              )}
+              {screen.name === "settings" && <Settings tab={screen.tab} onHome={home} />}
+            </Present>
+          </motion.div>
+        </AnimatePresence>
+      </div>
 
       <AlertDialog open={quitAsked} onOpenChange={setQuitAsked}>
         <AlertDialogContent>
