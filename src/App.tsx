@@ -70,8 +70,9 @@ export default function App() {
   const [listError, setListError] = useState("");
   const [quitAsked, setQuitAsked] = useState(false);
   const [quitError, setQuitError] = useState("");
-  // Why a recording ended by itself (disk, 4 hours, sleep), the GPU fallback, or a progress
-  // listener that would not start. OS notifications come in M5.
+  // Why a recording ended by itself (disk, 4 hours, sleep), the GPU fallback, a progress listener
+  // that would not start, or a review edit that failed to save after its screen closed. OS
+  // notifications come in M5.
   const [notice, setNotice] = useState("");
   const home = () => setScreen({ name: "home" });
   const quitFailed = (e: unknown) => setQuitError(`종료하지 못했습니다: ${e}`);
@@ -161,10 +162,12 @@ export default function App() {
   const running = current.filter((m) => phase(m, progress[m.id]) === "running");
   const waiting = current.filter((m) => phase(m, progress[m.id]) === "waiting").length;
   // "(42%)", or "(42%, 17%)" with two running. Only once a meeting's chunk plan exists: before
-  // that, `percent` is the planning's own.
+  // that, `percent` is the planning's own. A summary shows one only past a single LLM request, and
+  // a meeting's last event (before the list is read again) none.
   const percents = running.flatMap((m) => {
     const p = progress[m.id];
-    return p?.chunks ? [`${p.percent}%`] : [];
+    const counted = p?.status === "transcribing" ? p.chunks > 0 : p?.status === "summarizing" && p.chunks > 1;
+    return counted ? [`${p.percent}%`] : [];
   });
   const banners = [quitError, listError].filter(Boolean);
 
@@ -245,9 +248,18 @@ export default function App() {
         <Recording onHome={home} onStopped={(id) => setScreen({ name: "processing", id })} />
       )}
       {screen.name === "processing" && (
-        <Processing key={screen.id} id={screen.id} progress={progress[screen.id]} onHome={home} />
+        <Processing
+          key={screen.id}
+          id={screen.id}
+          progress={progress[screen.id]}
+          onHome={home}
+          onReview={(id) => setScreen({ name: "review", id })}
+          onSetup={(tab) => setScreen({ name: "settings", tab })}
+        />
       )}
-      {screen.name === "review" && <Review key={screen.id} id={screen.id} onHome={home} />}
+      {screen.name === "review" && (
+        <Review key={screen.id} id={screen.id} onHome={home} onNotice={setNotice} />
+      )}
       {screen.name === "settings" && <Settings tab={screen.tab} onHome={home} />}
 
       <AlertDialog open={quitAsked} onOpenChange={setQuitAsked}>

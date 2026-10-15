@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Square } from "lucide-react";
-import { Banner, Page } from "@/components/common";
+import { Banner, Page, RouteNotice } from "@/components/common";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import {
@@ -73,7 +73,8 @@ export default function Recording({
   onHome: () => void;
   onStopped: (id: string) => void;
 }) {
-  const [active, setActive] = useState<boolean | null>(null);
+  // The recording's meeting id; null when none is running, undefined until asked.
+  const [id, setId] = useState<string | null>();
   const [level, setLevel] = useState<Level | null>(null);
   const [warnings, setWarnings] = useState<Warning[]>([]);
   const [heardSystem, setHeardSystem] = useState(false);
@@ -93,7 +94,7 @@ export default function Recording({
     Promise.all(unlisten)
       .then(recordingState)
       .then((state) => {
-        setActive(!!state);
+        setId(state?.id ?? null);
         state?.warnings.forEach(add);
       })
       .catch((e) => setError(String(e)));
@@ -124,8 +125,8 @@ export default function Recording({
           {w.message}
         </Banner>
       ))}
-      {active === false && <p className="text-muted-foreground">진행 중인 녹음이 없습니다.</p>}
-      {active && (
+      {id === null && <p className="text-muted-foreground">진행 중인 녹음이 없습니다.</p>}
+      {id && (
         <div className="flex flex-col gap-6">
           <Card className="gap-6 p-6">
             <div className="flex flex-col items-center gap-2">
@@ -154,6 +155,7 @@ export default function Recording({
               color="bg-mint"
             />
           </Card>
+          <RouteNotice id={id} />
           {heardSystem && (
             <p className="text-sm text-muted-foreground">
               스피커 소리가 마이크에 다시 녹음되면 전사가 부정확해질 수 있습니다. 헤드폰을 쓰는 것을

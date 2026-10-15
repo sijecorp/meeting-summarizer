@@ -310,6 +310,21 @@ test("header chip adds the running percent, follows progress events and goes hom
   expect(await screen.findByRole("heading", { level: 1, name: "회의" })).toBeTruthy();
 });
 
+// While summarizing, `percent` is requests done; one request has nothing to count.
+test("header chip counts a summary as running, with a percent only past one request", async () => {
+  const summarizing = { status: "summarizing" as const, eta_secs: null };
+  mock((cmd) => {
+    if (cmd === "list_meetings") return [meeting("a", "summarizing")];
+    if (cmd === "queue_state") return [progress("a", { ...summarizing, chunk: 0, chunks: 1, percent: 0 })];
+  });
+
+  render(<App />);
+  expect(await screen.findByText("처리 중 1")).toBeTruthy();
+
+  await act(() => emit("meeting://progress", progress("a", { ...summarizing, chunk: 1, chunks: 3, percent: 33 })));
+  expect(await screen.findByText("처리 중 1 (33%)")).toBeTruthy();
+});
+
 test("the setup card's model row comes first; 전사 설정 opens the 전사 tab", async () => {
   mock((cmd) => {
     if (cmd === "get_settings") return { ...loaded, settings: { ...loaded.settings, webhooks: [] } };

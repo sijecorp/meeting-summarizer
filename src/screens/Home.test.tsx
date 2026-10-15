@@ -141,6 +141,19 @@ test("a failed row shows the error and 다시 시도 queues it", async () => {
   expect(calls.find((c) => c.cmd === "resume_meeting")?.args).toEqual({ id: "a" });
 });
 
+test("a summarizing row shows 요약 중; a failed summary shows its error, retried on its own screen", () => {
+  mock();
+  home(
+    [meeting("a", "summarizing"), meeting("b", "summarize_failed", "LLM 사용 한도를 넘었습니다(HTTP 429)")],
+    [progress("a", { status: "summarizing", chunk: 1, chunks: 3, percent: 33 })],
+  );
+
+  expect(screen.getByRole("progressbar", { name: "요약 진행률 (a)" }).getAttribute("aria-valuenow")).toBe("33");
+  expect(screen.getByText("요약 중 · 요청 2/3")).toBeTruthy();
+  expect(screen.getByText("LLM 사용 한도를 넘었습니다(HTTP 429)")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /^다시 시도/ })).toBeNull();
+});
+
 // ONB-01: the setup card downloads right away; cancel, import and the mirror stay in the 전사 tab.
 test("the setup card's 모델 받기 downloads with progress and checks the files again", async () => {
   let installed = false;

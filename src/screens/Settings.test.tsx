@@ -376,6 +376,39 @@ test("read-only settings disable the key inputs and 저장", async () => {
   expect(screen.getByRole("button", { name: "Slack" }).matches(":disabled")).toBe(false);
 });
 
+// SUM-07 for each cloud address; SUM-08's default for new meetings needs a local connection.
+test("요약(LLM) tab: where a transcript goes, and the local default only with a local connection", async () => {
+  const calls: Call[] = [];
+  mockIPC((cmd, args) => {
+    calls.push({ cmd, args: args as Call["args"] });
+    if (cmd === "get_settings") {
+      return { ...loaded, settings: { ...loaded.settings, summarize_local_by_default: true } };
+    }
+    if (cmd === "has_secret") return true;
+  });
+  render(<Settings tab="llm" onHome={() => {}} />);
+  const localDefault = () => screen.queryByRole("switch", { name: "새 회의를 기본으로 로컬에서 요약" });
+  const saved = () => calls.filter((c) => c.cmd === "save_settings").map((c) => c.args.value);
+
+  expect(await screen.findByText("요약할 때 전사본 전문이 이 주소로 전송됩니다")).toBeTruthy();
+  expect(screen.queryByText(/OLLAMA_CONTEXT_LENGTH/)).toBeNull();
+  expect(localDefault()).toBeNull();
+  // Hidden, so it cannot stay on.
+  fireEvent.click(screen.getByRole("button", { name: "저장" }));
+  await waitFor(() => expect(saved()).toMatchObject([{ summarize_local_by_default: false }]));
+
+  fireEvent.click(screen.getByRole("switch", { name: "이 PC에서 도는 로컬 LLM (Ollama, LM Studio)" }));
+  expect(screen.queryByText("요약할 때 전사본 전문이 이 주소로 전송됩니다")).toBeNull();
+  expect(screen.getByText(/OLLAMA_CONTEXT_LENGTH/)).toBeTruthy();
+  fireEvent.click(localDefault()!);
+  fireEvent.click(screen.getByRole("button", { name: "저장" }));
+  await waitFor(() => expect(saved()).toHaveLength(2));
+  expect(saved()[1]).toMatchObject({
+    summarize_local_by_default: true,
+    llm_connections: [{ name: "회사 클라우드", is_local: true }],
+  });
+});
+
 const WHISPER = "ggml-large-v3-turbo-q8_0.bin";
 const VAD = "ggml-silero-v6.2.0.bin";
 const models = (whisper: Partial<ModelFileState> = {}): ModelState => ({

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Download, FolderOpen, Plus, RotateCcw, Trash2 } from "lucide-react";
-import { Banner, Field, Page } from "@/components/common";
+import { Banner, Field, Page, SelectField } from "@/components/common";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -16,7 +16,6 @@ import {
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -288,6 +287,7 @@ export default function Settings({
   };
 
   const glossaryCount = glossary.split("\n").filter((t) => t.trim()).length;
+  const hasLocal = draft.llm_connections.some((c) => c.is_local);
 
   const save = async () => {
     // Each check opens the tab that holds the field.
@@ -311,6 +311,8 @@ export default function Settings({
       // Same rule as settings.rs: only switching the backend to GPU clears it.
       gpu_failed: draft.gpu_failed && !(draft.backend === "gpu" && persisted.backend !== "gpu"),
       recorder_name: draft.recorder_name.trim(),
+      // Its switch hides without a local connection, so it cannot stay on unseen.
+      summarize_local_by_default: draft.summarize_local_by_default && hasLocal,
       glossary: glossary
         .split("\n")
         .map((term) => term.trim())
@@ -587,6 +589,12 @@ export default function Settings({
                         onChange={(e) => editLlm(i, { base_url: e.target.value })}
                       />
                     </Field>
+                    {/* SUM-07 */}
+                    {!c.is_local && (
+                      <p className="text-sm text-muted-foreground">
+                        요약할 때 전사본 전문이 이 주소로 전송됩니다
+                      </p>
+                    )}
                     <Field label="모델">
                       <Input value={c.model} onChange={(e) => editLlm(i, { model: e.target.value })} />
                     </Field>
@@ -633,6 +641,13 @@ export default function Settings({
                       />
                       이 PC에서 도는 로컬 LLM (Ollama, LM Studio)
                     </label>
+                    {/* 9.3: a server running a smaller context cuts the input without a word. */}
+                    {c.is_local && (
+                      <p className="text-sm text-muted-foreground">
+                        Ollama는 OLLAMA_CONTEXT_LENGTH, LM Studio는 모델을 불러올 때 Context Length를
+                        위 컨텍스트 토큰 이상으로 맞춰 주세요
+                      </p>
+                    )}
                     <SecretField label="API 키" {...secretProps("llm", c.name)} />
                     <RemoveButton
                       label="연결 삭제"
@@ -665,6 +680,16 @@ export default function Settings({
                   ]}
                   onChange={(v) => edit({ default_llm: v === NO_DEFAULT ? null : v })}
                 />
+              )}
+              {/* SUM-08: each new meeting's "로컬로 요약" starts here. */}
+              {hasLocal && (
+                <label className="flex w-fit items-center gap-2 text-sm">
+                  <Switch
+                    checked={draft.summarize_local_by_default}
+                    onCheckedChange={(v) => edit({ summarize_local_by_default: v })}
+                  />
+                  새 회의를 기본으로 로컬에서 요약
+                </label>
               )}
             </section>
 
@@ -772,38 +797,5 @@ function SecretField({
         onChange={(e) => onChange(e.target.value)}
       />
     </Field>
-  );
-}
-
-/** A labelled Radix select; Radix renders a button, so the label goes on it as aria-label. */
-function SelectField({
-  label,
-  value,
-  options,
-  disabled,
-  onChange,
-}: {
-  label: string;
-  value: string;
-  options: { value: string; label: string }[];
-  disabled?: boolean;
-  onChange: (value: string) => void;
-}) {
-  return (
-    <div className="grid gap-1.5 text-sm">
-      <span className="font-medium text-muted-foreground">{label}</span>
-      <Select value={value} disabled={disabled} onValueChange={onChange}>
-        <SelectTrigger aria-label={label} className="w-full">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          {options.map((o) => (
-            <SelectItem key={o.value} value={o.value}>
-              {o.label}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-    </div>
   );
 }

@@ -59,3 +59,22 @@ test("a dismissed warning stays hidden until it is sent again", async () => {
   await act(() => emit("recording://warning", mic));
   expect(screen.getByText(mic.message)).toBeTruthy();
 });
+
+// SUM-07: shown while recording, before anything is sent.
+test("tells where this meeting's summary will go", async () => {
+  const asked: unknown[] = [];
+  mockIPC(
+    (cmd, args) => {
+      if (cmd === "recording_state") return state;
+      if (cmd === "summary_route") {
+        asked.push(args);
+        return { connection: null, local: false, local_available: false, locked: false };
+      }
+    },
+    { shouldMockEvents: true },
+  );
+  render(<Recording onHome={() => {}} onStopped={() => {}} />);
+
+  expect(await screen.findByText("LLM 연결이 없어 전사까지만 합니다")).toBeTruthy();
+  expect(asked).toEqual([{ id: state.id }]);
+});

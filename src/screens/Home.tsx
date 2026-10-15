@@ -5,9 +5,9 @@ import {
   DeleteButton,
   Page,
   phase,
+  ProcessProgress,
   StatusBadge,
   statusLabel,
-  TranscribeProgress,
 } from "@/components/common";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -241,7 +241,7 @@ export default function Home({
                     </button>
                     {now === "running" && p && (
                       <div className="px-4 pb-3">
-                        <TranscribeProgress progress={p} name={m.title || "제목 없음"} />
+                        <ProcessProgress progress={p} name={m.title || "제목 없음"} />
                       </div>
                     )}
                     {now === null && m.status === "transcribe_failed" && (
@@ -259,6 +259,12 @@ export default function Home({
                           다시 시도
                         </Button>
                       </div>
+                    )}
+                    {/* 요약 다시 실행 picks a connection, so it lives on the processing screen. */}
+                    {now === null && m.status === "summarize_failed" && (
+                      <p className="truncate px-4 pb-3 text-sm text-muted-foreground">
+                        {m.error ?? "요약하지 못했습니다"}
+                      </p>
                     )}
                   </li>
                 );
