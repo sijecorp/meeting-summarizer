@@ -107,6 +107,53 @@ jobs:
           Get-Command cl, ninja | Format-Table Name, Source
           ninja --version
 
+      # The llama-server sidecar (bundle.externalBin, M6.5 plan 5.1) with the same script as a local
+      # build. The script caches per llama.cpp commit and CMake options; this keeps that folder between
+      # runs. Windows builds inside the MSVC environment with Ninja and the Vulkan SDK set up above.
+      # Saved right after the build, so a later failure does not throw a fresh build away.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: llama-server-cache
+        with:
+          path: ${{ runner.temp }}/llama-server
+          key: llama-server-${{ runner.os }}-${{ hashFiles('scripts/llama.cpp.rev', 'scripts/llama-server.flags', 'scripts/build-llama-server.sh', 'scripts/build-llama-server.ps1') }}
+
+      - name: Build llama-server (macOS)
+        if: runner.os == 'macOS'
+        env:
+          MS_LLAMA_SERVER_CACHE: ${{ runner.temp }}/llama-server
+        run: bash scripts/build-llama-server.sh
+
+      - name: Build llama-server (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          MS_LLAMA_SERVER_CACHE: ${{ runner.temp }}/llama-server
+        run: ./scripts/build-llama-server.ps1
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.llama-server-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/llama-server
+          key: ${{ steps.llama-server-cache.outputs.cache-primary-key }}
+
+      # app-dev.ts reads the stamp the same way build.rs does; this checks it against the script's.
+      - run: bun run app:dev --check
+
+      # Tests in the same job (ENG8), after the sidecar so build.rs finds the real one. cargo test
+      # builds the dev profile into the same target dir (CARGO_TARGET_DIR on Windows), which
+      # rust-cache keeps; the release build below does not share or change it. Same CMake generator
+      # as the build below. The test exes load vulkan-1.dll at start on Windows, and System32 has it
+      # only when the Vulkan SDK installer ran (not on the action's cache hit), hence the PATH.
+      - run: bun run test
+
+      - name: cargo test
+        shell: pwsh
+        env:
+          CMAKE_GENERATOR_x86_64_pc_windows_msvc: Ninja
+        run: |
+          if ($env:VULKAN_SDK) { $env:PATH = "$env:VULKAN_SDK\runtime\x64;$env:PATH" }
+          cargo test --manifest-path src-tauri/Cargo.toml --locked
+
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
           # The cmake crate reads CMAKE_GENERATOR_<target> first, so this only applies on Windows.
@@ -139,24 +186,76 @@ jobs:
             grep -q '^GGML_AVX512:[A-Z]*=OFF' "$f" || { echo "::error::GGML_AVX512 is not OFF in $f"; exit 1; }
           done
 
-      # The worker is this exe. AVX-512 from an AVX-512 runner dies on most office PCs. Today no Rust
-      # dependency in the exe dispatches to AVX-512 at run time (crc32fast and simd-adler32 have such
-      # code but come in only through a proc-macro). If one is added, this step fails on a good build:
-      # then check only whisper-rs-sys's ggml-cpu.lib. findstr exits 1 when nothing matches, hence exit 0.
+      # The worker is this exe, and llama-server (tauri-build copies the sidecar next to it). AVX-512
+      # from an AVX-512 runner dies on most office PCs. Today no Rust dependency in the exe dispatches to
+      # AVX-512 at run time (crc32fast and simd-adler32 have such code but come in only through a
+      # proc-macro). If one is added, this step fails on a good build: then check only whisper-rs-sys's
+      # ggml-cpu.lib. llama-server links the C runtime statically; if its memcpy or the STL ever
+      # dispatches to AVX-512, check only llama.cpp's ggml-cpu.lib the same way. findstr exits 1 when
+      # nothing matches, hence exit 0.
       - name: Check for AVX-512 instructions
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $exe = "$env:CARGO_TARGET_DIR\release\meeting-summarizer.exe"
-          if (-not (Test-Path $exe)) { echo "::error::$exe not found"; exit 1 }
-          dumpbin /nologo /disasm:nobytes /out:disasm.txt $exe
-          if ($LASTEXITCODE) { echo "::error::dumpbin failed"; exit 1 }
-          $zmm = findstr /r "zmm[0-9]" disasm.txt
-          if ($zmm) {
-            $zmm | Select-Object -First 20
-            echo "::error::AVX-512 (zmm) instructions in $exe"
-            exit 1
+          foreach ($name in 'meeting-summarizer.exe', 'llama-server.exe') {
+            $exe = "$env:CARGO_TARGET_DIR\release\$name"
+            if (-not (Test-Path $exe)) { echo "::error::$exe not found"; exit 1 }
+            dumpbin /nologo /disasm:nobytes /out:disasm.txt $exe
+            if ($LASTEXITCODE) { echo "::error::dumpbin failed"; exit 1 }
+            $zmm = findstr /r "zmm[0-9]" disasm.txt
+            if ($zmm) {
+              $zmm | Select-Object -First 20
+              echo "::error::AVX-512 (zmm) instructions in $exe"
+              exit 1
+            }
           }
+          exit 0
+
+      # The sidecar is in the app and the dmg, signed by the bundler (ad-hoc, hardened runtime, like the
+      # app), and links only system libraries: nothing from Homebrew or the build machine.
+      - name: Check the llama-server sidecar (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          bundle=src-tauri/target/aarch64-apple-darwin/release/bundle
+          app=$bundle/macos/meeting-summarizer.app
+          bin=$app/Contents/MacOS/llama-server
+          test -s "$bin" || { echo "::error::$bin is missing or empty"; exit 1; }
+          otool -L "$bin"
+          other=$(otool -L "$bin" | tail -n +2 | awk '{print $1}' | grep -vE '^(/usr/lib/|/System/)' || true)
+          if [ -n "$other" ]; then echo "::error::llama-server links non-system libraries: $other"; exit 1; fi
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv "$bin" 2>&1 | grep -E '^(Identifier|CodeDirectory|Signature)'
+          codesign -dv "$bin" 2>&1 | grep -q 'flags=.*runtime' || { echo "::error::llama-server is not signed with the hardened runtime"; exit 1; }
+          mnt=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$(ls "$bundle"/dmg/*.dmg)" >/dev/null
+          found=$(test -s "$mnt/meeting-summarizer.app/Contents/MacOS/llama-server" && echo yes || true)
+          hdiutil detach "$mnt" >/dev/null
+          [ -n "$found" ] || { echo "::error::llama-server is not in the dmg"; exit 1; }
+
+      # The sidecar needs only Windows DLLs and vulkan-1.dll: the C runtime is static
+      # (CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded), so no VCRUNTIME140.dll or other redistributable.
+      # VC++ redistributable DLLs are in a runner's System32, hence the name check. In the installer it
+      # sits in one folder with the app and vulkan-1.dll, where Windows finds the DLL (ENG9).
+      - name: Check the llama-server sidecar (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = "$env:CARGO_TARGET_DIR\release\llama-server.exe"
+          $deps = dumpbin /nologo /dependents $exe | Select-String '^\s+(\S+\.dll)$' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+          if ($LASTEXITCODE -or -not $deps) { echo "::error::dumpbin /dependents failed for $exe"; exit 1 }
+          $deps
+          $bad = $deps | Where-Object { $_ -ne 'vulkan-1.dll' -and ($_ -match '^(vcruntime|msvcp|vcomp|concrt|api-ms-win-crt-)' -or -not (Test-Path "$env:SystemRoot\System32\$_")) }
+          if ($bad) { echo "::error::llama-server.exe needs DLLs Windows does not have: $($bad -join ', ')"; exit 1 }
+          $setup = (Get-ChildItem "$env:CARGO_TARGET_DIR\release\bundle\nsis\*-setup.exe")[0].FullName
+          $paths = 7z l -ba -slt $setup | Select-String '^Path = (.+)$' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+          $dirs = foreach ($name in 'meeting-summarizer.exe', 'llama-server.exe', 'vulkan-1.dll') {
+            $path = $paths | Where-Object { (Split-Path $_ -Leaf) -eq $name } | Select-Object -First 1
+            if (-not $path) { $paths; echo "::error::$name is not in $setup"; exit 1 }
+            "$path -> '$(Split-Path $path -Parent)'" | Write-Host
+            Split-Path $path -Parent
+          }
+          if (@($dirs | Select-Object -Unique).Count -ne 1) { echo "::error::app, llama-server.exe and vulkan-1.dll are not in one folder"; exit 1 }
           exit 0
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

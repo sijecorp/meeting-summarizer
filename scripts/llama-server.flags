@@ -1,0 +1,32 @@
+# CMake options for llama-server, one per line after a scope: `*` for every target, or a Rust target
+# triple. scripts/build-llama-server.sh and .ps1 pass the lines for their target. The stamp next to the
+# binary, the cache folder name and src-tauri/build.rs all use the sha256 of this whole file, so any
+# edit here (comments too) means one rebuild.
+* CMAKE_BUILD_TYPE=Release
+* BUILD_SHARED_LIBS=OFF
+# Not the build machine's CPU (a runner's AVX-512). Same baseline as .cargo/config.toml (H4).
+* GGML_NATIVE=OFF
+# ggml's own threads. MSVC's OpenMP is vcomp140.dll from the VC++ redistributable.
+* GGML_OPENMP=OFF
+# No HTTPS client: the server only opens a local model file (-m). The plan's LLAMA_CURL is gone at this
+# commit (deprecated and ignored); downloads go through cpp-httplib with OpenSSL, which would link a
+# libssl the user may not have.
+* LLAMA_OPENSSL=OFF
+# The web UI is off at run time (--no-webui), so do not download its assets at build time.
+* LLAMA_USE_PREBUILT_UI=OFF
+* LLAMA_BUILD_TESTS=OFF
+* LLAMA_BUILD_EXAMPLES=OFF
+* LLAMA_BUILD_APP=OFF
+# llama-server also needs LLAMA_BUILD_COMMON, LLAMA_BUILD_TOOLS and LLAMA_BUILD_SERVER, ON by default.
+aarch64-apple-darwin GGML_METAL=ON
+aarch64-apple-darwin GGML_METAL_EMBED_LIBRARY=ON
+aarch64-apple-darwin CMAKE_OSX_ARCHITECTURES=arm64
+# Same as bundle.macOS.minimumSystemVersion in src-tauri/tauri.conf.json.
+aarch64-apple-darwin CMAKE_OSX_DEPLOYMENT_TARGET=14.6
+x86_64-pc-windows-msvc GGML_VULKAN=ON
+x86_64-pc-windows-msvc GGML_AVX2=ON
+x86_64-pc-windows-msvc GGML_FMA=ON
+x86_64-pc-windows-msvc GGML_F16C=ON
+x86_64-pc-windows-msvc GGML_BMI2=ON
+# Static C runtime, so no VCRUNTIME140.dll is needed (ENG9).
+x86_64-pc-windows-msvc CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded

@@ -800,6 +800,12 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 - **번들 대상**: macOS `app`·`dmg`(`tauri.conf.json`), Windows `nsis`(`tauri.windows.conf.json`, Tauri가 Windows에서 병합한다).
 - **배포**: 관리자가 artifact를 OneDrive에 올리고 동료에게 링크를 보낸다. 설치·업데이트·삭제 안내는 `docs/install.md`다. 자동 업데이트는 없다(eng review D2).
 - **CPU 기준** (M6.5 계획의 H4): ggml(전사)은 빌드 기계가 아니라 x86-64 AVX2·FMA·F16C·BMI2(NFR-02), arm64 Apple M1 기준으로 빌드한다(`GGML_NATIVE=OFF`, 저장소 루트 `.cargo/config.toml`의 `[env]`). 워크플로가 CMake 기록과 Windows 실행 파일의 zmm 명령으로 확인한다.
+- **요약 엔진 사이드카** (M6.5 계획 5.1): llama.cpp의 `llama-server`를 정적 링크로 빌드해 `bundle.externalBin`(`binaries/llama-server`)으로 넣는다.
+  - 커밋은 `scripts/llama.cpp.rev` 한 곳에 고정한다(지금 v0.7.0, 620d222). 새 모델이 필요하거나 보안 수정이 있을 때만 올린다. 올릴 때는 `THIRD_PARTY_NOTICES.md`의 커밋과 포함 코드 목록을 고치고, 1단계 확인(두 OS 빌드, CPU 기준, Metal·Vulkan 실행, 회사 PC)을 다시 한다.
+  - CMake 옵션은 `scripts/llama-server.flags` 한 곳에 있다. 빌드는 `scripts/build-llama-server.sh`(macOS)와 `.ps1`(Windows)이 하고, CI도 같은 스크립트를 부른다.
+  - 결과는 저장소 밖 캐시에 커밋·대상·옵션 해시별로 남는다(macOS `~/Library/Caches/meeting-summarizer/llama-server`, Windows `%LOCALAPPDATA%\meeting-summarizer\llama-server`, `MS_LLAMA_SERVER_CACHE`로 바꾼다). Windows는 260자 한계 때문에 `C:\t\lls`에서 빌드한다(`MS_LLAMA_SERVER_WORK`로 바꾼다).
+  - 바이너리 옆 도장(`llama-server-<target-triple>.stamp`, 커밋과 옵션 해시)을 `build.rs`가 본다. 개발 빌드는 사이드카가 없으면 빈 자리표시를 만들고, 자리표시이거나 도장이 다르면 경고만 한다. release 빌드와 `tauri build`(`--debug` 포함)는 자리표시, 도장 없음, 도장 불일치에서 멈춘다.
+  - 워크플로는 사이드카를 빌드한 뒤 캐시를 바로 저장하고, `bun run app:dev --check`와 테스트를 돌린다. 설치 파일을 만든 뒤에는 이것을 확인한다. macOS: 앱과 dmg 안의 사이드카, `otool -L`이 시스템 라이브러리뿐, Hardened Runtime 서명. Windows: `dumpbin /dependents`가 시스템 DLL과 `vulkan-1.dll`뿐, zmm 명령 없음, 설치 파일 안에서 앱·`llama-server.exe`·`vulkan-1.dll`이 한 폴더.
 - **Windows 빌드 환경**: `windows-latest`(Visual Studio 18 2026, CMake 4.4)에서 두 가지를 맞췄다. (1) Visual Studio 생성기로는 ggml-vulkan이 따로 구성하는 `vulkan-shaders-gen`이 컴파일러를 찾지 못해, MSVC 개발 환경(`ilammy/msvc-dev-cmd`)에서 Ninja로 빌드한다(`CMAKE_GENERATOR_x86_64_pc_windows_msvc: Ninja`, cmake 크레이트가 대상 이름이 붙은 변수를 먼저 읽어 macOS에는 닿지 않는다). (2) `src-tauri\target` 아래에서는 그 하위 빌드의 pdb 경로가 269자로 MSVC의 260자 한계를 넘어(C1041), `CARGO_TARGET_DIR`을 `D:\a\t`로 둔다. rust-cache는 `CARGO_TARGET_DIR`을 읽지 않아 같은 폴더를 `src-tauri` 기준 상대 경로로 받는다.
 - 확인: 2026-10-16 첫 성공 실행(run 38839884897)에서 두 설치 파일이 나왔다(macOS dmg 12MiB, Windows setup.exe 17MiB, Windows 빌드 약 27분). 앞의 두 실행은 위 두 문제로 Windows만 실패했다. 실제 PC에서 설치·실행은 아직이다(12.2).
 

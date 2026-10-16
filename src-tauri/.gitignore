@@ -8,3 +8,7 @@
 
 # Copied from the Vulkan SDK before a Windows build (tauri.windows.conf.json)
 /vulkan-1.dll
+
+# The llama-server sidecar (bundle.externalBin): built by scripts/build-llama-server.sh or .ps1, or
+# the empty placeholder build.rs makes for debug builds
+/binaries/

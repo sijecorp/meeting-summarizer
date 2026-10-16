@@ -16,3 +16,7 @@ Key routing rules:
 - Save progress → invoke /context-save
 - Resume context → invoke /context-restore
 - Author a backlog-ready spec/issue → invoke /spec
+
+## 개발
+
+준비물과 실행·검사 명령은 README의 "개발 시작"을 따른다. 요약 엔진 사이드카는 `scripts/build-llama-server.sh`(Windows는 `scripts/build-llama-server.ps1`)로 빌드하고, `bun run app:dev`가 필요할 때 대신 돌린다.

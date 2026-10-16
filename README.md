@@ -1,7 +1,92 @@
-# Tauri + React + Typescript
+# 회의 요약 (meeting-summarizer)
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+회의를 녹음하고 전사·요약해서 Slack으로 보내는 데스크톱 앱이다(Tauri 2, React, Rust). 동료용 설치 안내는 [docs/install.md](docs/install.md), 설계는 [docs/architecture.md](docs/architecture.md)에 있다.
 
-## Recommended IDE Setup
+## 개발 시작
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+### 준비물
+
+모든 OS에 [Bun](https://bun.sh), [Rust](https://rustup.rs)(stable), Git, CMake가 필요하다.
+
+macOS (Apple 실리콘):
+
+```sh
+xcode-select --install
+brew install cmake
+```
+
+Windows x64:
+
+```powershell
+winget install Git.Git Kitware.CMake Ninja-build.Ninja KhronosGroup.VulkanSDK Microsoft.PowerShell
+winget install Microsoft.VisualStudio.BuildTools --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --passive"
+```
+
+Windows에서는 아래 명령을 모두 x64 MSVC 개발자 환경에서 돌린다("x64 Native Tools Command Prompt for VS"를 열고 `pwsh`). CI와 같은 값도 먼저 준다(아키텍처 11.3). Visual Studio 생성기로는 ggml-vulkan의 하위 빌드가 컴파일러를 찾지 못하고, `src-tauri\target` 아래에서는 경로가 MSVC의 260자 한계를 넘는다. `vulkan-1.dll`은 `tauri.windows.conf.json`이 설치 파일에 넣는 파일이라 개발 빌드에도 있어야 한다.
+
+```powershell
+$env:CMAKE_GENERATOR_x86_64_pc_windows_msvc = 'Ninja'
+$env:CARGO_TARGET_DIR = 'C:\t'
+Copy-Item C:\Windows\System32\vulkan-1.dll src-tauri\vulkan-1.dll
+```
+
+### 가장 빠른 길: 화면만 보기
+
+```sh
+bun install
+bun run dev
+```
+
+http://localhost:1420/preview.html 을 연다. IPC를 가짜로 바꾼 미리보기라 Rust를 빌드하지 않고 모든 화면과 상태를 본다(디자인 시스템 7).
+
+### 앱 실행
+
+```sh
+bun run app:dev
+```
+
+요약 엔진(`llama-server` 사이드카)이 없거나, 빈 자리표시 파일이거나, 도장이 지금 커밋·옵션과 다르면 먼저 빌드한 뒤 `tauri dev`를 띄운다. 첫 빌드는 몇 분 걸리고, 그 뒤에는 캐시에서 복사만 한다. `bun run app:dev --check`는 사이드카 상태만 알려 준다.
+
+### 요약 엔진 사이드카
+
+llama.cpp의 `llama-server`를 정적 링크로 빌드해 `src-tauri/binaries/llama-server-<target-triple>`에 둔다. git에는 넣지 않는다. CI도 같은 스크립트를 부른다.
+
+```sh
+scripts/build-llama-server.sh
+```
+
+```powershell
+pwsh -File scripts\build-llama-server.ps1
+```
+
+- llama.cpp 커밋은 `scripts/llama.cpp.rev`, CMake 옵션은 `scripts/llama-server.flags` 한 곳에만 있다.
+- 결과는 저장소 밖 캐시에 커밋·대상·옵션별로 남는다(macOS `~/Library/Caches/meeting-summarizer/llama-server`, Windows `%LOCALAPPDATA%\meeting-summarizer\llama-server`). 다른 worktree는 복사만 한다. 캐시 폴더는 `MS_LLAMA_SERVER_CACHE`로 바꾼다.
+- Windows는 MSVC의 260자 한계 때문에 `C:\t\lls`에서 빌드하고, 다 되면 그 폴더를 지운다. 다른 드라이브를 쓰려면 `MS_LLAMA_SERVER_WORK`에 상위 폴더를 준다(그 아래 `lls`만 쓰고 지운다).
+- 바이너리 옆의 도장(`llama-server-<target-triple>.stamp`)에 커밋과 옵션 해시가 있다. 사이드카가 없으면 디버그 빌드(`cargo check`, `cargo test`, rust-analyzer)는 빈 자리표시 파일을 만들고 경고만 한다. 릴리스 빌드는 자리표시이거나 도장이 없거나 다르면 멈춘다.
+
+### 검사
+
+```sh
+bun run test
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+```
+
+### 설치 파일 빌드
+
+```sh
+bun run tauri build
+```
+
+사이드카가 먼저 있어야 한다. 동료에게 줄 설치 파일은 GitHub Actions의 build 워크플로(수동 실행이나 `v*` 태그)가 macOS dmg와 Windows setup.exe로 만든다(아키텍처 11.3).
+
+### worktree를 여러 개 쓸 때
+
+worktree들은 같은 앱으로 실행된다(identifier `com.sije.meeting-summarizer`). 그래서 아래를 함께 쓴다.
+
+- 앱 데이터 폴더: 회의·모델·설정(macOS `~/Library/Application Support/com.sije.meeting-summarizer`, Windows 회의·모델은 `%LOCALAPPDATA%`, 설정은 `%APPDATA%` 아래 같은 이름)
+- 키체인 항목(LLM 키, Slack 웹훅)
+- Vite 포트 1420: 두 번째 `bun run dev`·`app:dev`는 포트가 겹쳐 시작하지 않는다
+- 단일 실행 검사: 앱이 이미 떠 있으면 두 번째 앱은 첫 창을 앞으로 가져오고 꺼진다
+
+따로 쓰게 하는 일은 `docs/TODOS.md`의 "worktree 격리"에 있다.

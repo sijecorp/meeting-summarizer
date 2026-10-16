@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "app:dev": "bun scripts/app-dev.ts",
     "test": "vitest run"
   },
   "dependencies": {

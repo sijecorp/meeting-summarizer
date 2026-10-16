@@ -7,6 +7,7 @@ Meetily: no code from it is included, so it is not listed. Handy: only the macOS
 | Component | Version / source | License | Distributed how |
 |---|---|---|---|
 | whisper.cpp (ggml) | via `whisper-rs` 0.16.0 / `whisper-rs-sys` 0.15.0 (whisper.cpp 1.8.3) | MIT | compiled into the worker binary |
+| llama.cpp (ggml) | `ggml-org/llama.cpp` v0.7.0 (commit 620d222, `scripts/llama.cpp.rev`) | MIT, plus the vendored code listed in its section | compiled into the bundled `llama-server` sidecar |
 | Whisper model weights (OpenAI) | `ggerganov/whisper.cpp` ggml files, downloaded at first run | MIT | downloaded, not bundled |
 | Silero VAD | `ggml-org/whisper-vad` `ggml-silero-v6.2.0.bin`, downloaded at first run | MIT | downloaded, not bundled |
 | Vulkan Loader (`vulkan-1.dll`) | `KhronosGroup/Vulkan-Loader`, from the Vulkan SDK | Apache-2.0 | bundled with the Windows installer, next to the exe |
@@ -38,6 +39,75 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## llama.cpp (MIT)
+
+Source: https://github.com/ggml-org/llama.cpp (v0.7.0, commit 620d2225cc436ab0b001e3200e590e3b286ef9ab).
+
+MIT License
+
+Copyright (c) 2023-2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+`llama-server` also contains code from other projects that llama.cpp includes:
+
+- cpp-httplib (`vendor/cpp-httplib`): MIT License, Copyright (c) 2017 yhirose
+- nlohmann/json (`vendor/nlohmann`): MIT License, Copyright (c) 2013-2025 Niels Lohmann
+- stb_image (`vendor/stb`): MIT License, Copyright (c) 2017 Sean Barrett (or public domain, at the user's choice)
+- miniaudio (`vendor/miniaudio`): public domain (Unlicense) or MIT No Attribution, Copyright 2026 David Reid
+- subprocess.h (`vendor/sheredom`): public domain (Unlicense)
+- rotate-bits (`vendor/hash/rotate-bits`): MIT License, Copyright (c) 2021 William Casarin
+- SHA-1 by Steve Reid and SHA-256 by Igor Pavlov (`vendor/hash`): public domain
+- xxHash (`vendor/hash/xxhash`): BSD 2-Clause License, text below
+- llamafile sgemm (`ggml/src/ggml-cpu/llamafile/sgemm.cpp`, built by default): MIT License, Copyright 2024 Mozilla Foundation
+- YaRN RoPE scaling (`ggml/src/ggml-cpu/ops.cpp`, `ggml/src/ggml-metal/kernels/rope.metal`), based on https://github.com/jquesnelle/yarn: MIT License, Copyright (c) 2023 Jeffrey Quesnelle and Bowen Peng
+- base64.hpp (`common/base64.hpp`): public domain (Unlicense)
+
+For each MIT component, the MIT License text above applies with its own copyright line.
+
+xxHash Library
+Copyright (c) 2012-2021 Yann Collet
+All rights reserved.
+
+BSD 2-Clause License (https://www.opensource.org/licenses/bsd-license.php)
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice, this
+  list of conditions and the following disclaimer in the documentation and/or
+  other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ## Whisper model weights, OpenAI (MIT)
 

@@ -16,6 +16,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# The llama-server stamp check hashes scripts/llama-server.flags (build.rs). Same version as below.
+sha2 = "0.10.9"
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
