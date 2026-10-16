@@ -10,17 +10,18 @@
 //! `percent` and `eta_secs`.
 
 use crate::settings::{self, Backend, SecretKind, Settings, SettingsStore};
+use crate::sidecar::Sidecar;
 use crate::store::{SCHEMA_VERSION, Status, Store, can_transition, write_atomic};
 use crate::summarize;
 use crate::transcribe::engine::{self, Chunk, Device, Line, Segment};
 use crate::transcribe::filter;
-use crate::transcribe::model::{Check, Models};
+use crate::transcribe::model::{self, Check, Models};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::future::Future;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -159,6 +160,8 @@ struct Job {
     abort: Option<Box<dyn Fn() + Send>>,
     /// A cloud summary is in flight: a recording lets it run on (SUM-09).
     cloud: bool,
+    /// A built-in summary is in flight (stage 4 sets it): deleting the meeting stops the engine.
+    builtin: bool,
 }
 
 impl Job {
@@ -483,17 +486,12 @@ fn run_worker(
             }
         });
         if let Some(stdout) = stdout {
-            let mut reader = BufReader::new(stdout);
-            let mut line = Vec::new();
-            // Bytes, not text: a line that is not ours (a native library printing, bad UTF-8)
-            // is skipped instead of ending the read.
-            while reader.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+            engine::read_lines(stdout, |line| {
                 let _ = beat.send(());
-                if let Ok(line) = serde_json::from_slice(&line) {
+                if let Some(line) = line {
                     on_line(line);
                 }
-                line.clear();
-            }
+            });
         }
         // Stdout closed. The child stays in its job, killable, until it has really exited.
         let status = loop {
@@ -552,15 +550,34 @@ pub struct Queue<R: Runtime = Wry> {
     /// The keychain; tests put a stand-in here.
     secret: Secret,
     inner: Mutex<Inner>,
+    /// The built-in summary engine, one for the app (plan 5.3). Its lock comes after `inner`'s.
+    sidecar: Sidecar,
 }
 
 impl<R: Runtime> Queue<R> {
+    /// After `Models` is managed: the sidecar runs llama-server in its folder.
     pub fn new(app: AppHandle<R>, exe: PathBuf) -> Self {
+        let models = app.state::<Models>().dir.clone();
+        // No log folder (no home folder): llama-server runs without its log, never into the cwd.
+        let logs = app.path().app_log_dir().ok();
+        let (hashing, marking) = (app.clone(), app.clone());
+        let sidecar = Sidecar::new(
+            &exe,
+            models,
+            logs,
+            move || hashing.state::<Models>().check(&[&model::SUMMARY]) != Check::Intact,
+            move || {
+                if let Err(e) = marking.state::<SettingsStore>().mark_summary_gpu_failed() {
+                    log::error!("summary_gpu_failed 저장 실패: {e}");
+                }
+            },
+        );
         Self {
             app,
             exe,
             secret: Box::new(|name| settings::get_secret(SecretKind::Llm, name)),
             inner: Mutex::new(Inner::default()),
+            sidecar,
         }
     }
 
@@ -683,10 +700,12 @@ impl<R: Runtime> Queue<R> {
     }
 
     /// TRN-09, SUM-09: kills every worker and aborts local summaries at once. Their meetings go
-    /// back to the front of the line. Cloud summaries go on.
+    /// back to the front of the line. Cloud summaries go on. The built-in engine stops too, under
+    /// the same lock and without waiting for it (plan 5.3).
     pub fn recording_started(&self) {
         let mut inner = lock(&self.inner);
         inner.suspend();
+        self.sidecar.stop("녹음 시작");
         self.publish_positions(&mut inner);
     }
 
@@ -707,6 +726,9 @@ impl<R: Runtime> Queue<R> {
                 && let Some(job) = inner.jobs.get_mut(id)
             {
                 job.halt(Stop::Delete);
+                if job.builtin {
+                    self.sidecar.stop("요약 중인 회의 삭제");
+                }
             }
             self.publish_positions(&mut inner);
         }
@@ -717,13 +739,36 @@ impl<R: Runtime> Queue<R> {
 
     /// App exit (architecture 8.5): nothing new starts, every worker is killed and every summary
     /// aborted. Child processes outlive their parent otherwise. `Store::pause_busy` then writes
-    /// `paused`.
+    /// `paused`. The engine's supervisor only has its stdin closed: it ends llama-server itself.
     pub fn shutdown(&self) {
         let mut inner = lock(&self.inner);
         inner.closed = true;
         for job in inner.jobs.values_mut() {
             job.halt(Stop::Quit);
         }
+        self.sidecar.stop("앱 종료");
+    }
+
+    /// ENG18: llama-server holds the summary model open.
+    pub fn engine_running(&self) -> bool {
+        self.sidecar.running()
+    }
+
+    /// ENG3: a built-in summary of `id` is about to start the engine. Under the lock, with the
+    /// job's stop: `Stopped` if the run was stopped or deleted already, else the job is marked
+    /// `builtin` (a delete or its end stops the engine) and the generation for `Sidecar::start`
+    /// comes back, so a stop after this is never missed.
+    #[allow(dead_code)] // ponytail: stage 4's summarize() calls it; drop the allow then.
+    fn engine_generation(&self, id: &str) -> Result<u64, End> {
+        let mut inner = lock(&self.inner);
+        let Some(job) = inner.jobs.get_mut(id) else {
+            return Err(End::Stopped(Stop::Delete));
+        };
+        if let Some(stop) = job.stop {
+            return Err(End::Stopped(stop));
+        }
+        job.builtin = true;
+        Ok(self.sidecar.generation())
     }
 
     fn settings(&self) -> Settings {
@@ -1191,6 +1236,10 @@ impl<R: Runtime> Queue<R> {
                 Some(Stop::Delete | Stop::Quit)
             );
             let requeue = requeue && !halted;
+            // Plan 5.3: no idle engine. It would hold 4 GB while the next transcription runs.
+            if inner.jobs.get(id).is_some_and(|j| j.builtin) {
+                self.sidecar.stop("요약 끝");
+            }
             inner.sched.finished(id);
             inner.jobs.remove(id);
             if !requeue {
@@ -1596,6 +1645,123 @@ mod tests {
         assert!(ended.stalled);
         assert_eq!(exit_of(ended, None), Exit::Stalled);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A queue on the mock runtime whose engine is the sidecar tests' fake (no meeting runs).
+    fn engine_queue(
+        dir: &Path,
+        supervisor: &str,
+        reap: Duration,
+    ) -> (
+        tauri::App<tauri::test::MockRuntime>,
+        Queue<tauri::test::MockRuntime>,
+    ) {
+        use crate::sidecar::tests::{fake, fake_llama};
+        let app = tauri::test::mock_app();
+        app.manage(Models::new(dir.join("models")));
+        // For `end`, which pumps the line: no model, so nothing starts.
+        app.manage(Store::new(dir.join("meetings")).unwrap());
+        app.manage(SettingsStore::new(dir.join("settings.json")));
+        let fake = fake(dir, supervisor, fake_llama("ready"), reap);
+        let queue = Queue {
+            sidecar: fake.sidecar,
+            ..Queue::new(app.handle().clone(), PathBuf::new())
+        };
+        (app, queue)
+    }
+
+    /// SUM-09, plan 5.3: a recording stops the engine under the queue lock without waiting for it
+    /// (the supervisor here takes 2 s to go), and a summary begun before cannot start another.
+    #[test]
+    fn a_recording_stops_the_engine_at_once_and_none_starts_in_it() {
+        use crate::sidecar::tests::{gone, port};
+        let tmp = tempfile::tempdir().unwrap();
+        let (_app, queue) = engine_queue(tmp.path(), "deaf_supervisor", Duration::from_secs(2));
+        let generation = queue.sidecar.generation();
+        let endpoint = queue.sidecar.start(generation, Device::Gpu).unwrap();
+
+        let started = Instant::now();
+        queue.recording_started();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let again = queue.sidecar.start(generation, Device::Gpu);
+        assert!(matches!(again, Err(crate::sidecar::Failure::Stopped)));
+        // At most the one winding down, and then none.
+        assert!(gone(port(&endpoint.base_url)));
+    }
+
+    /// A run of `id` without a thread: the test plays its end.
+    fn running(queue: &Queue<tauri::test::MockRuntime>, id: &str) {
+        let mut inner = lock(&queue.inner);
+        inner.sched.enqueue(id);
+        inner.sched.start_next();
+        inner.jobs.insert(id.into(), Job::default());
+    }
+
+    /// `cancel` waits for the run to end, which the test plays once the stop has landed.
+    fn delete(queue: &Queue<tauri::test::MockRuntime>, id: &str) {
+        thread::scope(|s| {
+            let deleting = s.spawn(|| queue.cancel(id));
+            while lock(&queue.inner).jobs[id].stop.is_none() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            lock(&queue.inner).sched.finished(id);
+            deleting.join().unwrap();
+        });
+    }
+
+    /// ENG3: the generation comes only with the job's stop checked, and marks the job, so a delete
+    /// after it stops the engine and a delete before it leaves nothing to start.
+    #[test]
+    fn deleting_the_meeting_whose_builtin_summary_runs_stops_the_engine() {
+        use crate::sidecar::tests::{gone, port};
+        let tmp = tempfile::tempdir().unwrap();
+        let (_app, queue) = engine_queue(tmp.path(), "supervisor", Duration::from_secs(10));
+        assert!(matches!(
+            queue.engine_generation("nothing"),
+            Err(End::Stopped(Stop::Delete))
+        ));
+        running(&queue, "deleted");
+        delete(&queue, "deleted");
+        assert!(matches!(
+            queue.engine_generation("deleted"),
+            Err(End::Stopped(Stop::Delete))
+        ));
+
+        running(&queue, "builtin");
+        let generation = queue.engine_generation("builtin").ok().unwrap();
+        let endpoint = queue.sidecar.start(generation, Device::Gpu).unwrap();
+        // A meeting that is not using the engine leaves it alone.
+        running(&queue, "cloud");
+        delete(&queue, "cloud");
+        assert_eq!(queue.sidecar.generation(), generation);
+        delete(&queue, "builtin");
+        assert!(gone(port(&endpoint.base_url)));
+        let again = queue.sidecar.start(generation, Device::Gpu);
+        assert!(matches!(again, Err(crate::sidecar::Failure::Stopped)));
+    }
+
+    /// Plan 5.3 "즉시 종료": a built-in summary that ends takes the engine with it, and the summary
+    /// model may change again (ENG18).
+    #[test]
+    fn a_builtin_summary_ending_stops_the_engine() {
+        use crate::sidecar::tests::{gone, port};
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, queue) = engine_queue(tmp.path(), "supervisor", Duration::from_secs(10));
+        running(&queue, "a");
+        let generation = queue.engine_generation("a").ok().unwrap();
+        let endpoint = queue.sidecar.start(generation, Device::Gpu).unwrap();
+        let refused = crate::commands::not_in_use(&[&model::SUMMARY], queue.engine_running());
+        assert!(refused.is_err());
+
+        queue.end(&app.state::<Store>(), "a", End::Done(Status::Review));
+        assert!(gone(port(&endpoint.base_url)));
+        let until = Instant::now() + Duration::from_secs(5);
+        while queue.engine_running() {
+            assert!(Instant::now() < until, "still winding down");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let allowed = crate::commands::not_in_use(&[&model::SUMMARY], queue.engine_running());
+        assert!(allowed.is_ok());
     }
 
     /// The queue end to end on the mock runtime, with a shell script as the worker, the `tiny`

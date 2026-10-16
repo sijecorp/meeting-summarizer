@@ -2570,6 +2570,7 @@ name = "meeting-summarizer"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "getrandom 0.3.4",
  "hound",
  "keepawake",
  "keyring",

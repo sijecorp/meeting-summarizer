@@ -274,8 +274,6 @@ pub enum Scope {
     Summary,
 }
 
-// ponytail: ENG18 (refuse "요약 중에는 요약 모델을 바꿀 수 없습니다" while the sidecar runs)
-// lands here with the sidecar in stage 3.
 fn scoped(scope: Option<Scope>, settings: &Settings) -> Result<Vec<&'static ModelFile>, String> {
     if scope == Some(Scope::Summary) {
         return Ok(vec![&model::SUMMARY]);
@@ -285,6 +283,18 @@ fn scoped(scope: Option<Scope>, settings: &Settings) -> Result<Vec<&'static Mode
         files.push(&model::SUMMARY);
     }
     Ok(files)
+}
+
+/// ENG18: while llama-server runs it holds the summary model open, and Windows can neither replace
+/// nor delete an open file. `running`: `Queue::engine_running`.
+/// ponytail: checked once before the download or import, so one racing a summary's engine start
+/// can still meet an open file; that fails the download or import with an OS error, nothing worse.
+/// Check again before the rename if that shows up.
+pub(crate) fn not_in_use(files: &[&ModelFile], running: bool) -> Result<(), String> {
+    if running && files.iter().any(|f| f.file == model::SUMMARY.file) {
+        return Err("요약 중에는 요약 모델을 바꿀 수 없습니다".into());
+    }
+    Ok(())
 }
 
 /// E3: a file in place lets waiting meetings start without the rest of the chain; the summary
@@ -322,6 +332,7 @@ pub async fn download_models(
 ) -> Result<(), String> {
     let settings = settings.load().map(|l| l.settings).unwrap_or_default();
     let files = scoped(scope, &settings)?;
+    not_in_use(&files, queue.engine_running())?;
     let installed = app.clone();
     let result = models
         .download(
@@ -370,6 +381,7 @@ pub fn import_model(
 ) -> Result<ModelState, String> {
     let settings = settings.load().map(|l| l.settings).unwrap_or_default();
     let files = scoped(scope, &settings)?;
+    not_in_use(&files, queue.engine_running())?;
     arrived(&queue, models.import(Path::new(&path), &files)?);
     Ok(models.state(&files))
 }
@@ -586,6 +598,20 @@ mod tests {
             serde_json::from_str::<[Scope; 3]>(r#"["all", "transcription", "summary"]"#).unwrap(),
             [Scope::All, Scope::Transcription, Scope::Summary]
         );
+    }
+
+    #[test]
+    fn the_summary_model_cannot_change_while_the_engine_runs() {
+        let transcription = model::needed(&Settings::default().model).unwrap();
+        let all = [&transcription[..], &[&model::SUMMARY]].concat();
+        assert_eq!(
+            not_in_use(&all, true).unwrap_err(),
+            "요약 중에는 요약 모델을 바꿀 수 없습니다"
+        );
+        assert!(not_in_use(&[&model::SUMMARY], true).is_err());
+        assert!(not_in_use(&all, false).is_ok());
+        // The transcription files are not llama-server's.
+        assert!(not_in_use(&transcription, true).is_ok());
     }
 
     #[test]

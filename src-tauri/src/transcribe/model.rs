@@ -462,8 +462,8 @@ impl Models {
     }
 
     /// The worst of the files' checks. Every file is hashed, so each damaged one goes. While a
-    /// download or import runs, nothing is deleted: it may be installing that very file.
-    fn check(&self, files: &[&ModelFile]) -> Check {
+    /// download or import runs, nothing is deleted: it may be installing that very file. Blocking.
+    pub fn check(&self, files: &[&ModelFile]) -> Check {
         let busy = Busy::take(&self.busy, "").ok();
         let mark = Mutex::new(busy.is_none());
         let checks: Vec<Check> = files

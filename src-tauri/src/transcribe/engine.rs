@@ -8,9 +8,10 @@
 //! (`exit_now`), so a GPU backend crashing in teardown cannot undo a result already printed.
 
 use crate::audio::mix;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperVadContext,
@@ -155,12 +156,26 @@ enum Fail {
     Crash(String),
 }
 
-fn print(line: &Line) {
+/// One result line; the LLM supervisor (`sidecar`) writes its lines the same way.
+pub(crate) fn print(line: &impl Serialize) {
     // Stdout is line buffered: each line reaches the app as soon as it is printed.
     println!(
         "{}",
         serde_json::to_string(line).expect("worker line serializes")
     );
+}
+
+/// A child's stdout to its end, line by line: `Some` for each of our JSON lines, `None` for
+/// anything else (a native library printing, bad UTF-8), which is skipped instead of ending the
+/// read. Bytes, not text, for that reason. The queue reads workers and the sidecar its supervisor
+/// with it.
+pub(crate) fn read_lines<T: DeserializeOwned>(stdout: impl Read, mut each: impl FnMut(Option<T>)) {
+    let mut reader = BufReader::new(stdout);
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+        each(serde_json::from_slice(&line).ok());
+        line.clear();
+    }
 }
 
 /// Prints `pct` when it changes.

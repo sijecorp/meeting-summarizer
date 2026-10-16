@@ -2,12 +2,19 @@ mod audio;
 mod commands;
 mod queue;
 mod settings;
+mod sidecar;
 mod slack;
 mod store;
 mod summarize;
 mod transcribe;
 
-pub use transcribe::engine::worker_main;
+/// This executable as a child process, before the app builds: a transcription worker
+/// (architecture 5.3) or the summary engine's supervisor (6.6) runs and exits inside. Returns for
+/// the app.
+pub fn worker_main() {
+    sidecar::supervisor_main();
+    transcribe::engine::worker_main();
+}
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};

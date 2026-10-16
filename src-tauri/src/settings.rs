@@ -43,6 +43,9 @@ pub struct Settings {
     pub recorder_name: String,
     pub backend: Backend,
     pub gpu_failed: bool,
+    /// The summary engine's GPU died of its own fault and the CPU then worked (plan 5.3): automatic
+    /// mode runs llama-server on the CPU. Written by the sidecar the way `gpu_failed` is by the queue.
+    pub summary_gpu_failed: bool,
     pub model: String,
     pub model_base_url: String,
     pub input_device: Option<String>,
@@ -64,6 +67,7 @@ impl Default for Settings {
                 .unwrap_or_default(),
             backend: Backend::Auto,
             gpu_failed: false,
+            summary_gpu_failed: false,
             model: "large-v3-turbo-q8_0".into(),
             model_base_url: "https://huggingface.co".into(),
             input_device: None,
@@ -176,10 +180,13 @@ impl SettingsStore {
         {
             return Err(NEWER_VERSION.to_string());
         }
-        // `gpu_failed` belongs to the queue (architecture 5.4): a save from the settings screen
-        // keeps the stored value, and switching the backend to "GPU" clears it.
-        settings.gpu_failed = stored["gpu_failed"].as_bool().unwrap_or(false)
-            && !(settings.backend == Backend::Gpu && stored["backend"] != "gpu");
+        // `gpu_failed` belongs to the queue (architecture 5.4) and `summary_gpu_failed` to the
+        // sidecar: a save from the settings screen keeps the stored values, and switching the
+        // backend to "GPU" clears both (one device setting for both, plan 5.3).
+        let gpu_chosen = settings.backend == Backend::Gpu && stored["backend"] != "gpu";
+        let kept = |field: &str| stored[field].as_bool().unwrap_or(false) && !gpu_chosen;
+        settings.gpu_failed = kept("gpu_failed");
+        settings.summary_gpu_failed = kept("summary_gpu_failed");
         // `last_channel` belongs to sending (SND-04) the same way.
         settings.last_channel = stored["last_channel"].as_str().map(String::from);
         self.write(settings)
@@ -200,6 +207,11 @@ impl SettingsStore {
     /// The GPU crashed twice on one chunk: automatic mode uses the CPU from now on (TRN-06).
     pub fn mark_gpu_failed(&self) -> Result<(), String> {
         self.patch(|s| s.gpu_failed = true)
+    }
+
+    /// The summary engine's GPU failed and its CPU worked (plan 5.3).
+    pub fn mark_summary_gpu_failed(&self) -> Result<(), String> {
+        self.patch(|s| s.summary_gpu_failed = true)
     }
 
     /// SND-04: a send went to this webhook, so it is the next default.
@@ -454,6 +466,25 @@ mod tests {
             })
             .unwrap();
         assert!(!store.load().unwrap().settings.gpu_failed);
+    }
+
+    #[test]
+    fn summary_gpu_failed_survives_settings_saves_until_gpu_is_chosen() {
+        let (_tmp, store) = store();
+        store.save(Settings::default()).unwrap();
+        store.mark_summary_gpu_failed().unwrap();
+        // The settings screen sends what it loaded before the sidecar marked the GPU.
+        store.save(Settings::default()).unwrap();
+        let loaded = store.load().unwrap().settings;
+        assert!(loaded.summary_gpu_failed && !loaded.gpu_failed);
+        store
+            .save(Settings {
+                backend: Backend::Gpu,
+                summary_gpu_failed: true,
+                ..Settings::default()
+            })
+            .unwrap();
+        assert!(!store.load().unwrap().settings.summary_gpu_failed);
     }
 
     #[test]
