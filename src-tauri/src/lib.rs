@@ -91,9 +91,9 @@ fn clear_notifications() {
 }
 
 const TRAY: &str = "main";
-/// Architecture 10.3 colors: `danger`, `mainBlue`, `warning`.
+/// Architecture 10.3 colors: `danger`, `accent` (a muted `mainBlue`), `warning`.
 const RECORDING_DOT: [u8; 3] = [0xf6, 0x59, 0x59];
-const PROCESSING_DOT: [u8; 3] = [0x55, 0x50, 0xff];
+const PROCESSING_DOT: [u8; 3] = [0x49, 0x50, 0xb0];
 const UNSENT_DOT: [u8; 3] = [0xff, 0x9b, 0x3f];
 
 /// APP-04: the tray's dot and tooltip. Recording beats processing beats unsent. While recording,

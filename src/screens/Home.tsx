@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
-import { Check, CircleAlert, TriangleAlert } from "lucide-react";
+import { Check, ChevronRight, CircleAlert, TriangleAlert } from "lucide-react";
 import { motion } from "motion/react";
 import {
   Banner,
@@ -113,7 +113,7 @@ function stateOf(m: MeetingItem, p: Progress | undefined, name: string): State {
     // says transcribing.
     const summarizing = (p?.status === "summarizing" ? p.status : m.status) === "summarizing";
     return {
-      mark: summarizing ? undefined : <Bars live className="h-3 text-brand" />,
+      mark: summarizing ? undefined : <Bars className="h-3 text-brand" />,
       text: line?.text ?? STATUS_LABEL[m.status],
       // "전사 42% · 약 3분 남음": the percent alone would not say what it counts.
       lead: p?.status === "transcribing" && p.chunks > 0 ? "전사" : undefined,
@@ -178,8 +178,7 @@ function Row({
   const body = (
     <>
       <span className="w-16 shrink-0 leading-tight">
-        {/* A time that never changes: Instrument Serif's italic numerals. */}
-        <span className="block font-display text-title text-ink-2 italic">{hhmm(m.created_at)}</span>
+        <span className="block text-label text-ink-2 tabular-nums">{hhmm(m.created_at)}</span>
         {day && <span className="block text-caption text-ink-2">{day}</span>}
       </span>
       <span className="min-w-0 flex-1">
@@ -190,7 +189,7 @@ function Row({
           layoutId={morph ? `title-${m.id}` : undefined}
           layout={morph ? "position" : undefined}
           transition={titleMove}
-          className={`block truncate font-display text-[1.125rem] leading-snug font-medium ${m.title ? "" : "text-ink-2"}`}
+          className={`block truncate text-body font-medium ${m.title ? "" : "text-ink-2"}`}
         >
           {name}
         </motion.span>
@@ -422,15 +421,11 @@ export default function Home({
             <Kbd>{SHORTCUT.start.label}</Kbd>
           </span>
         </button>
-        <ol className="flex flex-wrap items-baseline justify-center gap-x-2 gap-y-1 text-label text-ink-2">
+        <ol className="flex flex-wrap items-center justify-center gap-x-2 gap-y-1 text-label text-ink-2">
           {["녹음", "이 PC에서 전사", "요약 검토", "Slack으로 보내기"].map((step, i) => (
-            <li key={step} className="flex items-baseline gap-1.5">
-              {i > 0 && (
-                <span aria-hidden className="mr-0.5">
-                  —
-                </span>
-              )}
-              <span className="font-display text-title text-ink italic">{i + 1}</span>
+            <li key={step} className="flex items-center gap-1.5">
+              {i > 0 && <ChevronRight aria-hidden className="mr-0.5 size-3.5 text-ink-3" />}
+              <span className="font-semibold text-ink tabular-nums">{i + 1}</span>
               {step}
             </li>
           ))}
@@ -502,7 +497,7 @@ export default function Home({
         <header className="flex flex-wrap items-center justify-between gap-4">
           <h1 tabIndex={-1} className="font-display text-display-m outline-hidden">
             {today.toLocaleDateString("ko-KR", { month: "long", day: "numeric" })}{" "}
-            <span className="font-display text-title text-ink-2">
+            <span className="font-sans text-title font-normal text-ink-2">
               {today.toLocaleDateString("ko-KR", { weekday: "long" })}
             </span>
           </h1>
@@ -532,12 +527,12 @@ export default function Home({
         >
           {groups.map((g) => (
             <section key={g.name} aria-label={g.name}>
-              <motion.h2 variants={rowVariants} className="flex items-baseline gap-2 font-display text-title">
+              <motion.h2 variants={rowVariants} className="flex items-baseline gap-2 text-title">
                 {g.name}
                 {g.now && (
                   <>
                     {" "}
-                    <span className="font-display text-ink-2 italic">{g.rows.length}</span>
+                    <span className="font-normal text-ink-2 tabular-nums">{g.rows.length}</span>
                   </>
                 )}
               </motion.h2>

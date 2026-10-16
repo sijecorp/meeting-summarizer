@@ -81,15 +81,26 @@ export function Page({
   );
 }
 
-/** The logo's three bars, also the sign of transcribing. They move only while `live`; the
- * attribute says which, for tests. */
-export function Bars({ live, className = "" }: { live: boolean; className?: string }) {
+/** The company logo, in the text color. */
+export function SijeLogo({ className }: { className?: string }) {
   return (
-    <span aria-hidden data-live={live} className={`flex items-end gap-[2px] ${className}`}>
+    <svg viewBox="98.2 98.1 761.8 271.2" fill="currentColor" role="img" aria-label="SIJE" className={className}>
+      <path d="M344.7,113.3v27.5h23.3v185.8h-23.3v27.5c0,8.4,6.8,15.2,15.2,15.2h82.9v-42.7h-24.3v-185.8h24.3v-42.6h-82.9c-8.4,0-15.2,6.8-15.2,15.2Z" />
+      <path d="M587.6,98.1h-86.2v42.6h51.5v185.8h-51.5v42.7h86.2c8.7,0,15.8-6.8,15.8-15.2V113.3c0-8.4-7.1-15.2-15.8-15.2Z" />
+      <path d="M860,140.7v-42.6h-174.7c-8.4,0-15.2,6.8-15.2,15.2v240.8c0,8.4,6.8,15.2,15.2,15.2h174.7v-42.7h-140.4v-77.7h134.4v-42.1h-134.4v-66.1h140.4Z" />
+      <path d="M151.8,206.6v-39.6c0-16.9,9.6-26.2,26.9-26.2h118.1v-42.7h-133.8c-12.6.3-22.4,2.9-30,7.4-8.6,4.6-15.7,11.5-20.7,19.8-6.1,9.4-9.6,21.9-9.6,38.4v44.7h0v40.2h149.4v51.8c0,16.9-9.6,26.2-26.9,26.2h-127v42.7h142.8c12.6-.3,22.4-2.9,30-7.4,8.6-4.6,15.7-11.5,20.7-19.8,6.1-9.4,9.6-21.9,9.6-38.4v-97.1h-149.4Z" />
+    </svg>
+  );
+}
+
+/** Three bars, the sign of transcribing. */
+export function Bars({ className = "" }: { className?: string }) {
+  return (
+    <span aria-hidden className={`flex items-end gap-[2px] ${className}`}>
       {[0.55, 1, 0.75].map((height, i) => (
         <span
           key={i}
-          className={`w-[3px] origin-bottom rounded-full bg-current ${live ? "motion-safe:animate-bar" : ""}`}
+          className="w-[3px] origin-bottom rounded-full bg-current motion-safe:animate-bar"
           // Out of step, so the three never rise together.
           style={{ height: `${height * 100}%`, animationDelay: `${i * -0.3}s` }}
         />

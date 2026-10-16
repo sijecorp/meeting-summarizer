@@ -1,6 +1,6 @@
 import { useEffect, useRef, type ComponentProps, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Check, CircleAlert, Copy, Send, X } from "lucide-react";
+import { Check, ChevronRight, CircleAlert, Copy, Send, X } from "lucide-react";
 import { AnimatePresence, motion, useTransform, type Variants } from "motion/react";
 import {
   Bars,
@@ -132,7 +132,7 @@ export function parseDoc(text: string): Block[] {
 function Line({ block: b }: { block: Exclude<Block, { kind: "item" }> }) {
   if (b.kind === "heading") {
     return (
-      <h2 data-line={b.line} className="mb-1 font-display text-title">
+      <h2 data-line={b.line} className="mb-1 text-title">
         {highlight(b.text)}
       </h2>
     );
@@ -253,7 +253,7 @@ function Ticker({ value }: { value: number }) {
   return <motion.span className="tabular-nums">{text}</motion.span>;
 }
 
-/** Where a meeting stands before review: 녹음 ✓ — 전사 42% — 요약 — 검토, then a line of detail.
+/** Where a meeting stands before review: 녹음 ✓ › 전사 42% › 요약 › 검토, then a line of detail.
  * Plain text, never a live region; a screen reader gets the value from a hidden progress bar. */
 export function Steps({ meta, progress: p, failed }: { meta: Meta; progress?: Progress; failed: boolean }) {
   const now = phase(meta, p);
@@ -281,7 +281,7 @@ export function Steps({ meta, progress: p, failed }: { meta: Meta; progress?: Pr
   ) : now === "waiting" ? (
     <Dots />
   ) : transcribing ? (
-    <Bars live className="h-3 text-brand" />
+    <Bars className="h-3 text-brand" />
   ) : null;
   return (
     <div className="space-y-1">
@@ -292,7 +292,7 @@ export function Steps({ meta, progress: p, failed }: { meta: Meta; progress?: Pr
             aria-current={i === at ? "step" : undefined}
             className={`flex items-center gap-1.5 ${i === at ? "text-ink" : ""}`}
           >
-            {i > 0 && <span aria-hidden>—</span>}
+            {i > 0 && <ChevronRight aria-hidden className="mr-0.5 size-3.5 text-ink-3" />}
             {i === at && mark}
             {step}
             {i < at && (
@@ -380,7 +380,7 @@ function PanelBody({
   return (
     <>
       <div className="flex items-center justify-between gap-2 border-b border-line py-2 pr-2 pl-5">
-        <h2 ref={heading} tabIndex={-1} className="font-display text-title outline-hidden">
+        <h2 ref={heading} tabIndex={-1} className="text-body font-semibold outline-hidden">
           전사본
         </h2>
         <div className="flex items-center gap-1">

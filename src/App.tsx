@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent } from "react";
 import { Settings as SettingsIcon } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
-import { Banner, Bars, phase, Present, WIDTH, withModifier } from "@/components/common";
+import { Banner, phase, Present, SijeLogo, WIDTH, withModifier } from "@/components/common";
 import Dock from "@/components/Dock";
 import {
   AlertDialog,
@@ -315,11 +315,11 @@ export default function App() {
     <div className="min-h-screen">
       <header className="sticky top-0 z-10 flex h-12 items-center justify-between gap-4 border-b border-line bg-paper/92 px-6 backdrop-blur-md">
         <button
-          className="flex items-center gap-2 rounded-md font-display text-title"
+          className="flex items-center gap-2.5 rounded-md text-body font-semibold"
           onClick={(e) => (screen.name === "meeting" ? leave(screen.id, e) : home(e))}
         >
-          {/* Still unless something is being transcribed or summarized. */}
-          <Bars live={running.length > 0} className="h-3.5 text-brand" />
+          <SijeLogo className="h-3.5 w-auto text-ink" />
+          <span aria-hidden className="h-4 w-px bg-line" />
           회의 요약
         </button>
         <Button variant="ghost" size="icon" aria-label="설정" onClick={() => go({ name: "settings" })}>

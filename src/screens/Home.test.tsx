@@ -235,7 +235,7 @@ test("an untitled row goes by its length, or as the recording running", () => {
     [],
   );
 
-  const names = screen.getAllByRole("listitem").map((li) => li.querySelector(".font-display.truncate")?.textContent);
+  const names = screen.getAllByRole("listitem").map((li) => li.querySelector(".text-body.truncate")?.textContent);
   expect(names).toEqual(["녹음 중인 회의", "42분 녹음", "1시간 15분 녹음", "1분 미만 녹음", "제목 없는 녹음"]);
   expect(screen.getByRole("button", { name: "다시 시도 (1분 미만 녹음)" })).toBeTruthy();
 });
@@ -250,7 +250,7 @@ const ago = (days: number, hour: number) => {
 const titles = (region: HTMLElement) =>
   within(region)
     .getAllByRole("listitem")
-    .map((li) => li.querySelector(".font-display.truncate")?.textContent);
+    .map((li) => li.querySelector(".text-body.truncate")?.textContent);
 
 // Design-system 6.4: what needs the recorder on top, the rest by day, each meeting once.
 test("groups meetings into 지금 할 일 and days, each once", () => {

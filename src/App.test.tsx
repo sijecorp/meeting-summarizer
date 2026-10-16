@@ -408,29 +408,6 @@ test("the dock follows progress events and opens the meeting at the head of the 
   expect(await screen.findByRole("progressbar", { name: "전사 진행률" })).toBeTruthy();
 });
 
-// Design-system 6.1: the logo's bars move only while something is transcribed or summarized.
-test("the header logo moves only while a meeting is being processed", async () => {
-  let list = [meeting("a", "recorded")];
-  mock((cmd) => {
-    if (cmd === "list_meetings") return list;
-  });
-
-  const { container } = render(<App />);
-  expect(await screen.findByRole("button", { name: "처리 중 1 · a · 대기 중" })).toBeTruthy();
-  const moving = () => container.querySelector("header [data-live]")?.getAttribute("data-live");
-  expect(moving()).toBe("false");
-
-  list = [meeting("a", "transcribing")];
-  await act(() => emit("meeting://progress", progress("a")));
-  expect(await screen.findByRole("button", { name: "처리 중 1 · a · 전사 42%" })).toBeTruthy();
-  expect(moving()).toBe("true");
-
-  list = [meeting("a", "review")];
-  await act(() => emit("meeting://progress", progress("a", { status: "review" })));
-  await waitFor(() => expect(screen.queryByRole("button", { name: /^처리 중/ })).toBeNull());
-  expect(moving()).toBe("false");
-});
-
 // While summarizing, `percent` is requests done; one request has nothing to count.
 test("the dock counts a summary as running, with its requests only past one", async () => {
   const summarizing = { status: "summarizing" as const, eta_secs: null };

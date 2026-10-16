@@ -194,7 +194,7 @@ test("parses a summary into headings, items with owner and due date, 없음 and 
 });
 
 // Design-system 6.6: a formatted document, not Markdown source.
-test("the summary reads as a document: serif headings, owner chips, due dates, 없음 and 미정 on the marker", async () => {
+test("the summary reads as a document: headings, owner chips, due dates, 없음 and 미정 on the marker", async () => {
   const summary = [
     "## 결정사항",
     "- 파일럿은 12명으로 시작한다",
@@ -208,7 +208,8 @@ test("the summary reads as a document: serif headings, owner chips, due dates, �
   render(<Meeting id={id} {...props} />);
 
   const heading = await screen.findByRole("heading", { level: 2, name: "액션 아이템" });
-  expect(heading.className).toMatch(/font-display text-title/);
+  expect(heading.className).toMatch(/text-title/);
+  expect(heading.className).not.toMatch(/font-display/);
   const doc = heading.closest("[class*=whitespace-pre-wrap]") as HTMLElement;
   expect(doc.textContent).not.toMatch(/##|- |\[|\(/);
   const [plain, owned, undecided] = within(doc).getAllByRole("listitem");
@@ -982,9 +983,9 @@ test("a running meeting shows its step, chunk, percent and time left", async () 
   const steps = screen.getByRole("list", { name: "처리 단계" });
   expect(within(steps).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
     "녹음완료",
-    "—전사42%",
-    "—요약",
-    "—검토",
+    "전사42%",
+    "요약",
+    "검토",
   ]);
   expect(within(steps).getByText("42%").closest("li")?.getAttribute("aria-current")).toBe("step");
   expect(screen.getByRole("progressbar", { name: "전사 진행률" }).getAttribute("aria-valuenow")).toBe("42");
@@ -1087,7 +1088,7 @@ test("without a connection, the hint opens the 요약(LLM) tab", async () => {
   expect(screen.queryByText("LLM 연결을 추가하면 요약합니다")).toBeNull();
   // Still at 전사, as the event says, not at 요약 with no mark.
   expect(within(steps).getAllByRole("listitem").find((li) => li.getAttribute("aria-current"))?.textContent).toBe(
-    "—전사",
+    "전사",
   );
   between.unmount();
 

@@ -8,7 +8,6 @@
    unicode-range, so only the ranges on screen are read. */
 @import "pretendard/dist/web/variable/pretendardvariable-dynamic-subset.css";
 @import "@fontsource/instrument-serif";
-@import "@fontsource/instrument-serif/400-italic.css";
 @import "@fontsource-variable/noto-serif-kr";
 
 /* Light only (architecture 10.3): `dark:` follows a `.dark` class the app never sets, never the
@@ -19,12 +18,13 @@
 @theme {
   --font-sans: "Pretendard Variable", Pretendard, -apple-system, "Apple SD Gothic Neo", "Malgun Gothic",
     system-ui, sans-serif;
-  /* Serif titles and big numbers: Instrument Serif has no Hangul, so Hangul falls through to Noto
-     Serif KR. Neither has tabular figures (tnum): timers stay on Pretendard's. */
+  /* Serif only as an accent on a few page titles (design-system 2): Instrument Serif has no Hangul,
+     so Hangul falls through to Noto Serif KR. Neither has tabular figures (tnum). */
   --font-display: "Instrument Serif", "Noto Serif KR Variable", serif;
 
-  /* The weights are Noto Serif KR's, kept near Instrument Serif's only 400 so mixed titles ("Q3
-     로드맵 리뷰") weigh alike. Instrument Serif is never made bold (html below). */
+  /* The display-* weights are Noto Serif KR's, kept near Instrument Serif's only 400 so mixed
+     titles ("Q3 로드맵 리뷰") weigh alike. Instrument Serif is never made bold (html below).
+     `title` and below are Pretendard. */
   --text-display-xl: 5rem;
   --text-display-xl--line-height: 1;
   --text-display-xl--letter-spacing: -0.02em;
@@ -37,10 +37,10 @@
   --text-display-m--line-height: 1.25;
   --text-display-m--letter-spacing: -0.015em;
   --text-display-m--font-weight: 450;
-  --text-title: 1.25rem;
-  --text-title--line-height: 1.35;
+  --text-title: 1.125rem;
+  --text-title--line-height: 1.4;
   --text-title--letter-spacing: -0.01em;
-  --text-title--font-weight: 500;
+  --text-title--font-weight: 600;
   --text-body-doc: 1rem;
   --text-body-doc--line-height: 1.75;
   --text-body-doc--letter-spacing: 0;
@@ -69,9 +69,9 @@
   --color-line-strong: #8f897d;
   /* The design system's `accent`. Tailwind's `accent` stays shadcn's hover surface, so the brand
      color is `primary` (shadcn) or `brand` (our own code). */
-  --color-brand: #5550ff;
-  --color-accent-press: #4440cc;
-  --color-accent-tint: #eeedff;
+  --color-brand: #4950b0;
+  --color-accent-press: #393d95;
+  --color-accent-tint: #e6e8fb;
   --color-dock: #1f1d1a;
   --color-dock-2: #b8b2a7;
   --color-rec: #f65959;
@@ -82,7 +82,7 @@
   --color-warn-bg: #fff5ec;
   --color-ok-line: #1eba66;
   --color-ok-bg: #f4fcf7;
-  --color-mic: #5550ff;
+  --color-mic: #4950b0;
   --color-system: #5ec9e0;
 
   /* Shape and depth (design-system 4). Pills use rounded-full. */
@@ -135,7 +135,7 @@
   --card-foreground: #1f1d1a;
   --popover: #ffffff; /* surface */
   --popover-foreground: #1f1d1a;
-  --primary: #5550ff; /* brand */
+  --primary: #4950b0; /* brand */
   --primary-foreground: #ffffff;
   --secondary: #efece5; /* sunken */
   --secondary-foreground: #1f1d1a;
@@ -146,12 +146,12 @@
   --destructive: #dd5050; /* danger-line: borders and icons only, never text */
   --border: #e6e2d9; /* line */
   --input: #8f897d; /* line-strong: control boundaries, 3.5:1 on surface (WCAG 1.4.11) */
-  --ring: #5550ff; /* brand */
+  --ring: #4950b0; /* brand */
   --radius: 0.625rem;
 }
 
 @theme inline {
-  --font-heading: var(--font-display);
+  --font-heading: var(--font-sans);
   --color-ring: var(--ring);
   --color-input: var(--input);
   --color-border: var(--border);
@@ -188,12 +188,12 @@
     outline: 2px solid var(--ring);
     outline-offset: 2px;
   }
-  /* No faux bold: Instrument Serif keeps its one weight beside a 450 Hangul title. Italic may still
-     be slanted, but only Instrument Serif's numerals are set in italic. Hangul breaks between words,
-     never inside one; a long URL or channel name still breaks anywhere (design-system 2). */
+  /* No faux bold: Instrument Serif keeps its one weight beside a 450 Hangul title. Nothing is set
+     in italic. Hangul breaks between words, never inside one; a long URL or channel name still
+     breaks anywhere (design-system 2). */
   html {
     @apply font-sans;
-    font-synthesis: style;
+    font-synthesis: none;
     word-break: keep-all;
     overflow-wrap: break-word;
     /* A focused element scrolls clear of the sticky header (48px) and the fixed bottom stack (a bar

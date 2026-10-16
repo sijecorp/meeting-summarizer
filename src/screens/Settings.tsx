@@ -1021,13 +1021,13 @@ export default function Settings({
   );
 }
 
-/** A tab's panel: its serif title and what it is for, over its groups. Hidden, not unmounted. */
+/** A tab's panel: its title and what it is for, over its groups. Hidden, not unmounted. */
 function Section({ tab, open, children }: { tab: SettingsTab; open: SettingsTab; children: ReactNode }) {
   const { label, about } = TABS.find((t) => t.value === tab)!;
   return (
     <section hidden={tab !== open} className="space-y-5">
       <header className="space-y-1">
-        <h2 className="font-display text-title">{label}</h2>
+        <h2 className="text-title">{label}</h2>
         <p className="text-ink-2">{about}</p>
       </header>
       {children}
