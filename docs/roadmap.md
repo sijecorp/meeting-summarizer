@@ -44,7 +44,7 @@
 
 **끝 조건**
 - S1~S5 각각 통과 또는 "실패 시" 경로가 결정됨.
-- `whisper-rs` 버전이 고정됨. (M3에서 0.16.0으로 고정했다. Windows MSVC + Vulkan 빌드 확인은 M6 배포 워크플로의 첫 실행에 남아 있다)
+- `whisper-rs` 버전이 고정됨. (M3에서 0.16.0으로 고정했다. Windows MSVC + Vulkan 빌드는 M6 배포 워크플로에서 확인했다(2026-10-16))
 - CPU 폴백 기본 모델이 정해짐.
 - 용어집을 Whisper에도 넣을지 결정됨.
 - M1~M6 작업량을 다시 추정함.
@@ -219,12 +219,12 @@
 
 **M6 진행 메모**
 - 끝난 것 (2026-10-16): ONB-03 설정 오디오 탭의 시스템 오디오 테스트와 마이크 입력 레벨 미터, ONB-06 Slack 탭의 테스트 메시지(아키텍처 4.4, 7.1, 디자인 시스템 7의 "M6에서 정한 것"). 단위 테스트(테스트음, dBFS 판정, 미터 눈금, 테스트 메시지 본문과 주소 고르기)와 화면 테스트까지다.
-- 끝난 것 (2026-10-16): 배포 설정(아키텍처 11.3). `.github/workflows/build.yml`, `src-tauri/tauri.windows.conf.json`(NSIS `currentUser`, `vulkan-1.dll`), `src-tauri/Entitlements.plist`, `src-tauri/build.rs`의 링크 수정, `docs/install.md`, `THIRD_PARTY_NOTICES.md`(Rust·npm 의존성 전체 목록은 아직이고 `cargo about`이 후속이다). 로컬 `tauri build`로 ad-hoc 서명된 `.app`·`.dmg`를 확인했다(`Signature=adhoc`, Hardened Runtime, `codesign --verify --deep --strict` 통과). 워크플로는 아직 한 번도 실행하지 않았고, Windows 빌드는 확인하지 않았다.
+- 끝난 것 (2026-10-16): 배포 설정(아키텍처 11.3). `.github/workflows/build.yml`, `src-tauri/tauri.windows.conf.json`(NSIS `currentUser`, `vulkan-1.dll`), `src-tauri/Entitlements.plist`, `src-tauri/build.rs`의 링크 수정, `docs/install.md`, `THIRD_PARTY_NOTICES.md`(Rust·npm 의존성 전체 목록은 아직이고 `cargo about`이 후속이다). 로컬 `tauri build`로 ad-hoc 서명된 `.app`·`.dmg`를 확인했다(`Signature=adhoc`, Hardened Runtime, `codesign --verify --deep --strict` 통과). 워크플로는 세 번째 실행에서 두 설치 파일을 만들었다(Windows는 Ninja와 짧은 target 경로가 필요했다, 아키텍처 11.3). Windows는 빌드만 확인했고 실제 PC에서 설치·실행은 아직이다.
 - 사람이 해야 하는 것:
   - macOS 실기기: 시스템 오디오 녹음 권한이 없을 때와 있을 때 시스템 오디오 테스트가 실패·통과하는지, 테스트음이 거슬리지 않는지 본다. 출력 음량을 꺼도 통과하는지 기록한다(tap이 음량 전의 소리를 듣는다고 보고 실패 안내에서 음량을 뺐다). 블루투스 헤드셋처럼 지연이 큰 출력에서 1.2초 듣기로 충분한지와 -40 dBFS 기준이 맞는지는 `cargo test --lib on_this_machine -- --ignored --nocapture`(`audio/check.rs`, 실제 장치로 테스트음을 내고 들은 dBFS를 찍는다)로 확인한다. 마이크 권한을 아직 묻지 않은 상태에서 마이크 테스트를 누르면 팝업이 뜨고, 허용 뒤 레벨이 움직이는지 본다. 테스트 중에 ⌘R로 녹음을 시작하면 테스트가 멈추고 `system.wav`에 테스트음이 없는지 본다.
   - Windows 실기기: 같은 점검. Windows 코드(WASAPI 루프백으로 듣기, 고른 출력 장치로 재생)는 여기서 빌드하지 못해 확인하지 않았다.
   - 실제 Slack 테스트 채널로 테스트 메시지를 보내 문구와 녹음자 이름 줄을 본다.
-  - Actions에서 build를 처음 실행해 Windows 빌드와 두 설치 파일을 확인한다. 비공개 저장소라 macOS 실행 시간은 10배로 청구된다.
+  - Windows PC에 setup.exe를 설치해 앱이 뜨는지(`vulkan-1.dll`이 실행 파일 옆에 있는지), GPU 전사와 시스템 오디오 테스트가 되는지 확인한다. 빌드는 Actions에서 확인했다(2026-10-16).
   - 받은 `.dmg`를 다른 Mac에 설치하고("그래도 열기") 녹음이 0 버퍼가 아닌지, 업데이트 뒤 권한을 다시 물을 때 `docs/install.md`의 안내대로 풀리는지 본다(아키텍처 12.2).
 
 **선행 외부 조건**: Open Question 1(Apple Developer 계정)은 해결되지 않았다. 사용자 결정(2026-10-16)으로 대체 경로를 계획으로 삼는다: macOS는 ad-hoc 서명만 한 내부 배포 빌드다(공증 없음). 계정이 생기면 워크플로의 주석 처리된 `APPLE_*` Secrets를 채우면 된다.

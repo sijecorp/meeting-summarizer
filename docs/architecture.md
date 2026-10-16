@@ -270,7 +270,7 @@ queue.rs ──spawn── 앱 실행 파일 --plan-chunks {회의 폴더} {VAD 
 ### 5.4 백엔드 선택과 크래시 판정 (TRN-05, TRN-06)
 
 - **빌드**: macOS는 `metal`, Windows는 `vulkan` feature로 빌드한다. CPU 사용은 런타임에 `WhisperContextParameters::use_gpu(false)`로 고른다.
-- **Vulkan 로더 동봉**: Vulkan 빌드는 `vulkan-1.dll`에 로드 타임 의존성이 있다. 이 DLL이 없는 PC에서는 앱이 아예 시작되지 않는다. 그래서 LunarG Vulkan Loader(Apache-2.0)의 `vulkan-1.dll`을 실행 파일 옆에 함께 설치한다. `src-tauri/tauri.windows.conf.json`의 `bundle.resources`(`"vulkan-1.dll": "vulkan-1.dll"`)로 NSIS가 `$INSTDIR`(실행 파일 옆)에 설치하고, 제거할 때 지운다. 원본은 CI가 Vulkan SDK 1.4.313.2의 런타임에서 `src-tauri/vulkan-1.dll`로 복사한다(11.3). 실제 Windows PC에서는 첫 Actions 실행 뒤에 확인한다.
+- **Vulkan 로더 동봉**: Vulkan 빌드는 `vulkan-1.dll`에 로드 타임 의존성이 있다. 이 DLL이 없는 PC에서는 앱이 아예 시작되지 않는다. 그래서 LunarG Vulkan Loader(Apache-2.0)의 `vulkan-1.dll`을 실행 파일 옆에 함께 설치한다. `src-tauri/tauri.windows.conf.json`의 `bundle.resources`(`"vulkan-1.dll": "vulkan-1.dll"`)로 NSIS가 `$INSTDIR`(실행 파일 옆)에 설치하고, 제거할 때 지운다. 원본은 CI가 Vulkan SDK 1.4.313.2의 런타임에서 `src-tauri/vulkan-1.dll`로 복사한다(11.3). CI 빌드는 통과했다(11.3). 설치한 뒤 DLL이 실행 파일 옆에 놓이고 앱이 뜨는지는 실제 Windows PC에서 확인한다.
 - **자동 선택 순서**:
   1. `settings.json`에 `gpu_failed=true`가 있으면 CPU를 쓴다.
   2. GPU 컨텍스트 생성을 시도하고, 실패하면 CPU로 바꾼다. GPU 장치가 아예 없으면 whisper.cpp가 스스로 CPU로 돈다. 이 경우 워커는 `gpu`로 보고하므로 `meta.json`의 `backend`가 실제와 다를 수 있다.
@@ -799,7 +799,8 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 - **워크플로** (`.github/workflows/build.yml`): 수동 실행(workflow_dispatch)이나 `v*` 태그 push에서 macOS Apple Silicon(`aarch64-apple-darwin`, `.dmg`)과 Windows x64(NSIS `-setup.exe`)를 만든다. GitHub 릴리스는 만들지 않고 workflow artifact로 올리며, artifact는 30일 뒤 지워진다. 액션은 모두 커밋 SHA로 고정했다. 태그 실행이면 태그(`v` 제외)가 `tauri.conf.json`의 `version`과 같은지 먼저 확인한다.
 - **번들 대상**: macOS `app`·`dmg`(`tauri.conf.json`), Windows `nsis`(`tauri.windows.conf.json`, Tauri가 Windows에서 병합한다).
 - **배포**: 관리자가 artifact를 OneDrive에 올리고 동료에게 링크를 보낸다. 설치·업데이트·삭제 안내는 `docs/install.md`다. 자동 업데이트는 없다(eng review D2).
-- macOS 빌드는 로컬 `tauri build`로 확인했다(11.1의 ad-hoc 서명). 워크플로는 아직 실행하지 않았고, Windows 빌드는 첫 Actions 실행에서 처음 확인한다.
+- **Windows 빌드 환경**: `windows-latest`(Visual Studio 18 2026, CMake 4.4)에서 두 가지를 맞췄다. (1) Visual Studio 생성기로는 ggml-vulkan이 따로 구성하는 `vulkan-shaders-gen`이 컴파일러를 찾지 못해, MSVC 개발 환경(`ilammy/msvc-dev-cmd`)에서 Ninja로 빌드한다(`CMAKE_GENERATOR_x86_64_pc_windows_msvc: Ninja`, cmake 크레이트가 대상 이름이 붙은 변수를 먼저 읽어 macOS에는 닿지 않는다). (2) `src-tauri\target` 아래에서는 그 하위 빌드의 pdb 경로가 269자로 MSVC의 260자 한계를 넘어(C1041), `CARGO_TARGET_DIR`을 `D:\a\t`로 둔다. rust-cache는 `CARGO_TARGET_DIR`을 읽지 않아 같은 폴더를 `src-tauri` 기준 상대 경로로 받는다.
+- 확인: 2026-10-16 첫 성공 실행(run 38839884897)에서 두 설치 파일이 나왔다(macOS dmg 12MiB, Windows setup.exe 17MiB, Windows 빌드 약 27분). 앞의 두 실행은 위 두 문제로 Windows만 실패했다. 실제 PC에서 설치·실행은 아직이다(12.2).
 
 ## 12. 테스트 전략
 
