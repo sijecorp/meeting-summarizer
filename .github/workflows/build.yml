@@ -19,17 +19,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # target-dir is relative to src-tauri. Windows uses D:\a\t: under src-tauri\target, the
+        # nested vulkan-shaders-gen try-compile path passes MSVC's 260-character limit.
         include:
           - os: macos-latest
             name: macos-arm64
             args: --target aarch64-apple-darwin
             rust-targets: aarch64-apple-darwin
-            installer: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            target-dir: target
+            installer: aarch64-apple-darwin/release/bundle/dmg/*.dmg
           - os: windows-latest
             name: windows-x64
             args: ''
             rust-targets: ''
-            installer: src-tauri/target/release/bundle/nsis/*-setup.exe
+            target-dir: ../../../t
+            installer: release/bundle/nsis/*-setup.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -55,9 +59,16 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.rust-targets }}
 
+      # Cargo, tauri-cli (cargo metadata) and tauri-action all follow CARGO_TARGET_DIR. rust-cache
+      # does not, and joins an absolute target onto the workspace, hence the relative target-dir.
+      - name: Short Cargo target dir
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content $env:GITHUB_ENV "CARGO_TARGET_DIR=$([IO.Path]::GetFullPath("$env:GITHUB_WORKSPACE\src-tauri\${{ matrix.target-dir }}"))"
+
       - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: src-tauri
+          workspaces: src-tauri -> ${{ matrix.target-dir }}
 
       # whisper-rs-sys needs VULKAN_SDK (Lib\vulkan-1.lib) and glslc for the Vulkan backend
       # (architecture 5.4). 1.4.313.2 is what llama.cpp's Windows release used for the same ggml.
@@ -112,6 +123,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: meeting-summarizer-${{ matrix.name }}
-          path: ${{ matrix.installer }}
+          # Absolute on Windows: upload-artifact rejects `..` in paths.
+          path: ${{ env.CARGO_TARGET_DIR || 'src-tauri/target' }}/${{ matrix.installer }}
           if-no-files-found: error
           retention-days: 30
