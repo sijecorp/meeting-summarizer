@@ -1,0 +1,15 @@
+# CPU baseline for ggml (H4, architecture 11.3). whisper-rs-sys passes GGML_* variables to CMake as
+# options. Without GGML_NATIVE=OFF, ggml builds for the build machine's CPU (a runner's AVX-512) and
+# the worker dies with an illegal instruction on PCs without it. x86-64: AVX2, FMA, F16C, BMI2 (NFR-02;
+# `cpu_failure` in queue.rs checks the same set). `force`: a value already in the shell does not win.
+# arm64 ignores the x86 options and gets clang's default CPU, apple-m1.
+# whisper-rs-sys does not rebuild when these change: run `cargo clean -p whisper-rs-sys` once
+# for each profile and target you build (`--release`, `--release --target aarch64-apple-darwin`).
+# Here, not in src-tauri/.cargo: Cargo reads config from the current directory upward, so a
+# `--manifest-path` run from the repository root would miss that one.
+[env]
+GGML_NATIVE = { value = "OFF", force = true }
+GGML_AVX2 = { value = "ON", force = true }
+GGML_FMA = { value = "ON", force = true }
+GGML_F16C = { value = "ON", force = true }
+GGML_BMI2 = { value = "ON", force = true }

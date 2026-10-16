@@ -408,6 +408,15 @@ fn model_failure(check: Check, why: &str) -> String {
     }
 }
 
+/// H4: ggml is built for AVX2, FMA, F16C and BMI2 (NFR-02, `.cargo/config.toml`). Without one of
+/// them the worker dies with an illegal instruction, which would read as a GPU crash.
+#[cfg(any(target_arch = "x86_64", test))]
+fn cpu_failure(features: &[bool]) -> Option<&'static str> {
+    features.contains(&false).then_some(
+        "이 PC의 CPU는 전사에 필요한 AVX2 등의 명령어를 지원하지 않아 전사할 수 없습니다. AVX2를 지원하는 PC(대부분의 Intel Core·AMD Ryzen)에서 실행해 주세요",
+    )
+}
+
 /// The last thing the worker said on stderr: the reason shown for a failure.
 fn last_log_line(log: &Path) -> String {
     let text = fs::read(log).unwrap_or_default();
@@ -867,6 +876,16 @@ impl<R: Runtime> Queue<R> {
         });
         if let Err(e) = started {
             return End::Skipped(e);
+        }
+        // Before any worker: a plain failure, not a crash that counts toward `gpu_failed`.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(why) = cpu_failure(&[
+            std::arch::is_x86_feature_detected!("avx2"),
+            std::arch::is_x86_feature_detected!("fma"),
+            std::arch::is_x86_feature_detected!("f16c"),
+            std::arch::is_x86_feature_detected!("bmi2"),
+        ]) {
+            return End::Failed(why.into());
         }
         self.set_progress(id, |p| {
             p.status = Status::Transcribing;
@@ -1356,6 +1375,14 @@ mod tests {
         assert!(!damaged.contains("지웠"));
         let missing = model_failure(Check::Missing, "ggml error");
         assert!(missing.contains("없거나 읽을 수 없습니다") && missing.contains("다시 받아"));
+    }
+
+    #[test]
+    fn a_cpu_without_the_build_baseline_cannot_transcribe() {
+        assert_eq!(cpu_failure(&[true; 4]), None);
+        let missing = cpu_failure(&[false, true, true, true]).unwrap();
+        assert!(missing.contains("AVX2 등의 명령어를 지원하지 않아"));
+        assert_eq!(cpu_failure(&[true, true, true, false]), Some(missing));
     }
 
     #[test]

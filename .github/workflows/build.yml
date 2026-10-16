@@ -68,6 +68,9 @@ jobs:
 
       - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          # whisper-rs-sys does not rebuild when the GGML_* values in .cargo/config.toml change, and
+          # rust-cache restores older caches by prefix. Bump this whenever those values change.
+          prefix-key: v1-rust
           workspaces: src-tauri -> ${{ matrix.target-dir }}
 
       # whisper-rs-sys needs VULKAN_SDK (Lib\vulkan-1.lib) and glslc for the Vulkan backend
@@ -119,6 +122,42 @@ jobs:
           # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           args: ${{ matrix.args }}
+
+      # The ggml CPU baseline (.cargo/config.toml) must reach CMake, or ggml was built for this
+      # runner's CPU.
+      - name: Check ggml CPU baseline
+        shell: bash
+        run: |
+          shopt -s nullglob
+          caches=(src-tauri/${{ matrix.target-dir }}/{,*/}release/build/whisper-rs-sys-*/out/build/CMakeCache.txt)
+          if [ ${#caches[@]} -eq 0 ]; then echo "::error::No whisper-rs-sys CMakeCache.txt"; exit 1; fi
+          for f in "${caches[@]}"; do
+            echo "$f"
+            grep -E '^GGML_(NATIVE|AVX2|FMA|F16C|BMI2|AVX512)[:=]' "$f" || true
+            grep -q '^GGML_NATIVE:[A-Z]*=OFF' "$f" || { echo "::error::GGML_NATIVE is not OFF in $f"; exit 1; }
+            grep -q '^GGML_AVX2:[A-Z]*=ON' "$f" || { echo "::error::GGML_AVX2 is not ON in $f"; exit 1; }
+            grep -q '^GGML_AVX512:[A-Z]*=OFF' "$f" || { echo "::error::GGML_AVX512 is not OFF in $f"; exit 1; }
+          done
+
+      # The worker is this exe. AVX-512 from an AVX-512 runner dies on most office PCs. Today no Rust
+      # dependency in the exe dispatches to AVX-512 at run time (crc32fast and simd-adler32 have such
+      # code but come in only through a proc-macro). If one is added, this step fails on a good build:
+      # then check only whisper-rs-sys's ggml-cpu.lib. findstr exits 1 when nothing matches, hence exit 0.
+      - name: Check for AVX-512 instructions
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = "$env:CARGO_TARGET_DIR\release\meeting-summarizer.exe"
+          if (-not (Test-Path $exe)) { echo "::error::$exe not found"; exit 1 }
+          dumpbin /nologo /disasm:nobytes /out:disasm.txt $exe
+          if ($LASTEXITCODE) { echo "::error::dumpbin failed"; exit 1 }
+          $zmm = findstr /r "zmm[0-9]" disasm.txt
+          if ($zmm) {
+            $zmm | Select-Object -First 20
+            echo "::error::AVX-512 (zmm) instructions in $exe"
+            exit 1
+          }
+          exit 0
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

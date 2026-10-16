@@ -791,7 +791,7 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 - **설치 파일**: NSIS, `installMode: "currentUser"`, 설치 화면은 한국어(`src-tauri/tauri.windows.conf.json`). 관리자 권한 없이 사용자 단위로 설치한다(NFR-06). 파일럿 동안 새 버전은 같은 설치 파일로 덮어 설치한다. MSI는 쓰지 않는다.
 - **WebView2**: Tauri 기본값(`downloadBootstrapper`)을 그대로 쓴다. Windows 10/11 대부분에는 WebView2가 이미 설치돼 있다. 없는 PC에서는 WebView2 설치에 관리자 권한을 요구할 수 있다(NFR-06의 예외).
 - **Vulkan 로더**: `vulkan-1.dll`을 `$INSTDIR`(실행 파일 옆)에 설치한다(5.4).
-- **CPU**: AVX2가 없는 CPU는 전사가 4~10배 느리다(Meetily #306). 첫 실행 때 감지해서 "이 PC는 처리가 오래 걸릴 수 있습니다"를 안내한다.
+- **CPU**: 전사 빌드의 기준은 AVX2·FMA·F16C·BMI2다(M6.5 계획의 H4, 11.3). 이것이 없는 CPU에서는 워커가 잘못된 명령어로 죽어 GPU 실패로 오인되므로, 전사를 시작할 때 워커를 띄우기 전에 확인해(`queue.rs`의 `cpu_failure`) 그 회의를 `transcribe_failed`로 끝내고 "이 PC의 CPU는 전사에 필요한 AVX2 등의 명령어를 지원하지 않아 전사할 수 없습니다. AVX2를 지원하는 PC(대부분의 Intel Core·AMD Ryzen)에서 실행해 주세요"를 보여 준다. `gpu_failed`로 세지 않고, 자동 재시도나 CPU 전환도 없다.
 - **OS 알림** (APP-03): 토스트(`tauri-winrt-notification`)의 클릭은 토스트가 화면에 있는 동안만 앱으로 온다. 알림 센터로 넘어간 뒤 누르면 OS가 앱을 실행하고, 단일 실행(APP-06)이 메인 창만 앞으로 가져온다(회의로 가지 않는다). 토스트의 앱 ID(AUMID)는 설치된 앱에서만 번들 식별자이고, `target\debug`·`target\release`에서 실행하면 PowerShell의 것을 쓴다. 실제 토스트 클릭은 아직 Windows에서 확인하지 않았다(로드맵 M5). 기다리는 스레드는 토스트가 화면에서 사라질 때(`Dismissed`, 시간 초과 포함) 끝나 쌓이지 않으므로, 11.1의 포커스 때 지우기는 Windows에서 하지 않는다.
 
 ### 11.3 배포 빌드
@@ -799,6 +799,7 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 - **워크플로** (`.github/workflows/build.yml`): 수동 실행(workflow_dispatch)이나 `v*` 태그 push에서 macOS Apple Silicon(`aarch64-apple-darwin`, `.dmg`)과 Windows x64(NSIS `-setup.exe`)를 만든다. GitHub 릴리스는 만들지 않고 workflow artifact로 올리며, artifact는 30일 뒤 지워진다. 액션은 모두 커밋 SHA로 고정했다. 태그 실행이면 태그(`v` 제외)가 `tauri.conf.json`의 `version`과 같은지 먼저 확인한다.
 - **번들 대상**: macOS `app`·`dmg`(`tauri.conf.json`), Windows `nsis`(`tauri.windows.conf.json`, Tauri가 Windows에서 병합한다).
 - **배포**: 관리자가 artifact를 OneDrive에 올리고 동료에게 링크를 보낸다. 설치·업데이트·삭제 안내는 `docs/install.md`다. 자동 업데이트는 없다(eng review D2).
+- **CPU 기준** (M6.5 계획의 H4): ggml(전사)은 빌드 기계가 아니라 x86-64 AVX2·FMA·F16C·BMI2(NFR-02), arm64 Apple M1 기준으로 빌드한다(`GGML_NATIVE=OFF`, 저장소 루트 `.cargo/config.toml`의 `[env]`). 워크플로가 CMake 기록과 Windows 실행 파일의 zmm 명령으로 확인한다.
 - **Windows 빌드 환경**: `windows-latest`(Visual Studio 18 2026, CMake 4.4)에서 두 가지를 맞췄다. (1) Visual Studio 생성기로는 ggml-vulkan이 따로 구성하는 `vulkan-shaders-gen`이 컴파일러를 찾지 못해, MSVC 개발 환경(`ilammy/msvc-dev-cmd`)에서 Ninja로 빌드한다(`CMAKE_GENERATOR_x86_64_pc_windows_msvc: Ninja`, cmake 크레이트가 대상 이름이 붙은 변수를 먼저 읽어 macOS에는 닿지 않는다). (2) `src-tauri\target` 아래에서는 그 하위 빌드의 pdb 경로가 269자로 MSVC의 260자 한계를 넘어(C1041), `CARGO_TARGET_DIR`을 `D:\a\t`로 둔다. rust-cache는 `CARGO_TARGET_DIR`을 읽지 않아 같은 폴더를 `src-tauri` 기준 상대 경로로 받는다.
 - 확인: 2026-10-16 첫 성공 실행(run 38839884897)에서 두 설치 파일이 나왔다(macOS dmg 12MiB, Windows setup.exe 17MiB, Windows 빌드 약 27분). 앞의 두 실행은 위 두 문제로 Windows만 실패했다. 실제 PC에서 설치·실행은 아직이다(12.2).
 
