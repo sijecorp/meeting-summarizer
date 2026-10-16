@@ -325,7 +325,7 @@ async fn fetch(
         match fetch_once(client, &url, &part, f, on_progress).await {
             Ok(()) => break,
             Err(Fetch::Retry(e)) if attempt < ATTEMPTS => {
-                eprintln!("모델 다운로드 재시도 {attempt} ({}): {e}", f.file);
+                log::warn!("모델 다운로드 재시도 {attempt} ({}): {e}", f.file);
                 attempt += 1;
             }
             Err(Fetch::Retry(e) | Fetch::Stop(e)) => return Err(e),

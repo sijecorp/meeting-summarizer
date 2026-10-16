@@ -230,6 +230,8 @@ export const onRecordingStopped = (handler: (stopped: Stopped) => void) =>
 export const confirmQuit = () => invoke<void>("confirm_quit");
 /** Windows Ctrl+Q: same exit path as the tray "종료" (architecture 8.5). */
 export const requestQuit = () => invoke<void>("request_quit");
+/** Opens the folder of `app.log` in the file manager. Rust picks the path. */
+export const openLogDir = () => invoke<void>("open_log_dir");
 /** Quit was requested while work is running; the UI must ask before `confirmQuit`. */
 export const onQuitRequested = (handler: () => void) =>
   listen("app://quit-requested", handler);

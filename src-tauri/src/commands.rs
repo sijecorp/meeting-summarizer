@@ -240,6 +240,22 @@ pub fn request_quit(app: AppHandle) {
     app.exit(0);
 }
 
+/// Settings 일반 "로그 폴더 열기": the folder of `app.log` in the file manager. The path is
+/// resolved here, so the webview names no path and gets no opener scope. Created first: it is
+/// missing when app.log could not be opened at startup.
+#[tauri::command(async)]
+pub fn open_log_dir(app: AppHandle) -> Result<(), String> {
+    let opened = app
+        .path()
+        .app_log_dir()
+        .map_err(|e| e.to_string())
+        .and_then(|dir| {
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            tauri_plugin_opener::open_path(&dir, None::<&str>).map_err(|e| e.to_string())
+        });
+    opened.map_err(|e| format!("로그 폴더를 열지 못했습니다: {e}"))
+}
+
 /// Queued and running meetings, for the first render before `meeting://progress` arrives.
 #[tauri::command]
 pub fn queue_state(queue: State<'_, Queue>) -> Vec<Progress> {
@@ -454,7 +470,7 @@ pub async fn send_to_slack(
         .await;
     crate::refresh_tray(&app);
     if let Err(e) = app.emit("slack://finished", &id) {
-        eprintln!("전송 종료 이벤트 전송 실패: {e}");
+        log::warn!("전송 종료 이벤트 전송 실패: {e}");
     }
     sent
 }

@@ -35,6 +35,7 @@ import {
   NEWER_VERSION,
   onMicTestLevel,
   onModelDownload,
+  openLogDir,
   resetSettings,
   saveSettings,
   sendTestMessage,
@@ -59,7 +60,7 @@ import { cn } from "@/lib/utils";
 export type SettingsTab = "general" | "audio" | "transcription" | "llm" | "slack";
 
 const TABS: { value: SettingsTab; label: string; about: string }[] = [
-  { value: "general", label: "일반", about: "회의록에 남는 이름과 알림입니다." },
+  { value: "general", label: "일반", about: "회의록에 남는 이름, 알림과 로그입니다." },
   { value: "audio", label: "오디오", about: "녹음할 마이크와 시스템 오디오를 고릅니다." },
   { value: "transcription", label: "전사", about: "녹음은 이 PC에서 글로 옮깁니다. 모델은 처음 한 번만 받습니다." },
   {
@@ -321,6 +322,7 @@ export default function Settings({
               <RotateCcw aria-hidden />
               기본값으로 다시 시작
             </Button>
+            <LogFolder />
           </>
         )}
       </Page>
@@ -673,6 +675,9 @@ export default function Settings({
             </fieldset>
             {/* ONB-03: desktop notification permission cannot be read, so this is all we can say. */}
             <p className={cn(HELP, "px-5")}>알림이 보이지 않으면 OS 알림 설정에서 'meeting-summarizer'를 허용해 주세요</p>
+            <div className={cn(GROUP, "px-5 py-4")}>
+              <LogFolder />
+            </div>
           </Section>
 
           <Section tab="audio" open={tab}>
@@ -1181,6 +1186,34 @@ function Section({ tab, open, children }: { tab: SettingsTab; open: SettingsTab;
       </header>
       {children}
     </section>
+  );
+}
+
+/** DX1 "로그 폴더 열기". Not a setting: it works while read-only or saving and never counts
+ * toward 저장, and it is on the unreadable-settings screen too, where logs matter most. A failure
+ * stays beside it until a later open works. */
+function LogFolder() {
+  const help = useId();
+  const [error, setError] = useState("");
+  return (
+    <div className="space-y-3">
+      <div className="space-y-0.5">
+        <p className="font-medium">로그</p>
+        <p id={help} className={HELP}>
+          문제가 생기면 이 폴더의 app.log를 보내 주세요
+        </p>
+      </div>
+      <Button
+        size="sm"
+        variant="outline"
+        aria-describedby={help}
+        onClick={() => openLogDir().then(() => setError(""), (e) => setError(String(e)))}
+      >
+        <FolderOpen aria-hidden />
+        로그 폴더 열기
+      </Button>
+      {error && <Banner kind="error">{error}</Banner>}
+    </div>
   );
 }
 

@@ -356,7 +356,7 @@ impl Store {
             .filter_map(|id| match self.read(&id) {
                 Ok(meta) => Some(meta),
                 Err(e) => {
-                    eprintln!("{e}");
+                    log::warn!("{e}");
                     None
                 }
             })
@@ -498,7 +498,7 @@ impl Store {
                 Recovery::Requeue | Recovery::Nothing => Ok(()),
             };
             if let Err(e) = result {
-                eprintln!("복구 실패 ({}): {e}", meta.id);
+                log::error!("복구 실패 ({}): {e}", meta.id);
             }
         }
     }
@@ -571,7 +571,7 @@ impl Store {
                 transition(meta, to)
             });
             if let Err(e) = result {
-                eprintln!("종료 처리 실패 ({id}): {e}");
+                log::error!("종료 처리 실패 ({id}): {e}");
             }
         }
     }
@@ -595,7 +595,7 @@ fn remove_meeting_dir(dir: &Path) -> std::io::Result<()> {
     fs::remove_file(dir.join("meta.json"))?;
     // Without meta.json the meeting is gone; `recover` removes the empty folder next start.
     if let Err(e) = fs::remove_dir(dir) {
-        eprintln!("빈 회의 폴더 삭제 실패 ({}): {e}", dir.display());
+        log::warn!("빈 회의 폴더 삭제 실패 ({}): {e}", dir.display());
     }
     Ok(())
 }

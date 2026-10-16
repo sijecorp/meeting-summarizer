@@ -166,7 +166,7 @@ impl Recorder {
         if let Some(ended) = active.take()
             && ended.writer.join().is_err()
         {
-            eprintln!("녹음 기록 스레드가 비정상 종료했습니다 ({})", ended.id);
+            log::error!("녹음 기록 스레드가 비정상 종료했습니다 ({})", ended.id);
         }
         let id = store.create("", summarize_local)?.id;
         let dir = store.dir_for(&id)?;
@@ -231,7 +231,7 @@ impl Recorder {
                     .app_name("회의 요약")
                     .app_reverse_domain("com.sije.meeting-summarizer")
                     .create()
-                    .inspect_err(|e| eprintln!("절전 방지 실패: {e}"));
+                    .inspect_err(|e| log::warn!("절전 방지 실패: {e}"));
                 writer::run(writer, &handle.state::<Store>());
                 // TRN-01: the meeting is `recorded` now. Queue it, and let the transcriptions
                 // the recording stopped go on (TRN-09).
@@ -290,7 +290,7 @@ impl Recorder {
             .take_if(|a| only.is_none_or(|id| a.id == id))?;
         active.shared.stop.store(true, Ordering::SeqCst);
         if active.writer.join().is_err() {
-            eprintln!("녹음 기록 스레드가 비정상 종료했습니다 ({})", active.id);
+            log::error!("녹음 기록 스레드가 비정상 종료했습니다 ({})", active.id);
         }
         Some(active.id)
     }
@@ -328,7 +328,7 @@ fn emitter(app: AppHandle, warnings: Arc<Mutex<Vec<Warning>>>) -> Emit {
             }
         };
         if let Err(e) = sent {
-            eprintln!("녹음 이벤트 전송 실패: {e}");
+            log::warn!("녹음 이벤트 전송 실패: {e}");
         }
     })
 }

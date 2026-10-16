@@ -419,6 +419,46 @@ test("read-only settings disable the key inputs and 저장", async () => {
   expect((screen.getByRole("combobox", { name: "기본 LLM" }) as HTMLButtonElement).disabled).toBe(true);
 });
 
+// DX1: Rust picks the folder, so the button only asks. Not a setting, so read-only settings keep it.
+test("로그 폴더 열기 asks Rust to open the log folder and says beside it when it cannot", async () => {
+  const cmds: string[] = [];
+  let fails = true;
+  mockIPC((cmd) => {
+    cmds.push(cmd);
+    if (cmd === "get_settings") return { ...loaded, read_only: true };
+    if (cmd === "has_secret") return true;
+    if (cmd === "open_log_dir" && fails) throw "로그 폴더를 열지 못했습니다: 없음";
+  });
+  render(<Settings onHome={() => {}} />);
+
+  const button = await screen.findByRole("button", {
+    name: "로그 폴더 열기",
+    description: "문제가 생기면 이 폴더의 app.log를 보내 주세요",
+  });
+  expect(button.matches(":disabled")).toBe(false);
+  fireEvent.click(button);
+  expect((await screen.findByRole("alert")).textContent).toBe("로그 폴더를 열지 못했습니다: 없음");
+  // A later open that works clears it.
+  fails = false;
+  fireEvent.click(button);
+  await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  expect(cmds.filter((c) => c === "open_log_dir")).toHaveLength(2);
+});
+
+// When settings.json cannot be read is when the log is needed most.
+test("the unreadable-settings screen offers 로그 폴더 열기 too", async () => {
+  const cmds: string[] = [];
+  mockIPC((cmd) => {
+    cmds.push(cmd);
+    if (cmd === "get_settings") throw "settings.json을 읽을 수 없습니다";
+  });
+  render(<Settings onHome={() => {}} />);
+
+  expect(await screen.findByRole("button", { name: "기본값으로 다시 시작" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "로그 폴더 열기" }));
+  await waitFor(() => expect(cmds).toContain("open_log_dir"));
+});
+
 // SUM-07 for each cloud address; SUM-08's default for new meetings needs a local connection.
 test("요약(LLM) tab: where a transcript goes, and the local default only with a local connection", async () => {
   const calls: Call[] = [];

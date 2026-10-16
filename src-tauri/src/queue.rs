@@ -566,7 +566,7 @@ impl<R: Runtime> Queue<R> {
 
     fn emit(&self, progress: &Progress) {
         if let Err(e) = self.app.emit("meeting://progress", progress) {
-            eprintln!("진행률 이벤트 전송 실패: {e}");
+            log::warn!("진행률 이벤트 전송 실패: {e}");
         }
     }
 
@@ -673,7 +673,7 @@ impl<R: Runtime> Queue<R> {
                     inner.jobs.insert(id, Job::default());
                 }
                 Err(e) => {
-                    eprintln!("처리 스레드를 시작할 수 없습니다 ({id}): {e}");
+                    log::error!("처리 스레드를 시작할 수 없습니다 ({id}): {e}");
                     inner.sched.finished(&id);
                     inner.progress.remove(&id);
                 }
@@ -838,14 +838,14 @@ impl<R: Runtime> Queue<R> {
                 .then(|| filter::abnormal(&segments, chunk.speech_ms))
                 .flatten();
             if let Some(why) = abnormal {
-                eprintln!("비정상 전사 결과 ({id}, {}ms~): {why}", chunk.start_ms);
+                log::warn!("비정상 전사 결과 ({id}, {}ms~): {why}", chunk.start_ms);
             }
             match run.after(exit, abnormal.is_some()) {
                 Next::Accept => return Ok((segments, run.device)),
                 Next::Run(_) => {}
                 Next::GpuFailed => {
                     if let Err(e) = self.app.state::<SettingsStore>().mark_gpu_failed() {
-                        eprintln!("gpu_failed 저장 실패: {e}");
+                        log::error!("gpu_failed 저장 실패: {e}");
                     }
                     let _ = self.app.emit(
                         "transcribe://gpu-failed",
@@ -1150,13 +1150,13 @@ impl<R: Runtime> Queue<R> {
             End::Stopped(Stop::Recording) => {
                 // Nothing on disk claims work that is not running (same as recovery, 8.4).
                 if let Err(e) = store.set_status(id, Status::Paused) {
-                    eprintln!("일시정지 기록 실패 ({id}): {e}");
+                    log::error!("일시정지 기록 실패 ({id}): {e}");
                 }
                 Some(Status::Paused)
             }
             End::Stopped(Stop::Delete | Stop::Quit) => None,
             End::Failed(message) => {
-                eprintln!("처리 실패 ({id}): {message}");
+                log::error!("처리 실패 ({id}): {message}");
                 let failed = store.update(id, |m| {
                     let to = if m.status == Status::Summarizing {
                         Status::SummarizeFailed
@@ -1172,13 +1172,13 @@ impl<R: Runtime> Queue<R> {
                 match failed {
                     Ok(m) => Some(m.status),
                     Err(e) => {
-                        eprintln!("실패 상태 기록 실패 ({id}): {e}");
+                        log::error!("실패 상태 기록 실패 ({id}): {e}");
                         None
                     }
                 }
             }
             End::Skipped(reason) => {
-                eprintln!("처리 건너뜀 ({id}): {reason}");
+                log::info!("처리 건너뜀 ({id}): {reason}");
                 store.get(id).ok().map(|m| m.status)
             }
             End::Requeue => None,

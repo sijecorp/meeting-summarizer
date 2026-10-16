@@ -596,6 +596,7 @@ type Commands = {
   recording_state: typeof ipc.recordingState;
   confirm_quit: typeof ipc.confirmQuit;
   request_quit: typeof ipc.requestQuit;
+  open_log_dir: typeof ipc.openLogDir;
   queue_state: typeof ipc.queueState;
   model_status: typeof ipc.modelStatus;
   download_models: typeof ipc.startModelDownload;
@@ -815,6 +816,9 @@ const handlers: Handlers = {
     console.info("[미리보기] 종료 확인: 실제 앱이라면 진행 중인 작업을 멈추고 종료합니다");
   },
   request_quit: () => send("app://quit-requested"),
+  open_log_dir: () => {
+    console.info("[미리보기] 로그 폴더 열기: 실제 앱이라면 app.log가 있는 폴더를 엽니다");
+  },
 };
 
 function handle(cmd: string, args: Args) {

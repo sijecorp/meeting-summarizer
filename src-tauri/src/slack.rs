@@ -463,7 +463,7 @@ impl Slack {
                         format!("Slack에는 보냈지만 전송 기록을 저장하지 못했습니다: {e}")
                     })?;
                 if let Err(e) = settings.set_last_channel(webhook) {
-                    eprintln!("마지막 채널 저장 실패: {e}");
+                    log::warn!("마지막 채널 저장 실패: {e}");
                 }
                 Ok(meta)
             }
@@ -473,7 +473,7 @@ impl Slack {
                     Ok(())
                 });
                 if let Err(write) = failed {
-                    eprintln!("전송 실패 기록 실패 ({id}): {write}");
+                    log::error!("전송 실패 기록 실패 ({id}): {write}");
                 }
                 Err(e)
             }

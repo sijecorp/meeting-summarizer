@@ -63,7 +63,7 @@ pub(crate) fn notify<R: Runtime>(app: &AppHandle<R>, body: String, meeting: &str
             .extra("meeting", meeting)
             .show();
         if let Err(e) = shown {
-            eprintln!("알림을 보내지 못했습니다: {e}");
+            log::warn!("알림을 보내지 못했습니다: {e}");
         }
     });
 }
@@ -219,8 +219,39 @@ fn app_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
     )
 }
 
+/// The app log (architecture 8.1): stdout, so `tauri dev` shows it, and with `file` also
+/// `app.log` in `app_log_dir()`. 5 MB keeps months of these few lines per meeting and still
+/// attaches to a Slack message; two rotated files cap the folder near 15 MB. Info in dev too: the
+/// app has no `debug!` lines, so Debug would only add tao, wry and reqwest noise. The plugin's
+/// JS `log` command is not registered: the webview does not log.
+fn attach_log<R: Runtime>(app: &AppHandle<R>, file: bool) -> Result<(), String> {
+    use tauri_plugin_log::{Builder, RotationStrategy, Target, TargetKind};
+    let mut targets = vec![Target::new(TargetKind::Stdout)];
+    if file {
+        targets.push(Target::new(TargetKind::LogDir {
+            file_name: Some("app".into()),
+        }));
+    }
+    let (_, level, logger) = Builder::new()
+        .targets(targets)
+        .max_file_size(5_000_000)
+        .rotation_strategy(RotationStrategy::KeepSome(2))
+        .level(log::LevelFilter::Info)
+        .split(app)
+        .map_err(|e| e.to_string())?;
+    tauri_plugin_log::attach_logger(level, logger).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Release builds abort on panic and Windows release has no stderr, so a crash would leave no
+    // trace. Workers never get here (`worker_main` exits first): their panics stay on stderr,
+    // which is their `worker.log` (5.3).
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("{info}");
+        default_hook(info);
+    }));
     let builder = tauri::Builder::default()
         // Must be first: a second launch exits here and focuses the running instance (APP-06).
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -233,6 +264,15 @@ pub fn run() {
     let builder = builder.menu(app_menu);
     builder
         .setup(|app| {
+            // First, so the rest is logged. Here, not as a plugin: a plugin's setup error stops the
+            // app, and an app.log that cannot be opened or rotated (another process holds it, a
+            // read-only profile) must not. Plugins set up before this, so a second launch has
+            // exited without touching the running app's log.
+            if let Err(e) = attach_log(app.handle(), true)
+                && attach_log(app.handle(), false).is_ok()
+            {
+                log::error!("app.log를 열 수 없어 stdout에만 씁니다: {e}");
+            }
             // Recordings and models stay out of the Windows roaming profile (8.1).
             let local = app.path().app_local_data_dir()?;
             let store = store::Store::new(local.join("meetings"))?;
@@ -337,6 +377,7 @@ pub fn run() {
             commands::slack_length,
             commands::send_to_slack,
             commands::send_test_message,
+            commands::open_log_dir,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

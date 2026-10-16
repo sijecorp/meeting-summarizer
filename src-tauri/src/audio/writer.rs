@@ -506,11 +506,11 @@ impl<W: Write + Seek> Writer<W> {
         for (name, out) in [("mic.wav", self.mic), ("system.wav", self.system)] {
             let closed = out.wav.finalize().map_err(|e| e.to_string());
             if let Err(e) = closed.and_then(|()| out.sync.sync_data().map_err(|e| e.to_string())) {
-                eprintln!("{name} 마무리 실패 ({}): {e}", self.id);
+                log::error!("{name} 마무리 실패 ({}): {e}", self.id);
             }
         }
         if let Err(e) = store.finish_recording(&self.id, self.elapsed_ms, self.gaps) {
-            eprintln!("녹음 상태 저장 실패 ({}): {e}", self.id);
+            log::error!("녹음 상태 저장 실패 ({}): {e}", self.id);
             // Likely the same full disk. Offered like a crash leftover: "처리 계속" writes
             // `recorded` once there is room again, or the recorder deletes it (STO-03).
             store.mark_interrupted(&self.id);

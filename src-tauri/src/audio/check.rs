@@ -249,7 +249,7 @@ fn output<T: SizedSample + FromSample<f32>>(
                     next += 1;
                 }
             },
-            |e| eprintln!("테스트음 재생 오류: {e}"),
+            |e| log::warn!("테스트음 재생 오류: {e}"),
             None,
         )
         .map_err(|e| e.to_string())
