@@ -7,11 +7,11 @@ use crate::slack::{self, Slack};
 use crate::store::{Meta, Status, Store, one_line};
 use crate::summarize::{self, SummaryRoute};
 use crate::transcribe::engine::Segment;
-use crate::transcribe::model::{self, ModelState, Models};
-use serde::Serialize;
+use crate::transcribe::model::{self, Cancelled, ModelFile, ModelState, Models};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tauri_plugin_dialog::DialogExt;
 
 #[tauri::command(async)]
@@ -246,54 +246,116 @@ pub fn queue_state(queue: State<'_, Queue>) -> Vec<Progress> {
     queue.snapshot()
 }
 
-/// The chosen Whisper model and the VAD model: installed, partly downloaded, downloading.
+/// DX12: what the four model commands act on; `None` is `All`, as for the callers before scopes.
+#[derive(Deserialize, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    /// The chosen Whisper model and the VAD model, then the summary model while the built-in LLM
+    /// is the default (E3). A cloud or other local default leaves it out (plan 5.2).
+    All,
+    /// The Whisper and VAD models only, for the 전사 tab.
+    Transcription,
+    Summary,
+}
+
+// ponytail: ENG18 (refuse "요약 중에는 요약 모델을 바꿀 수 없습니다" while the sidecar runs)
+// lands here with the sidecar in stage 3.
+fn scoped(scope: Option<Scope>, settings: &Settings) -> Result<Vec<&'static ModelFile>, String> {
+    if scope == Some(Scope::Summary) {
+        return Ok(vec![&model::SUMMARY]);
+    }
+    let mut files = model::needed(&settings.model)?.to_vec();
+    if scope != Some(Scope::Transcription) && settings.default_llm.is_none() {
+        files.push(&model::SUMMARY);
+    }
+    Ok(files)
+}
+
+/// E3: a file in place lets waiting meetings start without the rest of the chain; the summary
+/// model also queues the `transcribed` ones (`enqueue_pending` pumps too).
+// ponytail: after a download this lists the meetings on an async worker; move it to
+// `spawn_blocking` if the list ever gets slow.
+pub(crate) fn arrived<R: Runtime>(queue: &Queue<R>, f: &ModelFile) {
+    if f.file == model::SUMMARY.file {
+        queue.enqueue_pending();
+    } else {
+        queue.pump();
+    }
+}
+
+/// The scope's files: installed, partly downloaded, downloading.
 #[tauri::command(async)]
 pub fn model_status(
     settings: State<'_, SettingsStore>,
     models: State<'_, Models>,
+    scope: Option<Scope>,
 ) -> Result<ModelState, String> {
     let settings = settings.load().map(|l| l.settings).unwrap_or_default();
-    models.state(&settings.model)
+    Ok(models.state(&scoped(scope, &settings)?))
 }
 
-/// ONB-01: downloads the missing model files from `model_base_url` (a mirror if set), sending
-/// `model://download`. Resumes a `.part` left by an earlier try. Queued meetings start after.
+/// ONB-01, E3: downloads the scope's missing files one by one from `model_base_url` (a mirror if
+/// set), sending `model://download`. Resumes a `.part` left by an earlier try.
 #[tauri::command]
 pub async fn download_models(
     app: AppHandle,
     settings: State<'_, SettingsStore>,
     models: State<'_, Models>,
     queue: State<'_, Queue>,
+    scope: Option<Scope>,
 ) -> Result<(), String> {
     let settings = settings.load().map(|l| l.settings).unwrap_or_default();
-    let files = model::needed(&settings.model)?;
-    models
-        .download(&settings.model_base_url, files, move |progress| {
-            let _ = app.emit("model://download", progress);
-        })
-        .await?;
-    queue.pump();
-    Ok(())
+    let files = scoped(scope, &settings)?;
+    let installed = app.clone();
+    let result = models
+        .download(
+            &settings.model_base_url,
+            &files,
+            move |progress| {
+                let _ = app.emit("model://download", progress);
+            },
+            move |f| arrived(&installed.state::<Queue>(), f),
+        )
+        .await;
+    // Also for a file installed as a cancel landed, and for files all there already.
+    if files.iter().any(|f| f.file == model::SUMMARY.file) && models.installed(&model::SUMMARY) {
+        queue.enqueue_pending();
+    } else {
+        queue.pump();
+    }
+    result
 }
 
-/// Stops the download; what arrived stays for resuming.
-#[tauri::command]
-pub fn cancel_model_download(models: State<'_, Models>) {
-    models.cancel();
+/// Stops the download and the rest of its chain; what arrived stays for resuming. A narrower
+/// scope cancels only its files: one in flight stops the download all the same, ones still
+/// ahead just leave the chain. `null` when there was nothing of the scope to cancel.
+#[tauri::command(async)]
+pub fn cancel_model_download(
+    settings: State<'_, SettingsStore>,
+    models: State<'_, Models>,
+    scope: Option<Scope>,
+) -> Result<Option<Cancelled>, String> {
+    let settings = settings.load().map(|l| l.settings).unwrap_or_default();
+    let only = match scope {
+        None | Some(Scope::All) => None,
+        _ => Some(scoped(scope, &settings)?),
+    };
+    Ok(models.cancel(only.as_deref()))
 }
 
-/// ONB-02: installs a model file the recorder picked, if its size and sha256 match.
+/// ONB-02: installs a model file of the scope the recorder picked, if its size and sha256 match.
 #[tauri::command(async)]
 pub fn import_model(
     settings: State<'_, SettingsStore>,
     models: State<'_, Models>,
     queue: State<'_, Queue>,
     path: String,
+    scope: Option<Scope>,
 ) -> Result<ModelState, String> {
     let settings = settings.load().map(|l| l.settings).unwrap_or_default();
-    models.import(Path::new(&path), &model::needed(&settings.model)?)?;
-    queue.pump();
-    models.state(&settings.model)
+    let files = scoped(scope, &settings)?;
+    arrived(&queue, models.import(Path::new(&path), &files)?);
+    Ok(models.state(&files))
 }
 
 /// Where this meeting's summary goes (SUM-07) and whether "로컬로 요약" can still change (SUM-08).
@@ -481,6 +543,34 @@ fn file_name(title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DX12, E3: transcription first, the summary model only for the built-in default.
+    #[test]
+    fn scopes_name_their_files_in_order() {
+        let files = |scope, default_llm: Option<&str>| {
+            let settings = Settings {
+                default_llm: default_llm.map(String::from),
+                ..Settings::default()
+            };
+            scoped(scope, &settings)
+                .unwrap()
+                .iter()
+                .map(|f| f.file)
+                .collect::<Vec<_>>()
+        };
+        let transcription = model::needed(&Settings::default().model)
+            .unwrap()
+            .map(|f| f.file);
+        let summary = model::SUMMARY.file;
+        assert_eq!(files(None, None), [&transcription[..], &[summary]].concat());
+        assert_eq!(files(Some(Scope::All), Some("클라우드")), transcription);
+        assert_eq!(files(Some(Scope::Transcription), None), transcription);
+        assert_eq!(files(Some(Scope::Summary), Some("클라우드")), [summary]);
+        assert_eq!(
+            serde_json::from_str::<[Scope; 3]>(r#"["all", "transcription", "summary"]"#).unwrap(),
+            [Scope::All, Scope::Transcription, Scope::Summary]
+        );
+    }
 
     #[test]
     fn export_file_name_cannot_leave_the_folder_or_upset_windows() {

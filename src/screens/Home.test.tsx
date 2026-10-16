@@ -24,8 +24,8 @@ afterEach(async () => {
 const WHISPER = "ggml-large-v3-turbo-q8_0.bin";
 const models = (installed: boolean): ModelState => ({
   files: [
-    { file: WHISPER, size: 874_188_075, installed, received: 0 },
-    { file: "ggml-silero-v6.2.0.bin", size: 885_098, installed: true, received: 0 },
+    { file: WHISPER, size: 874_188_075, installed, received: 0, downloading: false },
+    { file: "ggml-silero-v6.2.0.bin", size: 885_098, installed: true, received: 0, downloading: false },
   ],
   downloading: false,
 });
@@ -163,7 +163,7 @@ test("a summarizing row shows 요약 중; a failed summary shows its error, retr
 });
 
 // ONB-01: the setup line downloads right away; cancel, import and the mirror stay in the 전사 tab.
-test("the setup line's 전사 모델 받기 downloads with progress and checks the files again", async () => {
+test("the setup line's 모델 받기 downloads with progress and checks the files again", async () => {
   let installed = false;
   mock((cmd) => {
     if (cmd === "model_status") return models(installed);
@@ -174,18 +174,39 @@ test("the setup line's 전사 모델 받기 downloads with progress and checks t
 
   // Before a download there is nothing to cancel: the 전사 tab's link waits.
   expect(screen.queryByRole("button", { name: "전사 설정" })).toBeNull();
-  fireEvent.click(await screen.findByRole("button", { name: "전사 모델 받기" }));
-  expect(await screen.findByText("전사 모델 받는 중 0%")).toBeTruthy();
+  fireEvent.click(await screen.findByRole("button", { name: "모델 받기" }));
+  expect(await screen.findByText("모델 받는 중 0%")).toBeTruthy();
   // While it runs, the item shows progress instead of the button.
-  expect(screen.queryByRole("button", { name: "전사 모델 받기" })).toBeNull();
-  await act(() => emit("model://download", { file: WHISPER, received: 524_512_845, total: 874_188_075 }));
-  expect(await screen.findByText("전사 모델 받는 중 60%")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "모델 받기" })).toBeNull();
+  // The percent is the whole chain's: Whisper, VAD, then the summary model (E3).
+  const all_total = 874_188_075 + 885_098 + 2_740_937_888;
+  await act(() =>
+    emit("model://download", {
+      file: WHISPER,
+      received: 524_512_845,
+      total: 874_188_075,
+      all_received: 524_512_845,
+      all_total,
+    }),
+  );
+  expect(await screen.findByText("모델 받는 중 14%")).toBeTruthy();
+  await act(() =>
+    emit("model://download", {
+      file: "Qwen3.5-4B-Q4_K_M.gguf",
+      received: 1_370_468_944,
+      total: 2_740_937_888,
+      all_received: 874_188_075 + 885_098 + 1_370_468_944,
+      all_total,
+    }),
+  );
+  expect(await screen.findByText("모델 받는 중 62%")).toBeTruthy();
+  expect(screen.queryByText(/전사 모델 받는 중/)).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: "전사 설정" }));
   expect(opened).toBe("transcription");
 
   installed = true;
   await act(async () => release());
-  await waitFor(() => expect(screen.queryByText(/전사 모델/)).toBeNull());
+  await waitFor(() => expect(screen.queryByText(/모델 받/)).toBeNull());
 });
 
 test("a failed download says so and 다시 받기 tries again; each link opens its tab", async () => {
@@ -202,17 +223,37 @@ test("a failed download says so and 다시 받기 tries again; each link opens i
   render(<Home {...props} meetings={[]} progress={{}} onSetup={(tab) => opened.push(tab)} />);
 
   const items = within(await screen.findByRole("list", { name: "남은 설정" }));
-  fireEvent.click(await items.findByRole("button", { name: "전사 모델 받기" }));
-  expect(await items.findByText("전사 모델을 받지 못했습니다")).toBeTruthy();
+  fireEvent.click(await items.findByRole("button", { name: "모델 받기" }));
+  expect(await items.findByText("모델을 받지 못했습니다")).toBeTruthy();
   fireEvent.click(items.getByRole("button", { name: "전사 설정" }));
   fireEvent.click(items.getByRole("button", { name: "LLM 연결" }));
   fireEvent.click(items.getByRole("button", { name: "Slack 채널 연결" }));
   expect(opened).toEqual(["transcription", "llm", "slack"]);
 
   fireEvent.click(items.getByRole("button", { name: "다시 받기" }));
-  expect(await items.findByText("전사 모델 받는 중 0%")).toBeTruthy();
+  expect(await items.findByText("모델 받는 중 0%")).toBeTruthy();
   expect(downloads).toBe(2);
-  expect(items.queryByText("전사 모델을 받지 못했습니다")).toBeNull();
+  expect(items.queryByText("모델을 받지 못했습니다")).toBeNull();
+});
+
+test("with only the summary model missing, the item's settings link opens the 요약(LLM) tab", async () => {
+  const summary = { file: "Qwen3.5-4B-Q4_K_M.gguf", size: 2_740_937_888, installed: false, received: 0, downloading: false };
+  mock((cmd, args) => {
+    if (cmd === "model_status") {
+      const transcription = models(true);
+      const { scope } = args as { scope?: string };
+      return scope === "transcription" ? transcription : { ...transcription, files: [...transcription.files, summary] };
+    }
+    if (cmd === "download_models") throw new Error("연결이 끊겼습니다");
+  });
+  let opened = "";
+  render(<Home {...props} meetings={[]} progress={{}} onSetup={(tab) => (opened = tab)} />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "모델 받기" }));
+  expect(await screen.findByText("모델을 받지 못했습니다")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "전사 설정" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "요약(LLM) 설정" }));
+  expect(opened).toBe("llm");
 });
 
 // Titles come from the summary: until then a row says what it is, never a column of "제목 없음".

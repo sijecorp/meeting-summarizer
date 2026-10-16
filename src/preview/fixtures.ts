@@ -9,6 +9,7 @@ import {
   type LlmConnection,
   type MeetingItem,
   type Meta,
+  type ModelFileState,
   type ModelState,
   type Progress,
   type Segment,
@@ -86,6 +87,7 @@ const MODEL_FILES: Record<string, { file: string; size: number }> = {
   "medium-q5_0": { file: "ggml-medium-q5_0.bin", size: 539_212_467 },
 };
 const VAD = { file: "ggml-silero-v6.2.0.bin", size: 885_098 };
+const SUMMARY_MODEL = { file: "Qwen3.5-4B-Q4_K_M.gguf", size: 2_740_937_888 };
 
 const DEVICES: AudioDevices = {
   inputs: [
@@ -214,7 +216,7 @@ let secrets = new Set<string>();
 let models: ModelState = { files: [], downloading: false };
 let recording: { id: string; startedAt: number } | null = null;
 let timers: ReturnType<typeof setInterval>[] = [];
-let downloading: { cancelled: boolean; done: () => void } | null = null;
+let downloading: { cancelled: boolean; done: () => void; chain: ModelFileState[] } | null = null;
 /** An audio check is running: like check.rs, a second one is refused. */
 let checking = false;
 
@@ -228,16 +230,32 @@ const send = (event: string, payload?: unknown) => void emit(event, payload);
 const RUNNING: Status[] = ["transcribing", "summarizing"];
 const isRunning = (p: Progress) => RUNNING.includes(p.status);
 
+/** Every model file, the summary model last; `model_status` shows a scope of them. */
 function modelState(installed: boolean, received = 0): ModelState {
   const whisper = MODEL_FILES[settings.model] ?? MODEL_FILES["large-v3-turbo-q8_0"];
   return {
     files: [
-      { ...whisper, installed, received },
-      { ...VAD, installed, received: 0 },
+      { ...whisper, installed, received, downloading: false },
+      { ...VAD, installed, received: 0, downloading: false },
+      { ...SUMMARY_MODEL, installed, received: 0, downloading: false },
     ],
     downloading: false,
   };
 }
+
+/** Like `scoped` in commands.rs: `all` has the summary model while the built-in LLM is the default. */
+function scoped(scope: unknown) {
+  const [whisper, vad, summary] = models.files;
+  if (scope === "summary") return [summary];
+  return scope === "transcription" || settings.default_llm !== null ? [whisper, vad] : [whisper, vad, summary];
+}
+
+/** `downloading`: the running download still has the file to fetch. */
+const modelStatus = (scope: unknown): ModelState =>
+  clone({
+    files: scoped(scope).map((f) => ({ ...f, downloading: !f.installed && !!downloading?.chain.includes(f) })),
+    downloading: downloading != null,
+  });
 
 export function reset(scenario: Scenario) {
   timers.forEach(clearInterval);
@@ -754,11 +772,12 @@ const handlers: Handlers = {
   recording_state: () => (recording ? { id: recording.id, warnings: [] } : null),
 
   queue_state: () => clone(line),
-  model_status: () => clone({ ...models, downloading: downloading != null }),
-  download_models: () =>
+  model_status: (args) => modelStatus(args.scope),
+  download_models: (args) =>
     new Promise<void>((resolve, reject) => {
+      const chain = scoped(args.scope);
       const timer = setInterval(() => {
-        const file = models.files.find((f) => !f.installed);
+        const file = chain.find((f) => !f.installed);
         if (downloading?.cancelled || !file) {
           clearInterval(timer);
           const cancelled = downloading?.cancelled;
@@ -767,18 +786,28 @@ const handlers: Handlers = {
         }
         // About 32 MB/s: slow enough to watch the progress in the settings and on Home.
         file.received = Math.min(file.size, file.received + 8_000_000);
-        send("model://download", { file: file.file, received: file.received, total: file.size });
+        const all = chain.reduce((sum, f) => sum + f.size, 0);
+        const done = chain.reduce((sum, f) => sum + (f.installed ? f.size : f.received), 0);
+        send("model://download", {
+          file: file.file,
+          received: file.received,
+          total: file.size,
+          all_received: done,
+          all_total: all,
+        });
         if (file.received === file.size) Object.assign(file, { installed: true, received: 0 });
       }, 250);
       timers.push(timer);
-      downloading = { cancelled: false, done: resolve };
+      downloading = { cancelled: false, done: resolve, chain };
     }),
   cancel_model_download: () => {
-    if (downloading) downloading.cancelled = true;
+    if (!downloading) return null;
+    downloading.cancelled = true;
+    return "stopped";
   },
-  import_model: () => {
-    models.files.forEach((f) => Object.assign(f, { installed: true, received: 0 }));
-    return clone(models);
+  import_model: (args) => {
+    scoped(args.scope).forEach((f) => Object.assign(f, { installed: true, received: 0 }));
+    return modelStatus(args.scope);
   },
   "plugin:dialog|open": () => `/Users/hong/Downloads/${models.files[0].file}`,
 

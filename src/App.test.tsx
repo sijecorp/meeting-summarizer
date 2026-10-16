@@ -22,8 +22,8 @@ afterEach(cleanup);
 const WHISPER = "ggml-large-v3-turbo-q8_0.bin";
 const models = (installed: boolean): ModelState => ({
   files: [
-    { file: WHISPER, size: 874_188_075, installed, received: 0 },
-    { file: "ggml-silero-v6.2.0.bin", size: 885_098, installed: true, received: 0 },
+    { file: WHISPER, size: 874_188_075, installed, received: 0, downloading: false },
+    { file: "ggml-silero-v6.2.0.bin", size: 885_098, installed: true, received: 0, downloading: false },
   ],
   downloading: false,
 });
@@ -436,11 +436,11 @@ test("the setup line's model item comes first; after a failed download 전사 �
 
   const items = within(await screen.findByRole("list", { name: "남은 설정" }));
   await items.findByRole("button", { name: "Slack 채널 연결" });
-  await items.findByRole("button", { name: "전사 모델 받기" });
+  await items.findByRole("button", { name: "모델 받기" });
   const rows = items.getAllByRole("listitem").map((li) => li.firstChild?.textContent);
-  expect(rows).toEqual(["전사 모델 받기", "Slack 채널 연결"]);
-  fireEvent.click(items.getByRole("button", { name: "전사 모델 받기" }));
-  expect(await items.findByText("전사 모델을 받지 못했습니다")).toBeTruthy();
+  expect(rows).toEqual(["모델 받기", "Slack 채널 연결"]);
+  fireEvent.click(items.getByRole("button", { name: "모델 받기" }));
+  expect(await items.findByText("모델을 받지 못했습니다")).toBeTruthy();
   fireEvent.click(items.getByRole("button", { name: "전사 설정" }));
 
   expect(await screen.findByText(WHISPER)).toBeTruthy();

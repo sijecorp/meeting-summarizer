@@ -30,6 +30,7 @@ import {
   listAudioDevices,
   modelDownload,
   modelDownloadFailure,
+  modelFileFilter,
   modelStatus,
   NEWER_VERSION,
   onMicTestLevel,
@@ -232,8 +233,9 @@ export default function Settings({
     setSecrets(Object.fromEntries(saved));
   };
 
+  // The 전사 tab's files only; the summary model belongs to the 요약(LLM) tab (plan 5.8).
   const readModels = () =>
-    modelStatus().then(
+    modelStatus("transcription").then(
       (state) => {
         setModels(state);
         setStatusError("");
@@ -553,6 +555,8 @@ export default function Settings({
   // While it runs, only 취소 and the progress show.
   const idle = !modelBusy && !models?.downloading && !unsaved;
   const missing = !!models?.files.some((f) => !f.installed);
+  // A download started on Home may be past this tab's files: then nothing here to cancel.
+  const cancellable = downloading && !!models?.files.some((f) => f.downloading || !f.installed);
   const fileState = (f: ModelFileState) => {
     const d = received[f.file];
     if (f.installed) return "설치됨";
@@ -565,16 +569,16 @@ export default function Settings({
   const startDownload = () => {
     setReceived({});
     setModelError("");
-    follow(startModelDownload());
+    follow(startModelDownload("transcription"));
   };
 
   // ONB-02: a model file got some other way (a colleague, a USB stick).
   const importFile = () =>
-    open({ filters: [{ name: "모델 파일", extensions: ["bin"] }] })
+    open({ filters: [modelFileFilter("transcription")] })
       .then((path) => {
         if (!path) return;
         setModelBusy("import");
-        return importModel(path)
+        return importModel(path, "transcription")
           .then(setModels)
           .finally(() => setModelBusy(null));
       })
@@ -827,11 +831,19 @@ export default function Settings({
                         다운로드
                       </Button>
                     )}
-                    {downloading && (
+                    {cancellable && (
                       <Button
                         size="sm"
                         variant="outline"
-                        onClick={() => cancelModelDownload().catch((e) => setModelError(String(e)))}
+                        onClick={() =>
+                          cancelModelDownload("transcription").then(
+                            (done) => {
+                              // Nothing of the tab's was left: the list was stale.
+                              if (!done) readModels();
+                            },
+                            (e) => setModelError(String(e)),
+                          )
+                        }
                       >
                         취소
                       </Button>

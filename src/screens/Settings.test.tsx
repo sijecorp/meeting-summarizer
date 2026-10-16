@@ -4,11 +4,13 @@ import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, expect, test, vi } from "vitest";
 import {
+  cancelModelDownload,
   modelDownload,
   modelDownloadFailure,
   startModelDownload,
   type AudioDevices,
   type LoadedSettings,
+  modelFileFilter,
   type ModelFileState,
   type ModelState,
 } from "../lib/ipc";
@@ -456,24 +458,27 @@ const WHISPER = "ggml-large-v3-turbo-q8_0.bin";
 const VAD = "ggml-silero-v6.2.0.bin";
 const models = (whisper: Partial<ModelFileState> = {}): ModelState => ({
   files: [
-    { file: WHISPER, size: 874_188_075, installed: false, received: 0, ...whisper },
-    { file: VAD, size: 885_098, installed: true, received: 0 },
+    { file: WHISPER, size: 874_188_075, installed: false, received: 0, downloading: false, ...whisper },
+    { file: VAD, size: 885_098, installed: true, received: 0, downloading: false },
   ],
   downloading: false,
 });
 
 test("전사 tab: file states, download progress from events, and a quiet cancel", async () => {
-  const cmds: string[] = [];
+  const calls: Call[] = [];
   mockIPC(
-    (cmd) => {
-      cmds.push(cmd);
+    (cmd, args) => {
+      calls.push({ cmd, args: args as Call["args"] });
       if (cmd === "get_settings") return loaded;
       if (cmd === "has_secret") return true;
       if (cmd === "model_status") return models({ received: 437_094_037 });
       if (cmd === "download_models") {
         return new Promise((_, reject) => (release = () => reject("모델 다운로드를 취소했습니다")));
       }
-      if (cmd === "cancel_model_download") release();
+      if (cmd === "cancel_model_download") {
+        release();
+        return "stopped";
+      }
     },
     { shouldMockEvents: true },
   );
@@ -496,7 +501,16 @@ test("전사 tab: file states, download progress from events, and a quiet cancel
   await waitFor(() =>
     expect((screen.getByRole("button", { name: "다운로드" }) as HTMLButtonElement).disabled).toBe(false),
   );
-  expect(cmds).toContain("cancel_model_download");
+  // The tab's files only: the summary model belongs to the 요약(LLM) tab.
+  const scopes = calls.filter((c) => c.cmd.includes("model")).map((c) => [c.cmd, c.args.scope]);
+  expect(scopes).toEqual(
+    expect.arrayContaining([
+      ["model_status", "transcription"],
+      ["download_models", "transcription"],
+      ["cancel_model_download", "transcription"],
+    ]),
+  );
+  expect(scopes.every(([, scope]) => scope === "transcription")).toBe(true);
   expect(screen.queryByRole("alert")).toBeNull();
 });
 
@@ -517,7 +531,12 @@ test("직접 가져오기 hands the picked file to import_model", async () => {
   fireEvent.click(screen.getByRole("button", { name: "직접 가져오기" }));
 
   await waitFor(() => expect(screen.getAllByText("설치됨")).toHaveLength(2));
-  expect(calls.find((c) => c.cmd === "import_model")?.args).toEqual({ path });
+  expect(calls.find((c) => c.cmd === "import_model")?.args).toEqual({ path, scope: "transcription" });
+  // Transcription files are `.bin`; the summary model's import (scope `summary`) picks `.gguf`.
+  expect(calls.find((c) => c.cmd === "plugin:dialog|open")?.args).toMatchObject({
+    options: { filters: [{ extensions: ["bin"] }] },
+  });
+  expect(modelFileFilter("summary").extensions).toEqual(["gguf"]);
 });
 
 test("a failed download shows its error in the 전사 tab, not the shared banner", async () => {
@@ -597,6 +616,53 @@ test("reopened mid-download, the tab follows the same download and later shows i
   render(<Settings tab="transcription" onHome={() => {}} />);
   expect((await screen.findByRole("alert")).textContent).toMatch(/huggingface\.co에 연결할 수 없습니다/);
   expect(button("다운로드").disabled).toBe(false);
+});
+
+// A chain started on Home goes on to the summary model after the tab's two files.
+test("the 전사 tab offers 취소 only while one of its files is still to come", async () => {
+  let past = false;
+  mockIPC(
+    (cmd) => {
+      if (cmd === "get_settings") return loaded;
+      if (cmd === "has_secret") return true;
+      if (cmd === "model_status") {
+        return { ...models(past ? { installed: true } : { downloading: true }), downloading: true };
+      }
+      if (cmd === "download_models") return new Promise((resolve) => (release = () => resolve(undefined)));
+      if (cmd === "cancel_model_download") {
+        past = true;
+        return null;
+      }
+    },
+    { shouldMockEvents: true },
+  );
+  void startModelDownload();
+  const first = render(<Settings tab="transcription" onHome={() => {}} />);
+  // Read before the chain moved on. Answered null, the tab reads again and lets the button go.
+  fireEvent.click(await screen.findByRole("button", { name: "취소" }));
+  await waitFor(() => expect(screen.getAllByText("설치됨")).toHaveLength(2));
+  expect(screen.queryByRole("button", { name: "취소" })).toBeNull();
+  first.unmount();
+
+  render(<Settings tab="transcription" onHome={() => {}} />);
+  await waitFor(() => expect(screen.getAllByText("설치됨")).toHaveLength(2));
+  expect(screen.queryByRole("button", { name: "취소" })).toBeNull();
+});
+
+test("once a cancel stopped the download, a later answer cannot turn its end into a failure", async () => {
+  const answers = ["stopped", null];
+  mockIPC((cmd) => {
+    if (cmd === "download_models") {
+      return new Promise((_, reject) => (release = () => reject("모델 다운로드를 취소했습니다")));
+    }
+    if (cmd === "cancel_model_download") return answers.shift();
+  });
+  const running = startModelDownload();
+  expect(await cancelModelDownload()).toBe("stopped");
+  expect(await cancelModelDownload("summary")).toBeNull();
+  release();
+  await running;
+  expect(modelDownloadFailure()).toBe("");
 });
 
 test("the 전사 tab explains a GPU fallback in automatic mode", async () => {

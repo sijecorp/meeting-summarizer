@@ -1,25 +1,30 @@
-//! Model files (architecture 5.1, ONB-01, ONB-02): the chosen Whisper model and the Silero VAD
-//! model, downloaded with resume and sha256 verification, or imported from a file the recorder
-//! picked. Files land in `{local app data}/models/`; a download grows as `{file}.part` until
-//! its hash checks out.
+//! Model files (architecture 5.1, ONB-01, ONB-02): the chosen Whisper model, the Silero VAD
+//! model and the built-in summary model (plan 5.2), downloaded with resume and sha256
+//! verification, or imported from a file the recorder picked. Files land in
+//! `{local app data}/models/`; a download grows as `{file}.part` until its hash checks out.
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+#[derive(Debug)]
 pub struct ModelFile {
     pub repo: &'static str,
+    /// The commit the download URL pins (plan 5.2): a file uploaded again on `main` cannot turn
+    /// every new install into a hash failure.
+    pub revision: &'static str,
     pub file: &'static str,
     pub size: u64,
     pub sha256: &'static str,
 }
 
-/// `settings.model` → file. Hashes checked on Hugging Face on 2026-10-13 (architecture 5.1).
+/// `settings.model` → file. Hashes checked on Hugging Face on 2026-10-13 (architecture 5.1); the
+/// revisions are the commits `main` pointed at on 2026-10-16, where each file has these hashes.
 /// `tiny` is for development only (try the pipeline without an 874 MB download); the settings
 /// screen never offers it.
 const WHISPER: [(&str, ModelFile); 4] = [
@@ -27,6 +32,7 @@ const WHISPER: [(&str, ModelFile); 4] = [
         "large-v3-turbo-q8_0",
         ModelFile {
             repo: "ggerganov/whisper.cpp",
+            revision: "5359861c739e955e79d9a303bcbc70fb988958b1",
             file: "ggml-large-v3-turbo-q8_0.bin",
             size: 874_188_075,
             sha256: "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1",
@@ -36,6 +42,7 @@ const WHISPER: [(&str, ModelFile); 4] = [
         "large-v3-turbo",
         ModelFile {
             repo: "ggerganov/whisper.cpp",
+            revision: "5359861c739e955e79d9a303bcbc70fb988958b1",
             file: "ggml-large-v3-turbo.bin",
             size: 1_624_555_275,
             sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
@@ -45,6 +52,7 @@ const WHISPER: [(&str, ModelFile); 4] = [
         "medium-q5_0",
         ModelFile {
             repo: "ggerganov/whisper.cpp",
+            revision: "5359861c739e955e79d9a303bcbc70fb988958b1",
             file: "ggml-medium-q5_0.bin",
             size: 539_212_467,
             sha256: "19fea4b380c3a618ec4723c3eef2eb785ffba0d0538cf43f8f235e7b3b34220f",
@@ -54,6 +62,7 @@ const WHISPER: [(&str, ModelFile); 4] = [
         "tiny",
         ModelFile {
             repo: "ggerganov/whisper.cpp",
+            revision: "5359861c739e955e79d9a303bcbc70fb988958b1",
             file: "ggml-tiny.bin",
             size: 77_691_713,
             sha256: "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21",
@@ -62,15 +71,33 @@ const WHISPER: [(&str, ModelFile); 4] = [
 ];
 pub const VAD: ModelFile = ModelFile {
     repo: "ggml-org/whisper-vad",
+    revision: "9ffd54a1e1ee413ddf265af9913beaf518d1639b",
     file: "ggml-silero-v6.2.0.bin",
     size: 885_098,
     sha256: "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987",
+};
+/// The built-in summary model (plan 5.2), checked on Hugging Face on 2026-10-16.
+pub const SUMMARY: ModelFile = ModelFile {
+    repo: "unsloth/Qwen3.5-4B-GGUF",
+    revision: "e87f176479d0855a907a41277aca2f8ee7a09523",
+    file: "Qwen3.5-4B-Q4_K_M.gguf",
+    size: 2_740_937_888,
+    sha256: "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
 };
 /// D12: give up on a connection after 10 s, and on a download that sends nothing for 30 s.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Attempts per file. Each one after the first resumes where the last stopped.
 const ATTEMPTS: u32 = 3;
+/// Plan 5.2: free space a download leaves beyond its file.
+const DISK_MARGIN: u64 = 1_000_000_000;
+
+impl ModelFile {
+    /// What a mirror serves under its base URL (`docs/install.md`).
+    pub fn url_path(&self) -> String {
+        format!("{}/resolve/{}/{}", self.repo, self.revision, self.file)
+    }
+}
 
 /// The two files transcription needs: the chosen Whisper model and the VAD model.
 pub fn needed(model: &str) -> Result<[&'static ModelFile; 2], String> {
@@ -81,12 +108,15 @@ pub fn needed(model: &str) -> Result<[&'static ModelFile; 2], String> {
     Ok([whisper, &VAD])
 }
 
-/// `model://download`, about once per percent.
+/// `model://download`, about once per percent of the file being fetched. `all_*` add up every file
+/// of the download (E3, DX12), the ones already in place counted whole.
 #[derive(Serialize, Clone, Debug)]
 pub struct DownloadProgress {
     pub file: &'static str,
     pub received: u64,
     pub total: u64,
+    pub all_received: u64,
+    pub all_total: u64,
 }
 
 #[derive(Serialize, Debug)]
@@ -96,6 +126,8 @@ pub struct FileState {
     pub installed: bool,
     /// Bytes in `{file}.part`, kept for resuming.
     pub received: u64,
+    /// The running download still has this file to fetch, now or later in its chain (DX6).
+    pub downloading: bool,
 }
 
 /// For the settings card and the transcription tab.
@@ -122,6 +154,25 @@ type CancelMark = Arc<Mutex<bool>>;
 struct Current {
     mark: CancelMark,
     abort: Box<dyn Fn() + Send>,
+    /// The files the download has yet to finish, the one in flight first. A scoped `cancel` takes
+    /// files out from behind it.
+    left: Arc<Mutex<Vec<&'static ModelFile>>>,
+}
+
+impl Current {
+    fn ahead(&self, f: &ModelFile) -> bool {
+        lock(&self.left).iter().any(|l| l.file == f.file)
+    }
+}
+
+/// What `cancel` did (DX12).
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Cancelled {
+    /// The download ended at once, the rest of its chain with it.
+    Stopped,
+    /// Files still ahead left its chain; the one in flight goes on.
+    Dropped,
 }
 
 /// How a model file looked when hashed.
@@ -235,16 +286,39 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
         .map_err(|e| e.to_string())
 }
 
-/// One file into `dest`: attempts that resume each other, then the hash check.
+/// Plan 5.2, ENG13: what is left to fetch (the size less the `.part` already there) plus
+/// `DISK_MARGIN` must fit in `free`.
+fn room(f: &ModelFile, part: u64, free: u64) -> Result<(), String> {
+    // An oversized `.part` is dropped and the whole file fetched; a complete one only waits for
+    // its hash check.
+    let left = f.size.checked_sub(part).unwrap_or(f.size);
+    let need = left + DISK_MARGIN;
+    if left == 0 || free >= need {
+        return Ok(());
+    }
+    let what = if f.file == SUMMARY.file {
+        "요약 모델"
+    } else {
+        "전사 모델"
+    };
+    // In GB, rounded up to 0.1.
+    let short = (need - free).div_ceil(100_000_000) as f64 / 10.0;
+    Err(format!(
+        "{what}을 받으려면 디스크에 {short} GB가 더 필요합니다"
+    ))
+}
+
+/// One file into `dest`: attempts that resume each other, then the hash check. `on_progress` gets
+/// the bytes in the `.part`.
 async fn fetch(
     client: &reqwest::Client,
     base_url: &str,
     dest: &Path,
     f: &'static ModelFile,
     mark: &CancelMark,
-    on_progress: &impl Fn(DownloadProgress),
+    on_progress: &impl Fn(u64),
 ) -> Result<(), String> {
-    let url = format!("{base_url}/{}/resolve/main/{}", f.repo, f.file);
+    let url = format!("{base_url}/{}", f.url_path());
     let part = part_of(dest);
     let mut attempt = 1;
     loop {
@@ -267,10 +341,17 @@ async fn fetch_once(
     url: &str,
     part: &Path,
     f: &'static ModelFile,
-    on_progress: &impl Fn(DownloadProgress),
+    on_progress: &impl Fn(u64),
 ) -> Result<(), Fetch> {
     let retry = |e: reqwest::Error| Fetch::Retry(format!("모델을 받지 못했습니다: {e}"));
     let io = |e: std::io::Error| Fetch::Stop(format!("모델 파일을 쓸 수 없습니다: {e}"));
+    // ENG13: a mirror serving another file fails here, not after gigabytes and a hash check.
+    let mismatch = |total: u64| {
+        Fetch::Stop(format!(
+            "서버가 알려 준 크기({total} 바이트)가 {}의 크기({} 바이트)와 달라 받지 않았습니다: {url}. 사내 미러라면 이 경로가 Hugging Face의 같은 파일을 그대로 넘기는지 확인해 주세요",
+            f.file, f.size
+        ))
+    };
     let mut received = fs::metadata(part).map_or(0, |m| m.len());
     if received == f.size {
         // Complete; only the hash check is left.
@@ -287,14 +368,19 @@ async fn fetch_once(
     let mut response = request.send().await.map_err(retry)?;
     let status = response.status();
     let mut file = if status == reqwest::StatusCode::PARTIAL_CONTENT {
-        // Appended only where the server says the range starts: `bytes {start}-{end}/{size}`.
-        let start = response
+        // Appended only where the server says the range starts: `bytes {start}-{end}/{size}`. The
+        // body is only the rest, so the size checked is the one after `/` (a `*` is no size).
+        let range = response
             .headers()
             .get(reqwest::header::CONTENT_RANGE)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("bytes "))
-            .and_then(|v| v.split('-').next())
-            .and_then(|v| v.parse::<u64>().ok());
+            .unwrap_or("");
+        let start = range.split('-').next().and_then(|v| v.parse::<u64>().ok());
+        let total = range.rsplit_once('/').and_then(|(_, v)| v.parse().ok());
+        if let Some(total) = total.filter(|&total| total != f.size) {
+            return Err(mismatch(total));
+        }
         if start != Some(received) {
             fs::remove_file(part).map_err(io)?;
             return Err(Fetch::Retry(format!(
@@ -307,14 +393,11 @@ async fn fetch_once(
             .open(part)
             .map_err(io)?
     } else if status.is_success() {
-        // The server ignored the range and sends the whole file. Only replace what we have with
-        // something of the model's size.
-        if received > 0 && response.content_length() != Some(f.size) {
-            return Err(Fetch::Stop(format!(
-                "서버가 이어받기를 지원하지 않고, 받은 크기({:?})도 모델과 다릅니다 ({url})",
-                response.content_length()
-            )));
+        if let Some(total) = response.content_length().filter(|&total| total != f.size) {
+            return Err(mismatch(total));
         }
+        // The server ignored the range and sends the whole file, of the model's size or of a size
+        // untold: it replaces what we have, and the hash decides.
         received = 0;
         File::create(part).map_err(io)?
     } else {
@@ -328,11 +411,7 @@ async fn fetch_once(
         received += bytes.len() as u64;
         if received * 100 / f.size != shown {
             shown = received * 100 / f.size;
-            on_progress(DownloadProgress {
-                file: f.file,
-                received,
-                total: f.size,
-            });
+            on_progress(received);
         }
     }
     // Only an fsync: it changes nothing a later download could trip over if it runs on after a
@@ -365,7 +444,7 @@ impl Models {
 
     /// By size only; the hash was checked when the file was installed, and again by `download`
     /// and `verify`.
-    fn installed(&self, f: &ModelFile) -> bool {
+    pub fn installed(&self, f: &ModelFile) -> bool {
         fs::metadata(self.path(f)).is_ok_and(|m| m.len() == f.size)
     }
 
@@ -397,42 +476,67 @@ impl Models {
             .unwrap_or(Check::Intact)
     }
 
-    pub fn state(&self, model: &str) -> Result<ModelState, String> {
-        let files = needed(model)?
-            .into_iter()
-            .map(|f| FileState {
-                file: f.file,
-                size: f.size,
-                installed: self.installed(f),
-                received: fs::metadata(part_of(&self.path(f))).map_or(0, |m| m.len()),
+    pub fn state(&self, files: &[&ModelFile]) -> ModelState {
+        let current = lock(&self.current);
+        let files = files
+            .iter()
+            .map(|f| {
+                let installed = self.installed(f);
+                FileState {
+                    file: f.file,
+                    size: f.size,
+                    installed,
+                    received: fs::metadata(part_of(&self.path(f))).map_or(0, |m| m.len()),
+                    downloading: !installed && current.as_ref().is_some_and(|c| c.ahead(f)),
+                }
             })
             .collect();
-        Ok(ModelState {
+        ModelState {
             files,
             downloading: self.busy.load(Ordering::SeqCst),
-        })
-    }
-
-    /// Stops the download at once. What arrived stays in the `.part` for resuming, and nothing is
-    /// installed or deleted afterwards (`CancelMark`).
-    pub fn cancel(&self) {
-        if let Some(current) = lock(&self.current).as_ref() {
-            *lock(&current.mark) = true;
-            (current.abort)();
         }
     }
 
-    /// ONB-01: downloads what is missing or damaged from `{base}/{repo}/resolve/main/{file}`.
-    /// Runs as its own task so `cancel` can drop it wherever it waits.
+    /// Stops the download at once, and with it the rest of its chain. What arrived stays in the
+    /// `.part` for resuming, and nothing is installed or deleted afterwards (`CancelMark`).
+    /// `only`: just these files. One of them in flight stops the download all the same; ones
+    /// still ahead only leave its chain. `None` when there was nothing of them to cancel.
+    pub fn cancel(&self, only: Option<&[&ModelFile]>) -> Option<Cancelled> {
+        let current = lock(&self.current);
+        let current = current.as_ref()?;
+        if let Some(only) = only {
+            let ours = |f: &&ModelFile| only.iter().any(|o| o.file == f.file);
+            let mut left = lock(&current.left);
+            if !ours(left.first()?) {
+                let before = left.len();
+                left.retain(|f| !ours(f));
+                return (left.len() < before).then_some(Cancelled::Dropped);
+            }
+        }
+        *lock(&current.mark) = true;
+        (current.abort)();
+        Some(Cancelled::Stopped)
+    }
+
+    /// ONB-01, E3: fetches `files` in order from `{base}/{repo}/resolve/{revision}/{file}`, each
+    /// only if missing or damaged and only if the disk has room. A file that fails does not stop
+    /// the next, and `on_installed` follows each one installed; the error lists the failures, one
+    /// per line. Runs as its own task so `cancel` can drop it, the rest of the chain with it,
+    /// wherever it waits. Progress also comes after a file found intact or failed. A file's
+    /// `received` only grows and never passes its size, a failed file counting as far as it came,
+    /// so `all_received` of `all_total` only grows too.
     pub async fn download(
         &self,
         base_url: &str,
-        files: [&'static ModelFile; 2],
+        files: &[&'static ModelFile],
         on_progress: impl Fn(DownloadProgress) + Send + Sync + 'static,
+        on_installed: impl Fn(&'static ModelFile) + Send + 'static,
     ) -> Result<(), String> {
         let busy = Busy::take(&self.busy, "이미 모델을 받는 중입니다")?;
         let dir = self.dir.clone();
         let base_url = base_url.trim().trim_end_matches('/').to_string();
+        let left = Arc::new(Mutex::new(files.to_vec()));
+        let task_left = left.clone();
         let mark = CancelMark::default();
         let task_mark = mark.clone();
         let task = {
@@ -443,24 +547,86 @@ impl Models {
                 let _busy = busy;
                 fs::create_dir_all(&dir).map_err(|e| format!("모델 폴더 생성 실패: {e}"))?;
                 let client = client()?;
-                for f in files {
+                // `done`: the bytes of the files behind. `all_total` is those plus the files left.
+                let report = |f: &'static ModelFile, received, done, now| {
+                    let left: u64 = lock(&task_left).iter().map(|f| f.size).sum();
+                    on_progress(DownloadProgress {
+                        file: f.file,
+                        received,
+                        total: f.size,
+                        all_received: done + now,
+                        all_total: done + left,
+                    })
+                };
+                let mut done = 0;
+                let mut failed = Vec::new();
+                loop {
+                    // Should the abort land late, no next file starts all the same.
+                    if *lock(&task_mark) {
+                        return Err(CANCELLED.to_string());
+                    }
+                    let Some(&f) = lock(&task_left).first() else {
+                        break;
+                    };
                     let dest = dir.join(f.file);
                     // The right size can still be the wrong bytes: the hash decides (deleted if
                     // not).
-                    if fs::metadata(&dest).is_ok_and(|m| m.len() == f.size) {
+                    let intact = fs::metadata(&dest).is_ok_and(|m| m.len() == f.size) && {
                         let (path, mark) = (dest.clone(), task_mark.clone());
-                        if blocking(move || check(&path, f, &mark)).await? == Check::Intact {
-                            continue;
+                        blocking(move || check(&path, f, &mark)).await? == Check::Intact
+                    };
+                    let shown = AtomicU64::new(0);
+                    let fetched = if intact {
+                        Ok(())
+                    } else {
+                        let part = fs::metadata(part_of(&dest)).map_or(0, |m| m.len());
+                        // Free space that cannot be read does not hold the download back.
+                        match crate::audio::free_space(&dir)
+                            .map_or(Ok(()), |free| room(f, part, free))
+                        {
+                            Ok(()) => {
+                                // The high-water mark: a restart from 0 (a whole file answered
+                                // to a `Range`) shows no step back.
+                                let progress = |received: u64| {
+                                    let received = received.min(f.size);
+                                    let high = shown.fetch_max(received, Ordering::SeqCst);
+                                    let high = high.max(received);
+                                    report(f, high, done, high);
+                                };
+                                fetch(&client, &base_url, &dest, f, &task_mark, &progress).await
+                            }
+                            refused => refused,
+                        }
+                    };
+                    lock(&task_left).remove(0);
+                    match fetched {
+                        Ok(()) if intact => {
+                            done += f.size;
+                            report(f, f.size, done, 0);
+                        }
+                        Ok(()) => {
+                            done += f.size;
+                            on_installed(f);
+                        }
+                        Err(e) => {
+                            failed.push(e);
+                            let came = shown.load(Ordering::SeqCst);
+                            done += came;
+                            report(f, came, done, 0);
                         }
                     }
-                    fetch(&client, &base_url, &dest, f, &task_mark, &on_progress).await?;
                 }
-                Ok(())
+                if failed.is_empty() {
+                    Ok(())
+                } else {
+                    Err(failed.join("\n"))
+                }
             });
             let abort = task.inner().abort_handle();
             *current = Some(Current {
                 mark: mark.clone(),
                 abort: Box::new(move || abort.abort()),
+                left,
             });
             task
         };
@@ -483,13 +649,17 @@ impl Models {
     }
 
     /// ONB-02: installs a file the recorder picked, when it is one of `candidates` by size and
-    /// sha256. Blocking: hashing a model takes seconds.
-    pub fn import(&self, src: &Path, candidates: &[&ModelFile]) -> Result<(), String> {
+    /// sha256, and says which. Blocking: hashing a model takes seconds.
+    pub fn import(
+        &self,
+        src: &Path,
+        candidates: &[&'static ModelFile],
+    ) -> Result<&'static ModelFile, String> {
         let _busy = Busy::take(&self.busy, "모델을 받는 중에는 가져올 수 없습니다")?;
         let size = fs::metadata(src)
             .map_err(|e| format!("고른 파일을 읽을 수 없습니다: {e}"))?
             .len();
-        let f = candidates
+        let &f = candidates
             .iter()
             .find(|f| f.size == size)
             .ok_or("고른 파일은 이 앱이 쓰는 모델 파일이 아닙니다(크기가 다릅니다)")?;
@@ -503,7 +673,8 @@ impl Models {
             let _ = fs::remove_file(&staged);
             return Err(format!("모델 파일 복사 실패: {e}"));
         }
-        install(&staged, &dest, f, &Mutex::new(false))
+        install(&staged, &dest, f, &Mutex::new(false))?;
+        Ok(f)
     }
 }
 
@@ -514,9 +685,18 @@ mod tests {
     /// sha256("hello").
     static HELLO: ModelFile = ModelFile {
         repo: "test/repo",
+        revision: "0123456789abcdef0123456789abcdef01234567",
         file: "hello.bin",
         size: 5,
         sha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+    };
+    /// sha256("world").
+    static WORLD: ModelFile = ModelFile {
+        repo: "test/repo",
+        revision: "0123456789abcdef0123456789abcdef01234567",
+        file: "world.bin",
+        size: 5,
+        sha256: "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7",
     };
 
     #[test]
@@ -570,6 +750,7 @@ mod tests {
         let hashing = started.elapsed();
         let big: &'static ModelFile = Box::leak(Box::new(ModelFile {
             repo: "test/repo",
+            revision: HELLO.revision,
             file: "big.bin",
             size,
             sha256: sha256.leak(),
@@ -578,12 +759,13 @@ mod tests {
         let result = std::thread::scope(|s| {
             s.spawn(|| {
                 std::thread::sleep(hashing / 4);
-                models.cancel();
+                assert_eq!(models.cancel(None), Some(Cancelled::Stopped));
             });
             // No request is made: the `.part` is complete, only the hash check is left.
             tauri::async_runtime::block_on(models.download(
                 "http://127.0.0.1:9",
-                [big, big],
+                &[big],
+                |_| {},
                 |_| {},
             ))
         });
@@ -643,13 +825,16 @@ mod tests {
     fn every_setting_model_has_a_file() {
         for (name, f) in &WHISPER {
             assert_eq!(needed(name).unwrap()[0].file, f.file);
+        }
+        for f in WHISPER.iter().map(|(_, f)| f).chain([&VAD, &SUMMARY]) {
             assert_eq!(f.sha256.len(), 64);
+            assert_eq!(f.revision.len(), 40, "{}", f.file);
         }
         assert!(needed("large-v3").is_err());
         let tmp = tempfile::tempdir().unwrap();
         let models = Models::new(tmp.path().to_path_buf());
         assert!(models.ready("large-v3-turbo-q8_0").is_none());
-        let state = models.state("large-v3-turbo-q8_0").unwrap();
+        let state = models.state(&needed("large-v3-turbo-q8_0").unwrap());
         assert_eq!(state.files.len(), 2);
         assert!(state.files.iter().all(|f| !f.installed && f.received == 0));
     }
@@ -768,13 +953,15 @@ mod tests {
         // The right size, the wrong bytes: size alone would call it installed.
         fs::write(models.path(&HELLO), b"hellp").unwrap();
         let (url, server) = serve(vec![reply("200 OK", "", b"hello")], Duration::ZERO);
-        tauri::async_runtime::block_on(models.download(&url, [&HELLO, &HELLO], |_| {})).unwrap();
+        tauri::async_runtime::block_on(models.download(&url, &[&HELLO], |_| {}, |_| {})).unwrap();
         assert_eq!(fs::read(models.path(&HELLO)).unwrap(), b"hello");
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
+    /// DX12: the cancel stops the chain too. A next file fetched after it would wait on the held
+    /// server for 5 s and miss the 2 s below.
     #[test]
-    fn cancel_stops_a_stalled_download_at_once_and_frees_import() {
+    fn cancel_stops_a_stalled_download_and_its_chain_at_once_and_frees_import() {
         let tmp = tempfile::tempdir().unwrap();
         let models = Models::new(tmp.path().to_path_buf());
         // Two of five bytes, then nothing for 5 s (the stall timeout is 30 s).
@@ -787,13 +974,23 @@ mod tests {
                 // Once the two bytes are in the `.part`, however long a loaded machine took, the
                 // download only waits. A fixed sleep could cancel before the `.part` existed.
                 let _ = arrived.into_iter().any(|received| received == 2);
-                models.cancel();
+                let state = models.state(&[&HELLO, &WORLD, &VAD]);
+                let downloading: Vec<bool> = state.files.iter().map(|f| f.downloading).collect();
+                assert_eq!(downloading, [true, true, false]);
+                // Not for a file this download does not have.
+                assert_eq!(models.cancel(Some(&[&VAD])), None);
+                // HELLO is in flight: the whole download stops, WORLD ahead with it.
+                assert_eq!(models.cancel(Some(&[&HELLO])), Some(Cancelled::Stopped));
                 Instant::now()
             });
-            let result =
-                tauri::async_runtime::block_on(models.download(&url, [&HELLO, &HELLO], move |p| {
+            let result = tauri::async_runtime::block_on(models.download(
+                &url,
+                &[&HELLO, &WORLD],
+                move |p| {
                     let _ = progress.send(p.received);
-                }));
+                },
+                |_| {},
+            ));
             (result, canceller.join().unwrap())
         });
         assert_eq!(result.unwrap_err(), CANCELLED);
@@ -804,6 +1001,293 @@ mod tests {
         );
         assert!(!models.busy.load(Ordering::SeqCst));
         assert_eq!(fs::read(part_of(&models.path(&HELLO))).unwrap(), b"he");
+        assert!(!part_of(&models.path(&WORLD)).exists());
+        assert!(!models.state(&[&WORLD]).files[0].downloading);
+        assert_eq!(models.cancel(None), None);
+    }
+
+    /// DX12: a scoped cancel of a file still ahead takes it out of the chain and lets the file in
+    /// flight finish.
+    #[test]
+    fn a_cancel_of_a_file_ahead_drops_it_and_the_download_goes_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = Models::new(tmp.path().to_path_buf());
+        // Two of five bytes, the rest once the cancel is in.
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0; 1024];
+            let _ = stream.read(&mut buf).unwrap();
+            let whole = reply("200 OK", "", b"hello");
+            let (head, rest) = whole.split_at(whole.len() - 3);
+            stream.write_all(head).unwrap();
+            wait.recv().unwrap();
+            stream.write_all(rest).unwrap();
+        });
+        let (progress, arrived) = std::sync::mpsc::channel();
+        let result = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _ = arrived.into_iter().any(|received| received == 2);
+                assert_eq!(models.cancel(Some(&[&WORLD])), Some(Cancelled::Dropped));
+                assert!(!models.state(&[&WORLD]).files[0].downloading);
+                // Nothing of it is left to cancel.
+                assert_eq!(models.cancel(Some(&[&WORLD])), None);
+                go.send(()).unwrap();
+            });
+            tauri::async_runtime::block_on(models.download(
+                &url,
+                &[&HELLO, &WORLD],
+                move |p| {
+                    let _ = progress.send(p.received);
+                },
+                |_| {},
+            ))
+        });
+        result.unwrap();
+        server.join().unwrap();
+        assert!(models.installed(&HELLO) && !models.installed(&WORLD));
+    }
+
+    /// E3: files one by one, a failed one not stopping the next; the URL pins the commit.
+    #[test]
+    fn a_failed_file_does_not_stop_the_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = Models::new(tmp.path().to_path_buf());
+        let (url, server) = serve(
+            vec![
+                reply("404 Not Found", "", b""),
+                reply("200 OK", "", b"hello"),
+            ],
+            Duration::ZERO,
+        );
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let installed = Arc::new(Mutex::new(Vec::new()));
+        let (p, i) = (progress.clone(), installed.clone());
+        let result = tauri::async_runtime::block_on(models.download(
+            &url,
+            &[&WORLD, &HELLO],
+            move |d| p.lock().unwrap().push(d),
+            move |f| i.lock().unwrap().push(f.file),
+        ));
+        assert!(result.unwrap_err().contains("404"));
+        assert_eq!(*installed.lock().unwrap(), ["hello.bin"]);
+        assert!(models.installed(&HELLO) && !models.installed(&WORLD));
+        let paths: Vec<String> = server
+            .join()
+            .unwrap()
+            .iter()
+            .map(|head| head.split(' ').nth(1).unwrap().to_string())
+            .collect();
+        assert_eq!(
+            paths,
+            [WORLD.url_path(), HELLO.url_path()].map(|p| format!("/{p}"))
+        );
+        // The failed file leaves the total, so the percent goes from 0 % of the five bytes that
+        // remain up to all of them, never down.
+        let all: Vec<_> = progress
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| (p.file, p.all_received, p.all_total))
+            .collect();
+        assert_eq!(all, [("world.bin", 0, 5), ("hello.bin", 5, 5)]);
+    }
+
+    /// ENG13: the whole size the server announces, never a `206` body's length, against the table.
+    #[test]
+    fn a_total_other_than_the_table_size_stops_before_writing() {
+        let (result, part, head) = fetch_into(
+            b"he",
+            reply(
+                "206 Partial Content",
+                "Content-Range: bytes 2-4/6\r\n",
+                b"llo",
+            ),
+        );
+        let Err(Fetch::Stop(e)) = result else {
+            panic!("{head}")
+        };
+        // The URL tells a mirror operator which path serves the wrong file.
+        assert!(
+            e.contains("6 바이트") && e.contains("http://127.0.0.1:"),
+            "{e}"
+        );
+        assert_eq!(part.unwrap(), b"he");
+
+        let (result, part, _) = fetch_into(b"", reply("200 OK", "", b"hello, world"));
+        assert!(matches!(result, Err(Fetch::Stop(_))));
+        assert_eq!(part, None);
+    }
+
+    #[test]
+    fn a_missing_size_leaves_it_to_the_hash() {
+        let (result, part, _) = fetch_into(
+            b"he",
+            reply(
+                "206 Partial Content",
+                "Content-Range: bytes 2-4/*\r\n",
+                b"llo",
+            ),
+        );
+        assert!(result.is_ok());
+        assert_eq!(part.unwrap(), b"hello");
+
+        // No Content-Length: the body runs to the end of the connection.
+        let (result, part, _) = fetch_into(
+            b"",
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello".to_vec(),
+        );
+        assert!(result.is_ok());
+        assert_eq!(part.unwrap(), b"hello");
+    }
+
+    /// A resume answered by a whole file of untold size starts over, without the `Range`, and the
+    /// hash decides.
+    #[test]
+    fn a_resume_without_a_size_starts_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = Models::new(tmp.path().to_path_buf());
+        fs::write(part_of(&models.path(&HELLO)), b"he").unwrap();
+        let untold = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello".to_vec();
+        let (url, server) = serve(vec![untold], Duration::ZERO);
+        tauri::async_runtime::block_on(models.download(&url, &[&HELLO], |_| {}, |_| {})).unwrap();
+        assert_eq!(fs::read(models.path(&HELLO)).unwrap(), b"hello");
+        let heads = server.join().unwrap();
+        assert_eq!(heads.len(), 1);
+        assert!(heads[0].contains("range: bytes=2-"), "{}", heads[0]);
+    }
+
+    /// A broken attempt resumed at 4 of 5 bytes, answered by the whole file from 0: the progress
+    /// holds at 4 instead of stepping back to 2.
+    #[test]
+    fn a_restart_from_zero_shows_no_step_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = Models::new(tmp.path().to_path_buf());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut buf = [0; 1024];
+            // Four of five bytes, then the connection closes.
+            let (mut first, _) = listener.accept().unwrap();
+            let _ = first.read(&mut buf).unwrap();
+            let mut cut = reply("200 OK", "", b"hello");
+            cut.truncate(cut.len() - 1);
+            first.write_all(&cut).unwrap();
+            drop(first);
+            // The `Range` ignored: the whole file, in two writes.
+            let (mut second, _) = listener.accept().unwrap();
+            let _ = second.read(&mut buf).unwrap();
+            let whole = reply("200 OK", "", b"hello");
+            let (head, rest) = whole.split_at(whole.len() - 3);
+            second.write_all(head).unwrap();
+            second.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            second.write_all(rest).unwrap();
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let into = seen.clone();
+        tauri::async_runtime::block_on(models.download(
+            &url,
+            &[&HELLO],
+            move |p| into.lock().unwrap().push((p.received, p.all_received)),
+            |_| {},
+        ))
+        .unwrap();
+        server.join().unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(seen.windows(2).all(|w| w[0] <= w[1]), "{seen:?}");
+        assert_eq!((seen[0], *seen.last().unwrap()), ((4, 4), (5, 5)));
+    }
+
+    #[test]
+    fn room_counts_what_is_left_plus_a_gigabyte() {
+        // An almost complete `.part`: one byte left.
+        let almost = SUMMARY.size - 1;
+        assert!(room(&SUMMARY, almost, DISK_MARGIN + 1).is_ok());
+        assert_eq!(
+            room(&SUMMARY, almost, DISK_MARGIN).unwrap_err(),
+            "요약 모델을 받으려면 디스크에 0.1 GB가 더 필요합니다"
+        );
+        assert_eq!(
+            room(&SUMMARY, 0, 0).unwrap_err(),
+            "요약 모델을 받으려면 디스크에 3.8 GB가 더 필요합니다"
+        );
+        // A complete `.part` only waits for its hash check.
+        assert!(room(&SUMMARY, SUMMARY.size, 0).is_ok());
+        // An oversized `.part` is fetched again whole.
+        assert!(room(&VAD, VAD.size + 1, DISK_MARGIN + VAD.size - 1).is_err());
+        assert_eq!(
+            room(&VAD, 0, 0).unwrap_err(),
+            "전사 모델을 받으려면 디스크에 1.1 GB가 더 필요합니다"
+        );
+    }
+
+    #[test]
+    fn a_short_disk_fetches_nothing() {
+        static HUGE: ModelFile = ModelFile {
+            size: 1 << 60,
+            ..WORLD
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let models = Models::new(tmp.path().to_path_buf());
+        // Port 9 refuses: a request would end in a network error, not this one.
+        let e = tauri::async_runtime::block_on(models.download(
+            "http://127.0.0.1:9",
+            &[&HUGE],
+            |_| {},
+            |_| {},
+        ))
+        .unwrap_err();
+        assert!(e.starts_with("전사 모델을 받으려면 디스크에"), "{e}");
+        assert!(!part_of(&models.path(&HUGE)).exists());
+    }
+
+    /// Plan 5.2: a reinstall keeps the same `models` folder, so a model file already there counts
+    /// as installed and is not fetched again. One path for every row, the summary model included:
+    /// a small file stands in for its 2.7 GB.
+    #[test]
+    fn a_reinstall_reuses_a_model_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = Models::new(tmp.path().to_path_buf());
+        fs::write(models.path(&HELLO), b"hello").unwrap();
+        let state = models.state(&[&HELLO]);
+        assert!(state.files[0].installed && !state.files[0].downloading);
+
+        let installed = Arc::new(Mutex::new(Vec::new()));
+        let into = installed.clone();
+        tauri::async_runtime::block_on(models.download(
+            "http://127.0.0.1:9",
+            &[&HELLO],
+            |_| {},
+            move |f| into.lock().unwrap().push(f.file),
+        ))
+        .unwrap();
+        assert!(installed.lock().unwrap().is_empty());
+    }
+
+    /// DX11: the mirror table in `docs/install.md` is the model table, row for row.
+    #[test]
+    fn install_md_lists_the_files_a_mirror_serves() {
+        let doc = include_str!("../../../docs/install.md");
+        let rows: Vec<Vec<String>> = doc
+            .lines()
+            .filter(|l| l.starts_with('|') && l.contains("/resolve/"))
+            .map(|l| {
+                l.split('|')
+                    .skip(2)
+                    .take(3)
+                    .map(|c| c.trim().trim_matches('`').to_string())
+                    .collect()
+            })
+            .collect();
+        let [whisper, vad] = needed("large-v3-turbo-q8_0").unwrap();
+        let table: Vec<Vec<String>> = [whisper, vad, &SUMMARY]
+            .iter()
+            .map(|f| vec![f.url_path(), f.size.to_string(), f.sha256.to_string()])
+            .collect();
+        assert_eq!(rows, table);
     }
 
     /// Hits the network: `cargo test -- --ignored downloads_and_resumes`. Downloads the 885 KB VAD
@@ -818,8 +1302,9 @@ mod tests {
             let into = seen.clone();
             tauri::async_runtime::block_on(models.download(
                 "https://huggingface.co/",
-                [&VAD, &VAD],
+                &[&VAD],
                 move |p| into.lock().unwrap().push(p.received),
+                |_| {},
             ))
             .unwrap();
             std::mem::take(&mut *seen.lock().unwrap())

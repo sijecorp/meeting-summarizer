@@ -2021,6 +2021,25 @@ mod tests {
             assert!(!f.store().get(&id).unwrap().summarize_local);
         }
 
+        /// E3: a transcription file in place only pumps; the summary model, downloaded or imported
+        /// (`commands::arrived`), also queues the `transcribed` meetings.
+        #[test]
+        fn the_summary_model_arriving_queues_the_transcribed_meetings() {
+            let f = fixture(SPEECH, Backend::Auto);
+            let id = f.recorded();
+            f.queue().enqueue_pending();
+            f.wait("transcribed", || f.queue().snapshot().is_empty());
+            let stub = serve(|_| Some(completion(SUMMARY)));
+            // Saved past `save_settings`, which would queue it by itself.
+            f.connect(vec![connection(&stub.url, "회사 클라우드", false)]);
+
+            crate::commands::arrived(&f.queue(), &model::VAD);
+            assert!(f.queue().snapshot().is_empty());
+            assert_eq!(f.status(&id), Status::Transcribed);
+            crate::commands::arrived(&f.queue(), &model::SUMMARY);
+            f.wait("review", || f.status(&id) == Status::Review);
+        }
+
         /// SUM-10: no LLM request at all.
         #[test]
         fn too_little_speech_goes_to_review_without_asking_the_llm() {

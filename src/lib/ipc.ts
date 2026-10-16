@@ -267,38 +267,58 @@ export const onMeetingProgress = (handler: (progress: Progress) => void) =>
 export const onGpuFailed = (handler: (notice: { message: string }) => void) =>
   listen<{ message: string }>("transcribe://gpu-failed", (e) => handler(e.payload));
 
-/** `received`: bytes in the `.part` file kept for resuming. */
-export type ModelFileState = { file: string; size: number; installed: boolean; received: number };
-/** The chosen Whisper model and the VAD model. */
+/** What the model commands act on (DX12). `all`, the default: the chosen Whisper model and the VAD
+ * model, then the summary model while the built-in LLM is the default (`default_llm` null).
+ * `transcription`: the Whisper and VAD models only. `summary`: the summary model only. */
+export type ModelScope = "all" | "transcription" | "summary";
+/** `received`: bytes in the `.part` file kept for resuming. `downloading`: the running download
+ * still has this file to fetch, now or later. */
+export type ModelFileState = {
+  file: string;
+  size: number;
+  installed: boolean;
+  received: number;
+  downloading: boolean;
+};
+/** `downloading`: some download or import runs. */
 export type ModelState = { files: ModelFileState[]; downloading: boolean };
-/** `model://download`, about once per percent. */
-export type ModelDownload = { file: string; received: number; total: number };
-export const modelStatus = () => invoke<ModelState>("model_status");
+/** `model://download`, about once per percent of `file`. `all_*`: every file of the download
+ * together, the ones already in place counted whole. */
+export type ModelDownload = {
+  file: string;
+  received: number;
+  total: number;
+  all_received: number;
+  all_total: number;
+};
+export const modelStatus = (scope?: ModelScope) => invoke<ModelState>("model_status", { scope });
 
 // One download for the whole app: it outlives the screen that started it (874 MB takes a while),
 // so Home's setup card and the settings' 전사 tab both follow the same one.
 let download: Promise<void> | null = null;
 let cancelled = false;
 let failure = "";
+// A cancel answered `stopped` for this download: later answers cannot take it back.
+let stopped = false;
 
 /**
- * ONB-01: starts `download_models`, or joins the one running. Settles when both files are
- * installed and verified, or when it fails. Never rejects: the reason stays in
- * `modelDownloadFailure()` until the next download or a successful import, so a screen opened
- * later still shows it. A cancel leaves no reason.
+ * ONB-01: starts `download_models` for `scope`, or joins the one running, whatever its scope.
+ * Settles when every file has been tried (one failing does not stop the next), or when it is
+ * cancelled. Never rejects: the reasons stay in `modelDownloadFailure()` until the next download
+ * or a successful import, so a screen opened later still shows them. A cancel leaves no reason.
  */
-export const startModelDownload = () => {
+export const startModelDownload = (scope?: ModelScope) => {
   if (!download) {
     failure = "";
     // A cancel clicked as the last download settled must not hide this one's failure.
-    cancelled = false;
-    download = invoke<void>("download_models")
+    cancelled = stopped = false;
+    download = invoke<void>("download_models", { scope })
       .catch((e) => {
         if (!cancelled) failure = String(e);
       })
       .finally(() => {
         download = null;
-        cancelled = false;
+        cancelled = stopped = false;
       });
   }
   return download;
@@ -306,17 +326,35 @@ export const startModelDownload = () => {
 /** The download running, if any. */
 export const modelDownload = () => download;
 export const modelDownloadFailure = () => failure;
-/** What arrived stays for resuming. */
-export const cancelModelDownload = () => {
+/** What a cancel did: `stopped` the download and its chain, `dropped` the scope's files still
+ * ahead from the chain (the file in flight goes on), or null with nothing of the scope to cancel. */
+export type ModelCancel = "stopped" | "dropped" | null;
+/** Stops the download and the rest of its chain; what arrived stays for resuming. A narrower scope
+ * cancels only its files (`ModelCancel`). */
+export const cancelModelDownload = (scope?: ModelScope) => {
+  // Set first: the download can reject before this answer arrives. Kept only once one answer
+  // said stopped: after a drop or nothing, the download still runs and may still fail.
   cancelled = true;
-  return invoke<void>("cancel_model_download").catch((e) => {
-    cancelled = false;
-    throw e;
-  });
+  return invoke<ModelCancel>("cancel_model_download", { scope }).then(
+    (done) => {
+      stopped ||= done === "stopped";
+      cancelled = stopped;
+      return done;
+    },
+    (e) => {
+      cancelled = stopped;
+      throw e;
+    },
+  );
 };
-/** Installs a picked model file if its size and sha256 match (ONB-02). */
-export const importModel = (path: string) =>
-  invoke<ModelState>("import_model", { path }).then((state) => {
+/** The import picker's file type (ONB-02): `.bin` for transcription, `.gguf` for the summary model. */
+export const modelFileFilter = (scope?: ModelScope) => ({
+  name: "모델 파일",
+  extensions: scope === "summary" ? ["gguf"] : ["bin"],
+});
+/** Installs a picked model file of `scope` if its size and sha256 match (ONB-02). */
+export const importModel = (path: string, scope?: ModelScope) =>
+  invoke<ModelState>("import_model", { path, scope }).then((state) => {
     failure = "";
     return state;
   });

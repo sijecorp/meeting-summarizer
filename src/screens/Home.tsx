@@ -274,6 +274,8 @@ export default function Home({
   // The model item: a file is missing (or the check failed; the 전사 tab says why), or the shared
   // download (ipc.ts) is running, with its last `model://download`.
   const [noModel, setNoModel] = useState(false);
+  // Where the item's settings link goes: the summary model's tab when only it is missing.
+  const [modelTab, setModelTab] = useState<SettingsTab>("transcription");
   const [downloading, setDownloading] = useState(false);
   const [received, setReceived] = useState<ModelDownload | null>(null);
   const [downloadFailed, setDownloadFailed] = useState(() => !!modelDownloadFailure());
@@ -301,8 +303,11 @@ export default function Home({
   }, [morph, morphFrom]);
 
   const checkModel = () =>
-    modelStatus()
-      .then((state) => state.files.some((f) => !f.installed))
+    Promise.all([modelStatus(), modelStatus("transcription")])
+      .then(([all, transcription]) => {
+        setModelTab(transcription.files.every((f) => f.installed) ? "llm" : "transcription");
+        return all.files.some((f) => !f.installed);
+      })
       .catch(() => true)
       .then(setNoModel);
 
@@ -356,23 +361,23 @@ export default function Home({
             <li className={ITEM}>
               {downloading ? (
                 <span className="tabular-nums">
-                  {`전사 모델 받는 중 ${received ? Math.floor((received.received / received.total) * 100) : 0}%`}
+                  {`모델 받는 중 ${received?.all_total ? Math.floor((received.all_received / received.all_total) * 100) : 0}%`}
                 </span>
               ) : downloadFailed ? (
                 <>
-                  <span>전사 모델을 받지 못했습니다</span>
+                  <span>모델을 받지 못했습니다</span>
                   <Button variant="link" size="xs" onClick={download}>
                     다시 받기
                   </Button>
                 </>
               ) : (
                 <Button variant="link" size="xs" onClick={download}>
-                  전사 모델 받기
+                  모델 받기
                 </Button>
               )}
               {(downloading || downloadFailed) && (
-                <Button variant="link" size="xs" className="text-ink-2 underline" onClick={() => onSetup("transcription")}>
-                  전사 설정
+                <Button variant="link" size="xs" className="text-ink-2 underline" onClick={() => onSetup(modelTab)}>
+                  {modelTab === "llm" ? "요약(LLM) 설정" : "전사 설정"}
                 </Button>
               )}
             </li>
