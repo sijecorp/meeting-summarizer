@@ -319,6 +319,8 @@ pub fn run() {
             commands::stop_recording,
             commands::recording_state,
             commands::list_audio_devices,
+            commands::test_system_audio,
+            commands::test_microphone,
             commands::confirm_quit,
             commands::request_quit,
             commands::queue_state,
@@ -334,6 +336,7 @@ pub fn run() {
             commands::export_markdown,
             commands::slack_length,
             commands::send_to_slack,
+            commands::send_test_message,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

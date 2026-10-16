@@ -27,7 +27,7 @@ const MAX_LENGTH_MS: u64 = 4 * 3_600_000;
 const LENGTH_WARNING_MS: u64 = MAX_LENGTH_MS - 10 * 60_000;
 const SILENCE_PROMPT_MS: u64 = 15 * 60_000;
 /// -50 dBFS (REC-05).
-const SILENT_RMS: f32 = 0.003_162_3;
+pub(super) const SILENT_RMS: f32 = 0.003_162_3;
 /// REC-05 judges silence a second at a time: over one 40 ms level window a single click would
 /// count as sound and restart the 15 minutes.
 const SILENCE_WINDOW_MS: u64 = 1_000;

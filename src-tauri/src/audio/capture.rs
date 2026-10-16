@@ -46,7 +46,7 @@ impl Retry {
     }
 }
 
-struct Input {
+pub(super) struct Input {
     track: Track,
     /// Device id from settings. Ignored for the macOS system track (see `run`).
     pinned: Option<String>,
@@ -147,7 +147,7 @@ pub fn run(
 }
 
 impl Input {
-    fn new(track: Track, pinned: Option<String>) -> Self {
+    pub(super) fn new(track: Track, pinned: Option<String>) -> Self {
         Self {
             track,
             pinned,
@@ -267,7 +267,12 @@ impl Input {
         opened
     }
 
-    fn open_stream(&mut self, device: &Device, sources: &Sender<Source>) -> Result<(), String> {
+    /// Also used by the settings' audio checks (check.rs).
+    pub(super) fn open_stream(
+        &mut self,
+        device: &Device,
+        sources: &Sender<Source>,
+    ) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         if self.track == Track::System {
             // A fresh tap per output device: cheap, and safe even though a global tap follows the

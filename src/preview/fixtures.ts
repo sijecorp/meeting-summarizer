@@ -215,6 +215,8 @@ let models: ModelState = { files: [], downloading: false };
 let recording: { id: string; startedAt: number } | null = null;
 let timers: ReturnType<typeof setInterval>[] = [];
 let downloading: { cancelled: boolean; done: () => void } | null = null;
+/** An audio check is running: like check.rs, a second one is refused. */
+let checking = false;
 
 const find = (id: unknown) => {
   const m = meetings.find((x) => x.meta.id === id);
@@ -243,6 +245,7 @@ export function reset(scenario: Scenario) {
   // ipc.ts keeps one download for the app: let it settle, so the next screens read the new state.
   downloading?.done();
   downloading = null;
+  checking = false;
   recording = null;
   serial = done = 0;
   settings = fullSettings();
@@ -508,15 +511,15 @@ const bands = (t: number, loud: number, seed: number) =>
     return Math.round(Math.min(100, Math.max(0, loud * (1 - i / 28) * wobble * 110)));
   });
 
+/** A voice at `t` seconds, 0..1: syllables about four a second, inside phrases that come and go. */
+const speech = (t: number) =>
+  Math.min(1, Math.max(0, Math.sin(t * 0.9) + 0.35) * (0.55 + 0.45 * Math.abs(Math.sin(t * 6.3))));
+
 function levels() {
   if (!recording) return;
   const elapsed = Date.now() - recording.startedAt;
   const t = elapsed / 1000;
-  // A voice: syllables about four a second, inside phrases that come and go.
-  const voice = Math.min(
-    1,
-    Math.max(0, Math.sin(t * 0.9) + 0.35) * (0.55 + 0.45 * Math.abs(Math.sin(t * 6.3))),
-  );
+  const voice = speech(t);
   const system = Math.max(0, Math.sin(t * 0.37 + 2)) * 0.6;
   const level: Level = {
     elapsed_ms: elapsed,
@@ -554,6 +557,8 @@ type Commands = {
   has_secret: typeof ipc.hasSecret;
   delete_secret: typeof ipc.deleteSecret;
   list_audio_devices: typeof ipc.listAudioDevices;
+  test_system_audio: typeof ipc.testSystemAudio;
+  test_microphone: typeof ipc.testMicrophone;
   list_meetings: typeof ipc.listMeetings;
   get_meeting: typeof ipc.getMeeting;
   get_transcript: typeof ipc.getTranscript;
@@ -567,6 +572,7 @@ type Commands = {
   export_markdown: typeof ipc.exportMarkdown;
   slack_length: typeof ipc.slackLength;
   send_to_slack: typeof ipc.sendToSlack;
+  send_test_message: typeof ipc.sendTestMessage;
   start_recording: typeof ipc.startRecording;
   stop_recording: typeof ipc.stopRecording;
   recording_state: typeof ipc.recordingState;
@@ -601,6 +607,34 @@ const handlers: Handlers = {
     secrets.delete(`${a.kind}:${a.name}`);
   },
   list_audio_devices: () => clone(DEVICES),
+  // The tone plays for a second, then the loopback heard it.
+  test_system_audio: () => {
+    if (checking) throw "이미 테스트 중입니다";
+    if (recording) throw "녹음 중에는 테스트할 수 없습니다";
+    checking = true;
+    return later(1000, () => {
+      checking = false;
+      return true;
+    });
+  },
+  // Five seconds of someone saying a few words, 25 levels a second.
+  test_microphone: () => {
+    if (checking) throw "이미 테스트 중입니다";
+    if (recording) throw "녹음 중에는 테스트할 수 없습니다";
+    checking = true;
+    const started = Date.now();
+    return new Promise<boolean>((resolve) => {
+      const timer = setInterval(() => {
+        const t = (Date.now() - started) / 1000;
+        if (t < 5) return send("audio-test://level", Math.round(10 + speech(t + 1) * 55));
+        clearInterval(timer);
+        checking = false;
+        send("audio-test://level", 0);
+        resolve(true);
+      }, 40);
+      timers.push(timer);
+    });
+  },
 
   list_meetings: () =>
     clone(meetings.map((m) => m.meta).sort((a, b) => b.created_at.localeCompare(a.created_at))),
@@ -687,6 +721,12 @@ const handlers: Handlers = {
       send("slack://finished", a.id);
       return clone(m.meta);
     });
+  },
+
+  send_test_message: (a) => {
+    if (!a.url && !secrets.has(`slack:${a.webhook}`))
+      throw "웹훅 주소가 없습니다. 설정 → Slack에서 웹훅 주소를 입력해 주세요";
+    return later(1000, () => {});
   },
 
   start_recording: () => {

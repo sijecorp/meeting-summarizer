@@ -177,6 +177,15 @@ fn payload(title: &str, text: &str, edits: u32, fallback: bool) -> Value {
     json!({ "text": format!("{} 회의 요약", escape(heading(title))), "blocks": blocks })
 }
 
+/// ONB-06's test message, in mrkdwn: the recorder's name cannot become a mention.
+fn test_payload(recorder: &str) -> Value {
+    let mut text = "회의 요약 테스트 메시지입니다. 이 채널로 회의록이 전송됩니다.".to_string();
+    if !recorder.trim().is_empty() {
+        text += &format!("\n녹음: {}", recorder.trim());
+    }
+    json!({ "text": escape(&text) })
+}
+
 /// SND-03 (7.2): lines added or removed between the generated body and the sent one, by a line
 /// LCS. A removed line next to an added one is one change, not two. A new title adds 1. Without a
 /// generated summary, everything counts against an empty one.
@@ -469,6 +478,29 @@ impl Slack {
                 Err(e)
             }
         }
+    }
+
+    /// `send_test_message` (ONB-06): a fixed message through the same checks and request as a
+    /// meeting's. `typed`: a URL typed in the Slack tab and not saved yet, sent instead of the
+    /// keychain's. Only the outcome comes back, never the URL.
+    pub async fn send_test(
+        &self,
+        settings: &SettingsStore,
+        webhook: &str,
+        typed: Option<String>,
+    ) -> Result<(), String> {
+        let secret = match typed.filter(|url| !url.trim().is_empty()) {
+            Some(url) => Some(url),
+            None => (self.url)(webhook)?,
+        };
+        let url = webhook_url(secret).map_err(|f| f.message())?;
+        let recorder = settings
+            .load()
+            .map(|l| l.settings.recorder_name)
+            .unwrap_or_default();
+        post(&url, &test_payload(&recorder), self.timeout)
+            .await
+            .map_err(|f| f.message())
     }
 
     /// Between the save and the result: the webhook, the message, the request.
@@ -1089,6 +1121,55 @@ mod tests {
         let error = f.send("주간 회의", "- 본문").unwrap_err();
         assert!(error.contains("설정 → Slack"), "{error}");
         assert_eq!(f.store.get(&f.id).unwrap().error, Some(error));
+    }
+
+    /// ONB-06: a URL typed but not saved goes first; a blank one means the keychain's.
+    #[test]
+    fn a_test_message_goes_to_the_typed_url_or_else_the_saved_one() {
+        let ok = |_: &Request| Some(reply("200 OK", "ok"));
+        let (saved, typed) = (serve(ok), serve(ok));
+        let f = fixture();
+        f.point_at(&saved);
+        let test = |url: Option<String>| block_on(f.slack.send_test(&f.settings, "#개발", url));
+
+        test(Some(webhook(&typed))).unwrap();
+        test(Some(" ".into())).unwrap();
+        test(None).unwrap();
+
+        let body = |stub: &Stub| stub.requests.lock().unwrap()[0].body.clone();
+        assert_eq!(typed.requests.lock().unwrap().len(), 1);
+        assert_eq!(saved.requests.lock().unwrap().len(), 2);
+        assert_eq!(
+            body(&typed),
+            json!({ "text": "회의 요약 테스트 메시지입니다. 이 채널로 회의록이 전송됩니다.\n녹음: 홍길동" })
+        );
+        // Nothing about a meeting changes.
+        assert_eq!(f.store.get(&f.id).unwrap().status, Status::Review);
+
+        // The same checks and messages as a meeting's send.
+        let error = test(Some("http://hooks.slack.com/services/a".into())).unwrap_err();
+        assert!(
+            error.starts_with("웹훅 주소가 올바르지 않습니다"),
+            "{error}"
+        );
+        *f.url.lock().unwrap() = None;
+        assert!(test(None).unwrap_err().starts_with("웹훅 주소가 없습니다"));
+        let gone = serve(|_| Some(reply("404 Not Found", "no_service")));
+        let error = test(Some(webhook(&gone))).unwrap_err();
+        assert!(error.contains("HTTP 404: no_service"), "{error}");
+        assert!(!error.contains("secret-token"), "{error}");
+    }
+
+    #[test]
+    fn the_test_message_keeps_a_name_from_becoming_a_mention() {
+        assert_eq!(
+            test_payload("  <!channel> & co ")["text"],
+            "회의 요약 테스트 메시지입니다. 이 채널로 회의록이 전송됩니다.\n녹음: &lt;!channel&gt; &amp; co"
+        );
+        assert_eq!(
+            test_payload(" ")["text"],
+            "회의 요약 테스트 메시지입니다. 이 채널로 회의록이 전송됩니다."
+        );
     }
 
     #[test]

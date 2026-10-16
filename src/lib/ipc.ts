@@ -116,6 +116,19 @@ export type AudioDevice = { id: string; name: string };
 export type AudioDevices = { inputs: AudioDevice[]; outputs: AudioDevice[] };
 export const listAudioDevices = () => invoke<AudioDevices>("list_audio_devices");
 
+// The audio tab's checks (ONB-03, architecture 4.4). They change no setting, run one at a time,
+// and fail while recording (also one that starts meanwhile). `device` is what the tab shows, saved
+// or not.
+
+/** Plays a 1 kHz tone for a second and listens to the system audio meanwhile; true when heard
+ * (above -40 dBFS). `device` is the output device, Windows only (macOS hears every output). */
+export const testSystemAudio = (device: string | null) => invoke<boolean>("test_system_audio", { device });
+/** Listens to the microphone for 5 s, sending `audio-test://level`. True when sound came in. */
+export const testMicrophone = (device: string | null) => invoke<boolean>("test_microphone", { device });
+/** 25 a second during `testMicrophone`: 0..100, -60..0 dBFS like the recording meter. */
+export const onMicTestLevel = (handler: (level: number) => void) =>
+  listen<number>("audio-test://level", (e) => handler(e.payload));
+
 export const listMeetings = () => invoke<MeetingItem[]>("list_meetings");
 export const getMeeting = (id: string) => invoke<MeetingDetail>("get_meeting", { id });
 /** Times are from the start of the recording (architecture 5.2). */
@@ -175,6 +188,10 @@ export const sendToSlack = (
   body: string,
   offsetMinutes: number,
 ) => invoke<Meta>("send_to_slack", { id, webhook, title, body, offsetMinutes });
+/** ONB-06: a fixed message to the webhook `webhook`. `url`: one typed but not saved yet, sent
+ * instead of the keychain's. Rejects with the same messages as `sendToSlack`. */
+export const sendTestMessage = (webhook: string, url: string | null) =>
+  invoke<void>("send_test_message", { webhook, url });
 /** A send of this meeting ended, sent or not, whichever screen started it. */
 export const onSlackFinished = (handler: (id: string) => void) =>
   listen<string>("slack://finished", (e) => handler(e.payload));

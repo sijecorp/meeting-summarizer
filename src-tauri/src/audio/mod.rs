@@ -2,6 +2,7 @@
 //! streams, a writer thread turns them into `mic.wav` and `system.wav`.
 
 mod capture;
+pub mod check;
 mod clock;
 #[cfg(target_os = "macos")]
 mod macos_tap;

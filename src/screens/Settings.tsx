@@ -32,11 +32,15 @@ import {
   modelDownloadFailure,
   modelStatus,
   NEWER_VERSION,
+  onMicTestLevel,
   onModelDownload,
   resetSettings,
   saveSettings,
+  sendTestMessage,
   setSecret,
   startModelDownload,
+  testMicrophone,
+  testSystemAudio,
   type AudioDevice,
   type AudioDevices,
   type Backend,
@@ -144,17 +148,26 @@ const GROUP = "min-w-0 divide-y divide-line rounded-float bg-surface";
 const HELP = "text-label font-normal text-ink-2";
 // A control at a row's right, under its label on a narrow window.
 const CONTROL = "w-full sm:w-72 sm:shrink-0";
+// The mic check's level starts empty; events then write it straight to the DOM.
+const LEVEL_ZERO = { transform: "scaleX(0)" };
+
+// A check's outcome (ONB-03, ONB-06), in words the recorder can act on.
+type Outcome = { ok: boolean; text: string };
+type CheckState = "running" | Outcome;
 
 // One 저장 for every tab, keys included: the panels stay mounted while hidden and typed keys live
 // in this component's state, so switching tabs never drops an edit.
 export default function Settings({
   tab: initialTab = "general",
   barSlot,
+  recording = false,
   onHome,
 }: {
   tab?: SettingsTab;
   /** App's bottom stack: the save bar goes there, above the dock. */
   barSlot?: HTMLElement | null;
+  /** A recording is running or starting: the audio checks wait (they open devices too). */
+  recording?: boolean;
   onHome: () => void;
 }) {
   const [tab, setTab] = useState(initialTab);
@@ -194,6 +207,10 @@ export default function Settings({
   // error but never a download's or import's, which lasts until the next try.
   const [statusError, setStatusError] = useState("");
   const [modelError, setModelError] = useState(modelDownloadFailure);
+  // The audio and Slack checks, by "mic", "system" or the webhook's `keyOf`. Never part of the
+  // draft. `on`: the device or typed URL it ran with; no `outcome` while it runs.
+  const [checks, setChecks] = useState<Record<string, { on: string | null; outcome?: Outcome }>>({});
+  const micLevel = useRef<HTMLDivElement>(null);
   const present = useIsPresent();
   const nav = useRef<HTMLElement>(null);
   const bar = useRef<HTMLDivElement>(null);
@@ -240,10 +257,16 @@ export default function Settings({
       .catch((e) => setError(String(e)));
     const unlisten = onModelDownload((d) => setReceived((all) => ({ ...all, [d.file]: d })));
     unlisten.catch((e) => setStatusError(`다운로드 진행률을 받지 못했습니다: ${e}`));
+    // 25 times a second, straight to the DOM: no React state (design-system 5).
+    const unlistenLevel = onMicTestLevel((level) => {
+      const meter = micLevel.current;
+      meter?.setAttribute("aria-valuenow", String(level));
+      (meter?.firstElementChild as HTMLElement | null)?.style.setProperty("transform", `scaleX(${level / 100})`);
+    });
     const running = modelDownload();
     if (running) follow(running);
     return () => {
-      unlisten.then((stop) => stop(), () => {});
+      for (const u of [unlisten, unlistenLevel]) u.then((stop) => stop(), () => {});
     };
   }, []);
 
@@ -495,6 +518,11 @@ export default function Settings({
           (e) => problems.push(`키체인에 키를 저장하지 못했습니다: ${e}`),
         );
       }
+      // A Slack check's result spoke of the URL before this save; the typed one it ran with is
+      // gone now, so it would read as the new URL's.
+      setChecks((c) =>
+        Object.fromEntries(Object.entries(c).filter(([key, check]) => !key.startsWith("slack:") || !check.outcome)),
+      );
       if (problems.length) report(`설정은 저장했지만 ${problems.join(" / ")}`);
       else setError("");
       setDone(!problems.length);
@@ -554,6 +582,24 @@ export default function Settings({
         () => setModelError(""),
         (e) => setModelError(String(e)),
       );
+
+  // The checks act on what the tab shows, saved or not, and leave the draft alone.
+  const run = (key: string, on: string | null, check: () => Promise<Outcome>) => {
+    setChecks((c) => ({ ...c, [key]: { on } }));
+    check().then(
+      (outcome) => setChecks((c) => ({ ...c, [key]: { on, outcome } })),
+      (e) => setChecks((c) => ({ ...c, [key]: { on, outcome: { ok: false, text: String(e) } } })),
+    );
+  };
+  // An outcome speaks only of the device or URL it ran with: picking or typing another hides it,
+  // even one that arrives later.
+  const checkState = (key: string, on: string | null): CheckState | undefined => {
+    const check = checks[key];
+    if (!check?.outcome) return check && "running";
+    return check.on === on ? check.outcome : undefined;
+  };
+  // Rust runs one audio check at a time, so neither is offered while either runs.
+  const auditing = ["mic", "system"].some((key) => checks[key] && !checks[key].outcome);
 
   // A pinned device missing from the list still shows, so the select is never blank. Only a
   // list that loaded can tell it is unplugged.
@@ -622,13 +668,56 @@ export default function Settings({
               </Row>
             </fieldset>
             {/* ONB-03: desktop notification permission cannot be read, so this is all we can say. */}
-            <p className={cn(HELP, "px-5")}>알림이 보이지 않으면 OS 알림 설정에서 '회의 요약'을 허용해 주세요</p>
+            <p className={cn(HELP, "px-5")}>알림이 보이지 않으면 OS 알림 설정에서 'meeting-summarizer'를 허용해 주세요</p>
           </Section>
 
           <Section tab="audio" open={tab}>
             {deviceError && <Banner kind="error">{deviceError}</Banner>}
             <fieldset disabled={locked} className={GROUP}>
-              <Row label="마이크">
+              <Row
+                label="마이크"
+                below={
+                  // Opens the mic only when asked: opening it with the tab would raise the OS
+                  // permission prompt from the settings.
+                  <RunCheck
+                    name="마이크 테스트"
+                    action="테스트"
+                    busyText="테스트 중…"
+                    state={checkState("mic", draft.input_device)}
+                    blocked={recording || auditing}
+                    idle="5초 동안 마이크 소리를 들어 봅니다"
+                    hint="마이크에 대고 말해 보세요"
+                    running={
+                      <div
+                        ref={micLevel}
+                        role="meter"
+                        aria-label="마이크 입력 레벨"
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={0}
+                        className="h-1.5 w-32 overflow-hidden rounded-full bg-sunken"
+                      >
+                        {/* Square ends, so scaleX never warps them (design-system 5). */}
+                        <div className="size-full origin-left bg-brand" style={LEVEL_ZERO} />
+                      </div>
+                    }
+                    onRun={() =>
+                      run("mic", draft.input_device, () =>
+                        testMicrophone(draft.input_device).then((heard) =>
+                          heard
+                            ? { ok: true, text: "소리가 들어와요" }
+                            : {
+                                ok: false,
+                                text: pinsOutput
+                                  ? "소리가 들어오지 않아요. 마이크 권한과 장치를 확인하세요"
+                                  : "소리가 들어오지 않아요. 고른 마이크가 맞는지 보고, 시스템 설정 > 개인정보 보호 및 보안 > 마이크에서 'meeting-summarizer'를 허용하세요",
+                              },
+                        ),
+                      )
+                    }
+                  />
+                }
+              >
                 <Pick
                   disabled={locked}
                   value={draft.input_device ?? NO_DEFAULT}
@@ -636,21 +725,53 @@ export default function Settings({
                   onChange={(v) => edit({ input_device: v === NO_DEFAULT ? null : v })}
                 />
               </Row>
-              {pinsOutput ? (
-                <Row label="시스템 오디오" help="녹음할 출력 장치">
+              <Row
+                label="시스템 오디오"
+                help={pinsOutput ? "녹음할 출력 장치" : "모든 출력 장치의 소리를 함께 녹음합니다."}
+                below={
+                  <RunCheck
+                    name="시스템 오디오 테스트"
+                    action="테스트"
+                    busyText="테스트 중…"
+                    state={checkState("system", draft.output_device)}
+                    blocked={recording || auditing}
+                    idle="짧은 소리를 재생해 앱에 들리는지 확인합니다"
+                    hint="테스트음을 재생하고 있어요"
+                    onRun={() =>
+                      run("system", draft.output_device, () =>
+                        // The loopback most likely hears what plays before the output volume, so
+                        // the volume is not offered as a cause.
+                        testSystemAudio(draft.output_device).then((heard) =>
+                          heard
+                            ? { ok: true, text: "시스템 오디오가 잡혀요" }
+                            : {
+                                ok: false,
+                                text: pinsOutput
+                                  ? "시스템 오디오가 잡히지 않아요. 고른 출력 장치로 소리가 나는지 확인하세요"
+                                  : "시스템 오디오가 잡히지 않아요. 시스템 설정 > 개인정보 보호 및 보안 > 화면 및 시스템 오디오 녹음에서 'meeting-summarizer'를 허용하세요",
+                              },
+                        ),
+                      )
+                    }
+                  />
+                }
+              >
+                {pinsOutput ? (
                   <Pick
                     disabled={locked}
                     value={draft.output_device ?? NO_DEFAULT}
                     options={deviceOptions(devices?.outputs, draft.output_device)}
                     onChange={(v) => edit({ output_device: v === NO_DEFAULT ? null : v })}
                   />
-                </Row>
-              ) : (
-                <Row label="시스템 오디오" help="모든 출력 장치의 소리를 함께 녹음합니다." />
-              )}
+                ) : undefined}
+              </Row>
             </fieldset>
-            {/* REC-10. The system audio test comes with M6 (ONB-03). */}
-            <p className={cn(HELP, "px-5")}>헤드폰을 쓰면 상대방 목소리가 마이크로 다시 들어가는 에코가 줄어듭니다.</p>
+            <div className={cn(HELP, "space-y-1 px-5")}>
+              {/* REC-10 */}
+              <p>헤드폰을 쓰면 상대방 목소리가 마이크로 다시 들어가는 에코가 줄어듭니다.</p>
+              {/* One line for both checks, so a recording starting is said once. */}
+              <p role="status">{recording ? "녹음 중에는 테스트할 수 없어요" : ""}</p>
+            </div>
           </Section>
 
           <Section tab="transcription" open={tab}>
@@ -920,7 +1041,9 @@ export default function Settings({
           <Section tab="slack" open={tab}>
             <List moves={slackMoves} move={move}>
               {draft.webhooks.map((w) => {
-                const status = secrets[keyOf({ kind: "slack", name: w.name })] ? "키체인에 저장됨" : "URL 입력 안 됨";
+                const key = keyOf({ kind: "slack", name: w.name });
+                const status = secrets[key] ? "키체인에 저장됨" : "URL 입력 안 됨";
+                const typed = secretDrafts[key]?.trim() || null;
                 return (
                   <Entry
                     key={w.name}
@@ -938,7 +1061,21 @@ export default function Settings({
                   >
                     <fieldset disabled={locked} className="grid min-w-0 gap-4 px-5 pt-1 pb-5">
                       <SecretField label="웹훅 URL" {...secretProps("slack", w.name)} />
-                      <div className="flex justify-end">
+                      <div className="flex items-start justify-between gap-3">
+                        {/* ONB-06: a URL typed and not saved yet is the one tried. */}
+                        <RunCheck
+                          action="테스트 메시지 보내기"
+                          busyText="보내는 중…"
+                          state={checkState(key, typed)}
+                          onRun={() =>
+                            run(key, typed, () =>
+                              sendTestMessage(w.name, typed).then(() => ({
+                                ok: true,
+                                text: "보냈습니다. Slack 채널을 확인하세요",
+                              })),
+                            )
+                          }
+                        />
                         <RemoveButton
                           label="웹훅 삭제"
                           title={`${w.name} 웹훅을 삭제할까요?`}
@@ -1044,6 +1181,7 @@ function Row({
   help,
   aside,
   stacked,
+  below,
   children,
 }: {
   label: string;
@@ -1051,25 +1189,93 @@ function Row({
   /** At the right of the label, like the glossary's count. */
   aside?: ReactNode;
   stacked?: boolean;
+  /** Under the label and control, across the row, like an audio check. */
+  below?: ReactNode;
   children?: Control;
 }) {
   const id = useId();
   return (
-    <div className={cn("flex flex-col gap-3 px-5 py-4", !stacked && "sm:flex-row sm:items-center sm:justify-between sm:gap-8")}>
-      <div className="min-w-0 flex-1 space-y-0.5">
-        <div className="flex items-baseline justify-between gap-3">
-          <label id={`${id}-label`} htmlFor={children ? id : undefined} className="font-medium">
-            {label}
-          </label>
-          {aside}
+    <div className="space-y-3 px-5 py-4">
+      <div className={cn("flex flex-col gap-3", !stacked && "sm:flex-row sm:items-center sm:justify-between sm:gap-8")}>
+        <div className="min-w-0 flex-1 space-y-0.5">
+          <div className="flex items-baseline justify-between gap-3">
+            <label id={`${id}-label`} htmlFor={children ? id : undefined} className="font-medium">
+              {label}
+            </label>
+            {aside}
+          </div>
+          {help && (
+            <p id={`${id}-help`} className={HELP}>
+              {help}
+            </p>
+          )}
         </div>
-        {help && (
-          <p id={`${id}-help`} className={HELP}>
-            {help}
-          </p>
-        )}
+        {children && cloneElement(children, { id, "aria-describedby": help ? `${id}-help` : undefined })}
       </div>
-      {children && cloneElement(children, { id, "aria-describedby": help ? `${id}-help` : undefined })}
+      {below}
+    </div>
+  );
+}
+
+/** A check that changes no setting (ONB-03, ONB-06), so it never counts toward 저장. Running or
+ * unavailable, its button is `aria-disabled`, not `disabled`, so the focus stays (design-system 7,
+ * phase 3). What it says is one `role="status"`: what it does, what to do while it runs, then the
+ * outcome, which has an icon so color is never all it has. Rust runs one audio check at a time and
+ * says so if another is asked for. */
+function RunCheck({
+  name,
+  action,
+  busyText,
+  state,
+  blocked,
+  idle,
+  hint,
+  running,
+  onRun,
+}: {
+  /** The button's name, when `action` alone would be ambiguous. */
+  name?: string;
+  action: string;
+  busyText: string;
+  state: CheckState | undefined;
+  /** It cannot run now: a recording (said once for the group) or another check running. */
+  blocked?: boolean;
+  idle?: string;
+  hint?: string;
+  /** Beside the button while it runs, like the mic's level. */
+  running?: ReactNode;
+  onRun: () => void;
+}) {
+  const busy = state === "running";
+  const outcome = busy ? null : state;
+  const off = busy || blocked;
+  const Icon = outcome?.ok ? Check : CircleAlert;
+  return (
+    <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-2">
+      <Button
+        size="sm"
+        variant="outline"
+        // Matches the visible text while it runs (WCAG 2.5.3).
+        aria-label={name && (busy ? `${name} 중` : name)}
+        aria-disabled={off || undefined}
+        className="aria-disabled:opacity-50"
+        onClick={off ? undefined : onRun}
+      >
+        {busy ? busyText : action}
+      </Button>
+      {busy && running}
+      <p role="status" className={cn(HELP, "flex gap-1.5")}>
+        {busy ? (
+          hint
+        ) : outcome ? (
+          <>
+            <Icon aria-hidden className={cn("mt-px size-4 shrink-0", outcome.ok ? "text-ok-line" : "text-danger-line")} />
+            {outcome.text}
+          </>
+        ) : (
+          idle
+        )}
+      </p>
     </div>
   );
 }

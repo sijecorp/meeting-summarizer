@@ -867,3 +867,187 @@ test("직접 가져오기 stays offered when the model status cannot be read", a
   expect((screen.getByRole("button", { name: "직접 가져오기" }) as HTMLButtonElement).disabled).toBe(false);
   expect(screen.queryByRole("button", { name: "다운로드" })).toBeNull();
 });
+
+// ONB-03 and ONB-06: checks change no setting, so the save bar never counts them.
+const unsaved = () => screen.queryByText(/^저장 안 한 변경/)?.textContent ?? null;
+const twoMics: AudioDevices = {
+  inputs: [
+    { id: "coreaudio:BuiltInMicrophoneDevice", name: "MacBook 마이크" },
+    { id: "coreaudio:usb", name: "USB 마이크" },
+  ],
+  outputs: [],
+};
+
+test("the mic check listens to the mic shown, saved or not, and draws its level", async () => {
+  const calls: Call[] = [];
+  let finish = (_heard: boolean) => {};
+  mockIPC(
+    (cmd, args) => {
+      calls.push({ cmd, args: args as Call["args"] });
+      if (cmd === "get_settings") return loaded;
+      if (cmd === "has_secret") return true;
+      if (cmd === "list_audio_devices") return twoMics;
+      if (cmd === "test_microphone") return new Promise<boolean>((resolve) => (finish = resolve));
+    },
+    { shouldMockEvents: true },
+  );
+  render(<Settings tab="audio" onHome={() => {}} />);
+  const tests = () => calls.filter((c) => c.cmd === "test_microphone").map((c) => c.args);
+
+  const check = await screen.findByRole("button", { name: "마이크 테스트" });
+  expect(screen.getByText("5초 동안 마이크 소리를 들어 봅니다")).toBeTruthy();
+  fireEvent.keyDown(screen.getByRole("combobox", { name: "마이크" }), { key: "Enter" });
+  fireEvent.click(await screen.findByRole("option", { name: "USB 마이크" }));
+  expect(unsaved()).toBe("저장 안 한 변경 1개");
+  // The tab never opens the mic by itself: that would raise the OS permission prompt.
+  expect(tests()).toEqual([]);
+
+  fireEvent.click(check);
+  expect(tests()).toEqual([{ device: "coreaudio:usb" }]);
+  expect(check.textContent).toBe("테스트 중…");
+  // Its name says so too, like what it shows.
+  expect(check.getAttribute("aria-label")).toBe("마이크 테스트 중");
+  expect(check.getAttribute("aria-disabled")).toBe("true");
+  expect(screen.getByText("마이크에 대고 말해 보세요")).toBeTruthy();
+  fireEvent.click(check);
+  expect(tests()).toHaveLength(1);
+  // Rust runs one audio check at a time, so the other is not offered meanwhile.
+  const system = screen.getByRole("button", { name: "시스템 오디오 테스트" });
+  expect(system.getAttribute("aria-disabled")).toBe("true");
+  fireEvent.click(system);
+  expect(calls.map((c) => c.cmd)).not.toContain("test_system_audio");
+
+  await act(() => emit("audio-test://level", 64));
+  const meter = screen.getByRole("meter", { name: "마이크 입력 레벨" });
+  expect(meter.getAttribute("aria-valuenow")).toBe("64");
+  expect((meter.firstElementChild as HTMLElement).style.transform).toBe("scaleX(0.64)");
+
+  await act(async () => finish(false));
+  expect(system.getAttribute("aria-disabled")).toBeNull();
+  // Said once, through a status line. macOS lists the app by its bundle name.
+  const outcome = await screen.findByText(/^소리가 들어오지 않아요\./);
+  expect(outcome.getAttribute("role")).toBe("status");
+  expect(outcome.textContent).toContain("개인정보 보호 및 보안 > 마이크에서 'meeting-summarizer'를 허용하세요");
+  expect(screen.queryByRole("meter")).toBeNull();
+  expect(check.getAttribute("aria-disabled")).toBeNull();
+  expect(check.getAttribute("aria-label")).toBe("마이크 테스트");
+
+  fireEvent.click(check);
+  await act(async () => finish(true));
+  expect(await screen.findByText("소리가 들어와요")).toBeTruthy();
+  expect(unsaved()).toBe("저장 안 한 변경 1개");
+
+  // An outcome speaks of the mic it ran on, even one that arrives after another was picked.
+  const pickMic = async (name: string) => {
+    fireEvent.keyDown(screen.getByRole("combobox", { name: "마이크" }), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name }));
+  };
+  await pickMic("MacBook 마이크");
+  expect(screen.queryByText("소리가 들어와요")).toBeNull();
+  fireEvent.click(check);
+  await pickMic("USB 마이크");
+  await act(async () => finish(true));
+  expect(screen.queryByText("소리가 들어와요")).toBeNull();
+  expect(screen.getByText("5초 동안 마이크 소리를 들어 봅니다")).toBeTruthy();
+});
+
+test("the system audio check says what it heard, and no check runs while recording", async () => {
+  const calls: Call[] = [];
+  const answers = [true, false];
+  mockIPC((cmd, args) => {
+    calls.push({ cmd, args: args as Call["args"] });
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "has_secret") return true;
+    if (cmd === "list_audio_devices") return twoMics;
+    if (cmd === "test_system_audio") return answers.shift();
+    if (cmd === "test_microphone") throw "마이크를 열 수 없습니다: 장치가 사용 중입니다";
+  });
+  const { rerender } = render(<Settings tab="audio" onHome={() => {}} />);
+  const tests = () => calls.filter((c) => c.cmd.startsWith("test_"));
+
+  const system = await screen.findByRole("button", { name: "시스템 오디오 테스트" });
+  expect(screen.getByText("짧은 소리를 재생해 앱에 들리는지 확인합니다")).toBeTruthy();
+  fireEvent.click(system);
+  expect(await screen.findByText("시스템 오디오가 잡혀요")).toBeTruthy();
+  expect(tests().map((c) => c.args)).toEqual([{ device: null }]);
+  fireEvent.click(system);
+  // The loopback hears before the output volume, so only the permission is offered as the cause.
+  // macOS lists the app by its bundle name.
+  expect((await screen.findByText(/^시스템 오디오가 잡히지 않아요\./)).textContent).toBe(
+    "시스템 오디오가 잡히지 않아요. 시스템 설정 > 개인정보 보호 및 보안 > 화면 및 시스템 오디오 녹음에서 'meeting-summarizer'를 허용하세요",
+  );
+  // A device that cannot be opened says so in Rust's words.
+  fireEvent.click(screen.getByRole("button", { name: "마이크 테스트" }));
+  expect(await screen.findByText("마이크를 열 수 없습니다: 장치가 사용 중입니다")).toBeTruthy();
+  expect(unsaved()).toBeNull();
+
+  rerender(<Settings tab="audio" recording onHome={() => {}} />);
+  for (const name of ["마이크 테스트", "시스템 오디오 테스트"]) {
+    const button = screen.getByRole("button", { name });
+    expect(button.getAttribute("aria-disabled")).toBe("true");
+    fireEvent.click(button);
+  }
+  // Said once for both.
+  expect(screen.getByText("녹음 중에는 테스트할 수 없어요").getAttribute("role")).toBe("status");
+  expect(tests()).toHaveLength(3);
+});
+
+test("a test message goes with the URL typed, else the saved one, and leaves the draft alone", async () => {
+  const calls: Call[] = [];
+  const withWebhook: LoadedSettings = {
+    ...loaded,
+    settings: { ...loaded.settings, webhooks: [{ name: "#회의록" }] },
+  };
+  let finish = () => {};
+  mockIPC((cmd, args) => {
+    calls.push({ cmd, args: args as Call["args"] });
+    if (cmd === "get_settings") return withWebhook;
+    if (cmd === "has_secret") return true;
+    if (cmd === "send_test_message") {
+      if (!(args as Call["args"]).url) return new Promise<void>((resolve) => (finish = resolve));
+      throw "Slack에 연결하지 못했습니다. 인터넷 연결을 확인해 주세요: connection refused";
+    }
+  });
+  render(<Settings tab="slack" onHome={() => {}} />);
+  const sends = () => calls.filter((c) => c.cmd === "send_test_message").map((c) => c.args);
+  await expand("#회의록");
+
+  const send = screen.getByRole("button", { name: "테스트 메시지 보내기" });
+  fireEvent.click(send);
+  expect(sends()).toEqual([{ webhook: "#회의록", url: null }]);
+  expect(send.textContent).toBe("보내는 중…");
+  expect(send.getAttribute("aria-disabled")).toBe("true");
+  await act(async () => finish());
+  expect(await screen.findByText("보냈습니다. Slack 채널을 확인하세요")).toBeTruthy();
+  expect(unsaved()).toBeNull();
+
+  fireEvent.change(screen.getByLabelText(/^웹훅 URL/), {
+    target: { value: " https://hooks.slack.com/services/new " },
+  });
+  // It went to the saved URL, not this one.
+  expect(screen.queryByText("보냈습니다. Slack 채널을 확인하세요")).toBeNull();
+  fireEvent.click(send);
+  expect(sends()[1]).toEqual({ webhook: "#회의록", url: "https://hooks.slack.com/services/new" });
+  expect(await screen.findByText(/^Slack에 연결하지 못했습니다/)).toBeTruthy();
+  // Only the typed URL counts; the test sent nothing to save.
+  expect(unsaved()).toBe("저장 안 한 변경 1개");
+  expect(calls.map((c) => c.cmd)).not.toContain("set_secret");
+});
+
+// The typed URL is saved and its field empties: the result for the old keychain URL must not return.
+test("a test result for the saved URL goes once a new URL is saved", async () => {
+  mockIPC((cmd) => {
+    if (cmd === "get_settings") return { ...loaded, settings: { ...loaded.settings, webhooks: [{ name: "#회의록" }] } };
+    if (cmd === "has_secret") return true;
+  });
+  render(<Settings tab="slack" onHome={() => {}} />);
+  await expand("#회의록");
+  fireEvent.click(screen.getByRole("button", { name: "테스트 메시지 보내기" }));
+  expect(await screen.findByText("보냈습니다. Slack 채널을 확인하세요")).toBeTruthy();
+
+  fireEvent.change(screen.getByLabelText(/^웹훅 URL/), { target: { value: "https://hooks.slack.com/services/b" } });
+  fireEvent.click(screen.getByRole("button", { name: "저장" }));
+  expect(await screen.findByText("저장했습니다")).toBeTruthy();
+  expect((screen.getByLabelText(/^웹훅 URL/) as HTMLInputElement).value).toBe("");
+  expect(screen.queryByText("보냈습니다. Slack 채널을 확인하세요")).toBeNull();
+});

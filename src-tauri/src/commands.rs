@@ -11,7 +11,7 @@ use crate::transcribe::model::{self, ModelState, Models};
 use serde::Serialize;
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 #[tauri::command(async)]
@@ -168,6 +168,40 @@ pub async fn list_audio_devices() -> Result<AudioDevices, String> {
     tauri::async_runtime::spawn_blocking(audio::devices)
         .await
         .map_err(|e| e.to_string())?
+}
+
+/// The audio tab's checks open devices of their own, so never beside a recording's.
+fn recording(app: &AppHandle) -> bool {
+    app.state::<Recorder>().state().is_some()
+}
+
+/// ONB-03: plays a 1 kHz tone and listens to the system audio meanwhile (architecture 4.4); true
+/// when it was heard. `device`: the output device the tab shows, saved or not (Windows only). On
+/// a blocking thread: a permission prompt holds the opening.
+#[tauri::command]
+pub async fn test_system_audio(app: AppHandle, device: Option<String>) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        audio::check::system_audio(device, || recording(&app))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// ONB-03: listens to the microphone the tab shows (`device`, saved or not) for 5 s, sending
+/// `audio-test://level` (0..100). True when sound came in.
+#[tauri::command]
+pub async fn test_microphone(app: AppHandle, device: Option<String>) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        audio::check::microphone(
+            device,
+            || recording(&app),
+            |level| {
+                let _ = app.emit("audio-test://level", level);
+            },
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Waits until both WAV files are closed and the meeting is `recorded`.
@@ -361,6 +395,18 @@ pub async fn send_to_slack(
         eprintln!("전송 종료 이벤트 전송 실패: {e}");
     }
     sent
+}
+
+/// ONB-06: a fixed message to the webhook named `webhook`. `url`: one typed in the tab but not
+/// saved yet, sent instead of the keychain's. The URL never comes back.
+#[tauri::command]
+pub async fn send_test_message(
+    settings: State<'_, SettingsStore>,
+    slack: State<'_, Slack>,
+    webhook: String,
+    url: Option<String>,
+) -> Result<(), String> {
+    slack.send_test(&settings, &webhook, url).await
 }
 
 /// SUM-06 "요약 다시 실행" after `summarize_failed`, with the connection the recorder picked.

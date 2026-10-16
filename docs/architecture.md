@@ -46,7 +46,7 @@
 | 링 버퍼 | `rtrb` | 오디오 콜백 → 기록 스레드. 락·할당 없는 SPSC |
 | WAV 기록 | `hound` | |
 | 리샘플 | `rubato` 5 | 장치 샘플레이트 → 16kHz. 안티에일리어싱 FFT 리샘플러(`Fft`) |
-| 전사 | `whisper-rs` 0.16.0 (whisper.cpp 바인딩) | M3에서 0.16.0으로 고정했다(`whisper-rs-sys` 0.15.0, whisper.cpp 1.8.3 내장). 내장 VAD, `suppress_nst`, `no_context`, initial prompt, `use_gpu`, 진행률 콜백이 모두 있다. features는 `Cargo.toml`에서 대상별로 준다: macOS `metal`, Windows `vulkan`. 빌드에 `cmake`가 필요하다. Windows Vulkan 빌드 확인은 **[S3]** CI에 남아 있다 |
+| 전사 | `whisper-rs` 0.16.0 (whisper.cpp 바인딩) | M3에서 0.16.0으로 고정했다(`whisper-rs-sys` 0.15.0, whisper.cpp 1.8.3 내장). 내장 VAD, `suppress_nst`, `no_context`, initial prompt, `use_gpu`, 진행률 콜백이 모두 있다. features는 `Cargo.toml`에서 대상별로 준다: macOS `metal`, Windows `vulkan`. 빌드에 `cmake`가 필요하다. Windows Vulkan 빌드는 배포 워크플로(11.3)가 하지만, 첫 Actions 실행 전이라 아직 확인하지 않았다 |
 | HTTP | `reqwest` 0.13 (`default-features = false`, `native-tls`, `system-proxy`) | LLM, Slack, 모델 다운로드. OS의 TLS와 인증서 저장소를 써서 사내 미러의 사내 CA를 따로 설정하지 않아도 믿는다. 기본값(rustls + aws-lc-rs)은 C 빌드가 하나 더 붙는다. M4·M5 모두 기능을 더하지 않았다(요청 본문은 `serde_json`으로 만든다) |
 | 해시 | `sha2` 0.10 | 모델 검증. 트리에 이미 있던 버전이라 중복이 없다 |
 | 비밀값 | `keyring` 4.x | `tauri-plugin-stronghold`는 지원 중단돼 쓰지 않는다 |
@@ -65,6 +65,7 @@ src-tauri/src/
     mod.rs           Recorder(녹음 시작·종료·상태), 이벤트, 디스크 여유 공간
     capture.rs       캡처 스레드: cpal 스트림 열기·재연결, 기본 장치 1초 폴링
     macos_tap.rs     macOS 시스템 오디오용 전역 tap + 비공개 aggregate 장치 (4.3)
+    check.rs         설정 오디오 탭의 마이크·시스템 오디오 테스트 (4.4, ONB-03)
     writer.rs        기록 스레드: 다운믹스 → 리샘플 → 정렬 → WAV, 레벨·무음·권한·최대 길이·디스크·절전 검사
     clock.rs         OS 시계 읽기 + 무음 채우기·넘친 샘플·절전 판정 (판정은 순수 로직)
     mix.rs           게이팅 + 합산 (순수 로직)
@@ -156,6 +157,9 @@ preview.html        개발용 미리보기 진입점. `bun run dev` → `/previe
 
 - 마이크: 마이크 장치에서 처음 받은 3초 분량의 샘플이 모두 정확히 0이면 `recording://warning { kind: "mic_permission" }`을 보낸다. 무음 채우기로 넣은 0은 세지 않는다.
 - 시스템 오디오: 녹음 중에는 검사하지 않는다. 설정 오디오 탭의 "시스템 오디오 테스트"(M6)가 1kHz 사인파를 1초 재생하고, 같은 시간 루프백 RMS가 -40 dBFS를 넘으면 통과로 본다.
+- **설정 오디오 탭의 테스트** (ONB-03, M6, `audio/check.rs`): 둘 다 녹음과 따로 장치를 열므로 녹음 중이면 거부하고, 도는 중에 녹음이 시작되면(⌘R·Ctrl+R, 독) 40ms 안에 멈추고 "녹음이 시작되어 테스트를 멈췄습니다"로 끝난다(시작할 때의 거부는 "녹음 중에는 테스트할 수 없습니다"). 녹음이 끝난 뒤에도 남는 결과가 아직 녹음 중처럼 읽히지 않게 문구를 나눴다. 시스템 오디오 테스트는 테스트음부터 멈춰 `system.wav`에 들어가지 않게 한다. 테스트는 앱 전체에서 한 번에 하나다(`AtomicBool`): 같은 장치를 두 번 열지 않고, 테스트 중에 설정 화면을 나갔다 다시 와도 둘째가 시작되지 않는다("이미 테스트 중입니다"). 장치 열기가 권한 팝업에 멈출 수 있어 blocking 스레드에서 돈다. 장치는 탭에 보이는 값(저장하지 않은 선택 포함)이고, 고른 장치가 연결돼 있지 않으면 기본 장치로 바꾸지 않고 실패한다. 다른 장치로 통과하면 안 되기 때문이다. 설정을 바꾸지 않으므로 저장 막대에 세지 않는다.
+  - 시스템 오디오 테스트(`test_system_audio`): 듣기를 먼저 열고 테스트음을 낸다. 사인파는 최고 -20 dBFS(RMS -23 dBFS)이고 앞뒤 10ms를 페이드해 딸깍 소리가 나지 않는다. 테스트음을 연 직후 그때까지 들은 것을 버리고, 그 뒤 1.2초(테스트음 1초 + 출력·루프백 지연) 동안 들은 샘플 전체의 RMS로 판정한다. 버리지 않으면 테스트음 앞의 무음이 값을 묽히고, 출력 장치가 늦게 열리면 듣기 스트림의 2초 버퍼가 차서 테스트음이 버려진다. macOS는 녹음과 같은 전역 tap(4.3)을 하나 새로 만들어 듣는다. 제외한 프로세스가 없어 앱이 낸 테스트음도 들리므로 테스트음은 기본 출력 장치로 낸다. 권한이 없으면 0만 와서(-120 dBFS) 실패로 나온다. Windows는 탭의 출력 장치(없으면 기본)로 재생하고 그 장치의 WASAPI 루프백으로 듣는다. 재생 중인 다른 소리도 통과로 센다(앱이 시스템 오디오를 듣는다는 것은 같다). tap과 WASAPI 루프백은 출력 음량을 적용하기 전의 소리를 들을 가능성이 커(확인하지 않음) 실패 안내에 출력 음량을 넣지 않는다. 결과는 통과 여부만 돌려준다. 기준(-40 dBFS)과 듣는 시간은 무시한 테스트 `on_this_machine`이 실제 장치에서 찍는 dBFS로 맞춘다.
+  - 마이크 테스트(`test_microphone`): 탭을 열 때는 마이크를 열지 않는다. 열면 설정 화면에서 권한 팝업이 뜬다. "테스트"를 누르면 5초 동안 열고 40ms마다 `audio-test://level`(0~100, 녹음 화면 미터와 같은 -60~0 dBFS)을 보낸다. 장치 버퍼가 오지 않은 40ms는 보내지 않아 막대가 0으로 깜빡이지 않는다. 40ms 하나라도 -50 dBFS(REC-05의 무음 기준) 이상이면 "소리가 들어와요"다. 권한을 아직 묻지 않았다면 이 버튼이 첫 권한 팝업을 띄울 수 있다(첫 녹음보다 먼저).
 - macOS에서는 권한이 없으면 오류 없이 0 버퍼만 온다. 그래서 위 방식으로만 판정한다.
 
 ### 4.5 합산과 게이팅 (TRN-02)
@@ -266,7 +270,7 @@ queue.rs ──spawn── 앱 실행 파일 --plan-chunks {회의 폴더} {VAD 
 ### 5.4 백엔드 선택과 크래시 판정 (TRN-05, TRN-06)
 
 - **빌드**: macOS는 `metal`, Windows는 `vulkan` feature로 빌드한다. CPU 사용은 런타임에 `WhisperContextParameters::use_gpu(false)`로 고른다.
-- **Vulkan 로더 동봉**: Vulkan 빌드는 `vulkan-1.dll`에 로드 타임 의존성이 있다. 이 DLL이 없는 PC에서는 앱이 아예 시작되지 않는다. 그래서 LunarG Vulkan Loader(Apache-2.0)의 `vulkan-1.dll`을 실행 파일 옆에 함께 설치한다. 설치 경로는 **[S3]**에서 확인한다.
+- **Vulkan 로더 동봉**: Vulkan 빌드는 `vulkan-1.dll`에 로드 타임 의존성이 있다. 이 DLL이 없는 PC에서는 앱이 아예 시작되지 않는다. 그래서 LunarG Vulkan Loader(Apache-2.0)의 `vulkan-1.dll`을 실행 파일 옆에 함께 설치한다. `src-tauri/tauri.windows.conf.json`의 `bundle.resources`(`"vulkan-1.dll": "vulkan-1.dll"`)로 NSIS가 `$INSTDIR`(실행 파일 옆)에 설치하고, 제거할 때 지운다. 원본은 CI가 Vulkan SDK 1.4.313.2의 런타임에서 `src-tauri/vulkan-1.dll`로 복사한다(11.3). 실제 Windows PC에서는 첫 Actions 실행 뒤에 확인한다.
 - **자동 선택 순서**:
   1. `settings.json`에 `gpu_failed=true`가 있으면 CPU를 쓴다.
   2. GPU 컨텍스트 생성을 시도하고, 실패하면 CPU로 바꾼다. GPU 장치가 아예 없으면 whisper.cpp가 스스로 CPU로 돈다. 이 경우 워커는 `gpu`로 보고하므로 `meta.json`의 `backend`가 실제와 다를 수 있다.
@@ -419,6 +423,7 @@ queue.rs ──spawn── 앱 실행 파일 --plan-chunks {회의 폴더} {VAD 
 | 그 밖의 4xx·5xx (대체 경로의 400 포함) | "Slack 오류: HTTP {상태}: {코드}" |
 
 - **자동 재시도는 없다**: 응답만 잃었을 뿐 Slack에는 이미 올라갔을 수 있어, 다시 보내면 두 번 올라간다. "다시 보내기"는 녹음자의 클릭이다. 위의 S5 대체 경로만 예외다(거부된 요청은 올라가지 않았다). 대체 경로는 400에서만 타고, 확인하지 못한 응답(3xx, 그 밖의 2xx)에서는 타지 않는다.
+- **테스트 메시지** (ONB-06, `send_test_message`): 설정 Slack 탭의 펼친 웹훅 행에서 보낸다. 본문은 고정 문구 "회의 요약 테스트 메시지입니다. 이 채널로 회의록이 전송됩니다."와, 저장된 녹음자 이름이 있으면 "녹음: {이름}" 줄이고, `{"text": …}` 하나로 보낸다. `text`는 mrkdwn이라 `&` `<` `>`를 이스케이프해 이름이 멘션이 되지 않는다. 주소는 그 행에 입력하고 저장하지 않은 URL이 있으면 그것, 없으면 키체인의 URL이다. 주소 검사(`webhook_url`), 요청과 시간 제한(`post`), 실패 문구(`Failure`)는 회의 전송과 같다. 회의, `last_channel`, 키체인은 바꾸지 않는다. 입력한 URL을 Rust로 넘기므로 웹뷰가 `https://`(또는 이 PC의 `http://`) 주소로 고정 문구를 보내게 할 수 있다. 문구가 고정이라 받아들였다.
 - **`send_to_slack`의 순서**: 같은 회의의 전송이 이미 돌고 있으면 바로 거부한다(회의별 잠금, 두 번 누름 방지). `no_speech`이면 거부한다(SUM-10). `save_summary`와 같은 경로로 제목·본문을 먼저 저장한다(`review`에서만). 그래서 보낸 것이 저장된 것이다. 이어서 지난 시도의 `error`를 지운다(새 시도가 시작됐으니 더는 맞지 않는 원인이다. 그사이 다시 연 회의 문서에도 보이지 않는다). 그다음 웹훅 이름 확인 → 12,000자 검사 → 수정 수(7.2) → 키체인 → 요청이다. 성공하면 `store.update`로 `sent`와 `meta.sent`를 쓰고 `error`를 지운 뒤 `last_channel`을 그 웹훅으로 바꾼다(9.1). 삭제된 회의의 늦은 결과는 다른 쓰기와 같이 버려진다(8.3). 실패하면 `review` 그대로 `error`에 원인을 쓰고 원인을 돌려준다. 보냈는데 `sent`를 쓰지 못했으면 "Slack에는 보냈지만 전송 기록을 저장하지 못했습니다"로 알린다(다시 보내면 두 번 올라간다). 회의별 잠금을 쥔 동안 `get_meeting`의 `sending`이 참이고, 끝나면(성공·실패 모두) `send_to_slack`이 `slack://finished`(회의 id)를 보낸다(10.1, 10.2).
 
 ### 7.2 수정 수 계산 (SND-03)
@@ -583,7 +588,7 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 - 저장한 연결·웹훅을 지운 뒤 같은 이름을 저장 전에 다시 추가할 수 없다("저장한 뒤 다시 추가하세요"). 옛 키가 1번에서 지워지지 않고 새 항목에 남기 때문이다.
 - 계정 이름: `llm:{연결 이름}`, `slack:{웹훅 이름}`
 - 값: API 키, 웹훅 URL
-- 비밀값을 읽는 것(`settings::get_secret`)은 Rust 안에서 요청을 보내기 직전뿐이다(LLM 요약은 6.1, Slack 전송은 7.1). 명령으로 열지 않고, 웹뷰로 돌려주지 않고, 로그에 쓰지 않는다. 대기열과 Slack 전송의 테스트는 이 읽기를 가짜로 바꿔 실제 키체인을 건드리지 않는다.
+- 비밀값을 읽는 것(`settings::get_secret`)은 Rust 안에서 요청을 보내기 직전뿐이다(LLM 요약은 6.1, Slack 전송과 테스트 메시지는 7.1). 명령으로 열지 않고, 웹뷰로 돌려주지 않고, 로그에 쓰지 않는다. 대기열과 Slack 전송의 테스트는 이 읽기를 가짜로 바꿔 실제 키체인을 건드리지 않는다.
 
 ### 9.3 연결 설정 입력 (ONB-04)
 
@@ -669,7 +674,8 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
   - **제목 공유 전환** (디자인 시스템 6.1): 홈 행 제목과 문서 제목은 같은 `layoutId`("title-{id}")다. `layoutId`는 입력란이 아니라 감싼 요소에 두고 `layout="position"`이라 글자가 늘어나지 않고 왼쪽 위 모서리 자리만 미끄러진다(300ms `ease.out`. 매일 보는 화면의 300ms 상한 때문에 `spring.gentle` 대신 tween). 홈 행은 여는 버튼(행 버튼, "검토하기"·"요약 다시 실행")에 포인터가 눌린 행과, 클릭으로 돌아온 회의의 행만 600ms(`TITLE_GLIDE_MS`) 동안 `layoutId`를 갖는다. 모든 행이 가지면 다른 묶음으로 옮겨 붙는 행의 제목만 미끄러지기 때문이다. Motion은 `layoutId`를 요소를 만들 때 한 번만 읽으므로 행 제목은 `layoutId`가 바뀔 때 새로 만든다(`key`). 돌아오는 미끄러짐은 그 행에서 온 회의(`screen.glided`)만이다: 독·알림에서 연 회의의 행은 아래쪽 보이지 않는 곳에 있을 수 있다. 이미 나가던 홈이 다시 들어오면 돌아온 회의로 600ms를 다시 센다. 문서 제목은 도착한 뒤 600ms와 나갈 때만 300ms로 움직이고, 그 밖의 자리 이동(메타 줄이 두 줄이 될 때)은 바로다. 키보드는 행을 누르지 않으므로 키보드로 연 회의는 미끄러지지 않는다. 스크롤된 페이지에서는 하지 않는다: 화면이 바뀌면 `App.tsx`가 스크롤을 맨 위로 돌리므로 제목이 행이 없는 자리에서 날아온다. 움직임 줄이기면 `MotionConfig`가 레이아웃 애니메이션을 끈다. 홈은 창이 스크롤하므로 `layoutScroll`은 필요 없다.
 - 진행률 문구는 일반 텍스트다. 매 틱을 읽어 주는 live region을 두지 않는다. 막대는 `role="progressbar"`와 값을 갖고, 움직임 줄이기 설정이면 전환 애니메이션을 끈다. 보일 값이 없으면(요청이 하나뿐인 요약) 빈 막대를 그리지 않고 문구만 둔다.
 - **설정 줄**: 홈 머리 아래(첫 화면은 맨 아래)에 "요약까지 하려면" 다음으로 빠진 항목을 짧은 링크로 잇는다(목록 이름 "남은 설정"). 전사 모델 없음(`model_status`에 설치 안 된 파일이 있거나 읽지 못함)이 맨 앞이다. "전사 모델 받기"는 바로 다운로드를 시작하고(ONB-01), 받는 동안 링크 대신 "전사 모델 받는 중 42%"를 보인다. 실패하면 "전사 모델을 받지 못했습니다"와 "다시 받기". 받는 중이거나 실패했을 때만 옆에 흐린 "전사 설정" 링크(취소·직접 가져오기·미러 주소가 있는 전사 탭)가 붙는다. 그다음 "LLM 연결" → 요약(LLM) 탭, "Slack 채널 연결" → Slack 탭, 설정 파일을 읽을 수 없음 → "설정 열기"(일반 탭, 오류와 "기본값으로 다시 시작"). 녹음은 막지 않는다.
-- **일반 탭**: 녹음자 이름(행 도움말 "Slack 메시지에 표시됩니다")과, 묶음 아래 알림 권한 안내 한 줄 "알림이 보이지 않으면 OS 알림 설정에서 '회의 요약'을 허용해 주세요"(ONB-03). 데스크톱 알림 권한 API는 항상 허용으로 답해 거부를 알 수 없다.
+- **오디오 탭** (ONB-03, REC-07, REC-10): 마이크 선택, 시스템 오디오(Windows는 출력 장치 선택, macOS는 모든 출력을 녹음한다는 도움말), 묶음 아래 헤드폰 안내. 마이크 행과 시스템 오디오 행 아래에 테스트 줄이 있다(4.4): "테스트" 버튼과 한 줄의 `role="status"`가 하는 일("5초 동안 마이크 소리를 들어 봅니다"), 도는 동안 할 일("마이크에 대고 말해 보세요"), 결과를 차례로 말한다. 마이크 테스트 동안에는 버튼 옆에 가는 레벨 막대가 뜬다. 버튼 이름은 "마이크 테스트"·"시스템 오디오 테스트"이고 도는 동안 보이는 글자처럼 "… 테스트 중"이 된다. 결과는 아이콘(체크 / 원 안의 느낌표)과 `ink-2` 글자다. 실패 문구는 할 일을 말한다. macOS는 OS 설정의 목록을 번들 이름으로 가리킨다(11.1): 마이크는 "소리가 들어오지 않아요. 고른 마이크가 맞는지 보고, 시스템 설정 > 개인정보 보호 및 보안 > 마이크에서 'meeting-summarizer'를 허용하세요", 시스템 오디오는 "시스템 오디오가 잡히지 않아요. 시스템 설정 > 개인정보 보호 및 보안 > 화면 및 시스템 오디오 녹음에서 'meeting-summarizer'를 허용하세요". Windows는 "마이크 권한과 장치를 확인하세요", "고른 출력 장치로 소리가 나는지 확인하세요"다. 결과는 그 테스트가 쓴 장치의 것이라, 다른 장치를 고르면(도는 중에 골라 결과가 늦게 와도) 보이지 않는다. 녹음 중(시작 중 포함)에는 두 버튼이 쉬고, 묶음 아래 `role="status"` 한 줄이 "녹음 중에는 테스트할 수 없어요"를 한 번만 말한다.
+- **일반 탭**: 녹음자 이름(행 도움말 "Slack 메시지에 표시됩니다")과, 묶음 아래 알림 권한 안내 한 줄 "알림이 보이지 않으면 OS 알림 설정에서 'meeting-summarizer'를 허용해 주세요"(ONB-03). OS 설정은 앱을 번들 이름(`productName`)으로 보이므로 화면 이름 "회의 요약"이 아니라 그 이름을 쓴다(11.1). 데스크톱 알림 권한 API는 항상 허용으로 답해 거부를 알 수 없다.
 - **설정 탭** (디자인 시스템 6.7): 왼쪽 탭 목록(넓은 창에서는 `sticky`, 좁은 창에서는 내용 위)과 오른쪽 내용. 탭은 일반, 오디오, 전사, 요약(LLM), Slack이다(ONB-07). 선택한 탭은 `aria-current="page"`이고 선택 표시(`sunken`)가 `layoutId`로 탭 사이를 미끄러진다(키보드로 고르면 바로). 탭마다 제목과 한 줄 설명, 그리고 `surface` 묶음의 행(왼쪽 레이블·도움말, 오른쪽 조작)이다. 행의 `<label for>`가 조작의 이름, 도움말이 `aria-describedby`다. 안 보이는 탭도 마운트된 채 숨겨 두므로 탭을 바꿔도 입력이 사라지지 않는다. 비밀값 규칙은 9.2~9.3 그대로다.
   - **저장 막대**: 저장 버튼 하나가 모든 탭을 저장한다. 바뀐 것이 있을 때만 `App.tsx`의 아래 스택(보내기 막대와 같은 포털 자리, 독 위)에 흰 알약 "저장 안 한 변경 N개 · 되돌리기 · 저장"으로 뜬다. N은 바뀐 필드 하나씩, 추가·삭제·수정한 연결·웹훅 하나씩, 입력한 키 하나씩, 키체인에서 아직 지우지 못한 키 하나씩이다. 용어집은 저장할 모양으로 비교하고, 저장 때 고쳐 넣는 값은 세지 않는다. 저장하는 동안에는 누를 때의 N을 그대로 보이며 남는다(`settings.json`을 쓴 뒤 키체인 단계 동안 초안은 이미 저장본과 같다). 성공하면 같은 알약이 "저장했습니다"로 1.5초 남았다 내려가고 숨은 `role="status"`가 "설정을 저장했습니다"를 한 번 말한다. 저장하는 동안 입력은 `fieldset`으로, 선택 목록은 자기 `disabled`로(Radix는 `pointerdown`에 열리고 `fieldset`을 읽지 않는다), 막대의 버튼은 `aria-disabled`("저장 중…")로 막는다(`disabled`는 포커스를 떨어뜨린다). 읽기 전용이면 막대가 없고 `save`도 하지 않는다. 같은 저장 오류가 다시 나면 배너를 새로 그려 다시 알린다.
   - **되돌리기**: 초안과 입력한 키를 마지막으로 저장한 상태로 돌린다. 입력한 키가 있을 때만 확인을 받는다. 키체인에서 지우지 못한 키는 남는다(9.2). 막대의 버튼이 사라지면(저장 성공, 되돌리기) 포커스는 지금 탭 버튼으로 간다.
@@ -677,7 +683,7 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 - **전사 탭** (ONB-01, ONB-02, ONB-07): 모델 묶음은 모델 선택(5.1의 세 모델, 개발용 `tiny`는 고르게 하지 않는다), 파일별 상태(설치됨 / 없음 / 받는 중 X% (받은/전체 MB), 이어받을 `.part`가 있으면 받아 둔 양)와 받는 동안의 진행 막대, 다운로드·직접 가져오기(빠진 파일이 있을 때, 상태를 읽지 못하면 직접 가져오기만), 받는 동안에는 취소와 진행 막대만, 모델 다운로드 주소(`model_base_url`)다. 처리 묶음은 전사 백엔드(자동 / GPU / CPU 분할 선택. 숨긴 네이티브 라디오라 화살표 키로 고른다. 행 레이블이 `aria-labelledby`로 이름 짓는다), 용어집(레이블 옆에 개수). 자동 백엔드에서 `gpu_failed`면 "GPU 전사에 실패해 CPU로 처리하고 있습니다"와 GPU로 골라 저장하면 지워진다는 안내를 보인다.
   - 모델과 주소는 다른 설정처럼 저장 버튼으로 저장한다. 다운로드·가져오기는 누르면 바로 돈다. 둘 다 `settings.json`의 모델과 주소를 쓰므로, 저장하지 않은 모델·주소 변경이 있으면 두 버튼을 막고 먼저 저장하라고 안내한다. 화면에 고른 값과 다른 옛 값으로 받는 일이 없게 하려는 것이다. 받는 동안에는 모델 선택도 막는다.
   - 진행률은 `model://download`로 받는다. 취소는 오류로 보이지 않는다. 받기·가져오기 오류는 공용 배너가 아니라 전사 탭 안에 보인다.
-- **요약(LLM) 탭** (ONB-04, SUM-07, SUM-08): 연결은 행 목록이다. 행은 이름, 호스트, "로컬"/"클라우드" 꼬리표, 기본 연결이면 "기본"을 보이고(이름은 "회사 클라우드, 클라우드, api.example.com, 기본 LLM"처럼 이름부터), 누르면 그 자리에서 펼쳐진다(`aria-expanded`, 한 목록에 하나, 높이는 motion `layout`). 펼친 행에 Base URL, 모델, API 키, 컨텍스트 토큰, 응답 시간 제한, 로컬 여부, "연결 삭제". 마지막 행이 이름 입력과 "연결 추가"(Enter로도)이고, 추가한 연결은 펼쳐져 있다. 행을 지우면 포커스는 이름 입력으로 간다. Slack 탭의 웹훅도 같은 행 목록이다(행에 "키체인에 저장됨"/"URL 입력 안 됨", 펼치면 웹훅 URL과 "웹훅 삭제"). 클라우드 연결은 Base URL 아래에 "요약할 때 전사본 전문이 이 주소로 전송됩니다"를, 로컬 연결은 서버의 컨텍스트 길이를 컨텍스트 토큰 이상으로 맞추라는 안내(Ollama `OLLAMA_CONTEXT_LENGTH`, LM Studio Context Length, 9.3)를 보인다. 목록 아래 묶음에 기본 LLM 선택이 있고, 로컬 연결이 하나라도 있으면 "새 회의를 기본으로 로컬에서 요약"(`summarize_local_by_default`) 스위치를 두고 저장 버튼으로 함께 저장한다. 로컬 연결이 없으면 스위치를 감추고 `false`로 저장한다(보이지 않는 값이 켜진 채 남지 않게).
+- **요약(LLM) 탭** (ONB-04, SUM-07, SUM-08): 연결은 행 목록이다. 행은 이름, 호스트, "로컬"/"클라우드" 꼬리표, 기본 연결이면 "기본"을 보이고(이름은 "회사 클라우드, 클라우드, api.example.com, 기본 LLM"처럼 이름부터), 누르면 그 자리에서 펼쳐진다(`aria-expanded`, 한 목록에 하나, 높이는 motion `layout`). 펼친 행에 Base URL, 모델, API 키, 컨텍스트 토큰, 응답 시간 제한, 로컬 여부, "연결 삭제". 마지막 행이 이름 입력과 "연결 추가"(Enter로도)이고, 추가한 연결은 펼쳐져 있다. 행을 지우면 포커스는 이름 입력으로 간다. Slack 탭의 웹훅도 같은 행 목록이다(행에 "키체인에 저장됨"/"URL 입력 안 됨", 펼치면 웹훅 URL, "테스트 메시지 보내기"(ONB-06, 7.1), "웹훅 삭제"). 클라우드 연결은 Base URL 아래에 "요약할 때 전사본 전문이 이 주소로 전송됩니다"를, 로컬 연결은 서버의 컨텍스트 길이를 컨텍스트 토큰 이상으로 맞추라는 안내(Ollama `OLLAMA_CONTEXT_LENGTH`, LM Studio Context Length, 9.3)를 보인다. 목록 아래 묶음에 기본 LLM 선택이 있고, 로컬 연결이 하나라도 있으면 "새 회의를 기본으로 로컬에서 요약"(`summarize_local_by_default`) 스위치를 두고 저장 버튼으로 함께 저장한다. 로컬 연결이 없으면 스위치를 감추고 `false`로 저장한다(보이지 않는 값이 켜진 채 남지 않게).
 - **조사**: 화면 글자에 "(으)로"를 쓰지 않는다. `lib/utils.ts`의 `josa`가 이름의 마지막 글자로 고른다(받침 있음 → "으로", 받침 없음·ㄹ·한글 아님 → "로"). "{이름}({호스트})"는 괄호 속이 아니라 이름으로 고른다. 이 문서의 "{이름}(으)로"는 그 자리를 뜻한다. Rust 오류 문구의 "을(를)" 같은 표기는 그대로다.
 - **모델 받기 상태**: 받기는 앱에 하나이고 `ipc.ts`의 모듈 변수에 둔다(`startModelDownload`, `modelDownload`, `modelDownloadFailure`). 화면을 떠나도 받기는 계속되고, 홈 설정 줄과 전사 탭은 열릴 때 같은 받기를 이어서 보여 준다. 받기가 끝나면(성공·실패·취소) `model_status`를 다시 읽는다. 마지막 진행률 이벤트는 해시 확인과 이름 바꾸기 전에 오므로 이벤트로 판단하지 않는다. 실패 이유는 다음 받기나 가져오기 성공 때까지 남아, 화면이 닫혀 있을 때 실패해도 다음에 열면 보인다.
   - 직접 가져오기는 `tauri-plugin-dialog`의 파일 열기로 고른 경로를 `import_model`에 넘긴다. 권한은 `dialog:allow-open` 하나만 준다(`src-tauri/capabilities/default.json`).
@@ -698,7 +704,8 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 | `confirm_quit` (종료 확인 후 진행 중 작업을 `paused`로 기록하고 종료), `request_quit` (Windows Ctrl+Q 경로) | |
 | `reset_settings` (`settings.json`이 손상됐을 때만: 원본을 `settings.json.bak-<시각>`으로 옮기고 기본값으로 시작) | |
 | `model_status` → `{ files: [{ file, size, installed, received }], downloading }` (설정의 모델과 VAD 모델. `received`는 이어받을 `.part` 크기), `download_models` (두 파일이 설치·검증되면 끝나고, 실패하면 이유를 돌려준다), `cancel_model_download`, `import_model(path)` → `model_status`와 같은 값 | |
-| `test_system_audio`, `send_test_message` | |
+| `test_system_audio(device)` → 들렸는지 (ONB-03, 4.4. `device`는 탭의 출력 장치, Windows만 쓴다), `test_microphone(device)` → 소리가 들어왔는지 (5초 동안 `audio-test://level`). 둘 다 녹음 중이거나 도는 중에 녹음이 시작되면, 또 다른 테스트가 돌고 있으면 거부하고, 장치를 열 수 없으면 한국어 오류다 | `audio-test://level` (0~100, `test_microphone` 동안 40ms마다. 끝나면 0) |
+| `send_test_message(webhook, url)` (ONB-06, 7.1. `url`은 Slack 탭에 입력하고 저장하지 않은 주소, 없으면 `null`이고 키체인의 `slack:{webhook}`을 쓴다. 비밀값은 돌려주지 않는다) | |
 | `list_audio_devices` → `{ inputs, outputs }`, 항목은 `{ id, name }`. `id`는 cpal `DeviceId` 문자열(`host:id`)이라 `input_device`·`output_device`에 그대로 저장하면 캡처 스레드가 같은 장치를 연다. 장치 호출이 멈출 수 있어 blocking 스레드에서 열거하고, 우리 private aggregate 장치(macOS 시스템 오디오 탭)는 뺀다 | |
 
 **`meeting://progress`** (TRN-01, APP-07): 회의가 줄에 들어올 때, 대기 순서가 바뀔 때, 처리가 시작될 때, 구간 진행률이 바뀔 때, 요약이 시작될 때, LLM 요청이 끝날 때, 끝날 때 보낸다.
@@ -769,10 +776,11 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 - **`src-tauri/Info.plist`** (M2에서 추가. Tauri가 번들에 병합하고, `tauri dev`에서는 실행 파일에 내장한다):
   - `NSMicrophoneUsageDescription`: "회의를 녹음하기 위해 마이크를 사용합니다."
   - `NSAudioCaptureUsageDescription`: "화상 회의 상대방의 목소리를 녹음하기 위해 시스템 오디오를 사용합니다."
-- **엔타이틀먼트** (Hardened Runtime): `com.apple.security.device.audio-input`.
+- **엔타이틀먼트** (`src-tauri/Entitlements.plist`, `bundle.macOS.entitlements`): `com.apple.security.device.audio-input`. 서명할 때 Hardened Runtime이 켜지므로(Tauri 기본값) 이것이 없으면 마이크가 막혀 0 버퍼가 된다.
 - **개발 중 주의**: `tauri dev`에서는 권한 요청이 터미널 앱 이름으로 뜰 수 있다. 권한을 초기화하려면 `tccutil reset Microphone com.sije.meeting-summarizer`를 실행한다.
-- **서명**: ad-hoc 서명은 빌드마다 권한을 다시 묻는다. 개발 중에도 Apple Development 인증서처럼 고정된 서명을 쓴다.
-- **OS 알림** (APP-03): 플러그인(`notify-rust` → `mac-notification-sys`)은 `NSUserNotificationCenter`를 쓴다(macOS 14부터 지원 중단 표시가 붙었지만 동작한다). 알림마다 스레드 하나가 클릭이나 닫기를 기다리고, 클릭은 메인 런 루프의 대리자로 온다. `on_action`을 등록했으므로 모든 알림이 그렇다. 배너를 눌러도, 알림 센터에 남은 것을 나중에 눌러도 그 회의로 간다. 앱이 꺼졌다 켜진 뒤에는 이전 알림을 눌러도 회의로 가지 않는다(기다리던 스레드가 없다). `tauri dev`에서는 알림이 터미널 앱 이름으로 뜨고 클릭이 터미널을 연다. 배포 번들에서는 번들 식별자 `com.sije.meeting-summarizer`로 뜬다. OS 알림 설정의 앱 이름은 번들 이름(`productName`, 지금은 `meeting-summarizer`)이다. M6에서 번들 이름을 정하면 일반 탭의 안내 문구("'회의 요약'을 허용")와 맞춘다.
+- **배포 서명** (사용자 결정 2026-10-16): Apple Developer 계정이 없어 ad-hoc 서명(`bundle.macOS.signingIdentity: "-"`)만 하고 공증은 하지 않는다. Hardened Runtime은 켜 두고 위 엔타이틀먼트를 넣는다(나중에 Developer ID로 공증할 때도 필요하다). 내려받은 앱은 처음 열 때 시스템 설정 > 개인정보 보호 및 보안의 "그래도 열기"를 한 번 거친다(`docs/install.md`). ad-hoc 서명은 빌드마다 cdhash가 바뀌어 TCC가 다른 앱으로 볼 수 있으므로, 업데이트할 때마다 마이크·시스템 오디오 권한을 다시 허용해야 할 수 있다. 실제 서명으로 바꾸려면 워크플로의 주석 처리된 `APPLE_*` 값을 저장소 Secrets로 채운다(`APPLE_SIGNING_IDENTITY`가 `"-"`보다 우선한다).
+- **`libclang_rt.osx.a` 링크** (`src-tauri/build.rs`): `tauri build`는 배포 대상(deployment target)을 `minimumSystemVersion`인 14.6으로 정한다. 그러면 ggml-metal의 `@available` 검사가 `__isPlatformVersionAtLeast` 호출로 남는데, rustc는 이 함수가 든 clang 런타임을 링크하지 않아(`-nodefaultlibs`) 링크가 실패한다. 그래서 macOS 빌드는 `xcrun clang --print-resource-dir` 아래 `lib/darwin/libclang_rt.osx.a`를 링크한다. 그냥 `cargo build`는 지금 macOS 버전을 대상으로 해서 검사가 빠지므로 드러나지 않았다. Handy의 `build.rs`(MIT, 5197faf)와 같은 방법이다(13).
+- **OS 알림** (APP-03): 플러그인(`notify-rust` → `mac-notification-sys`)은 `NSUserNotificationCenter`를 쓴다(macOS 14부터 지원 중단 표시가 붙었지만 동작한다). 알림마다 스레드 하나가 클릭이나 닫기를 기다리고, 클릭은 메인 런 루프의 대리자로 온다. `on_action`을 등록했으므로 모든 알림이 그렇다. 배너를 눌러도, 알림 센터에 남은 것을 나중에 눌러도 그 회의로 간다. 앱이 꺼졌다 켜진 뒤에는 이전 알림을 눌러도 회의로 가지 않는다(기다리던 스레드가 없다). `tauri dev`에서는 알림이 터미널 앱 이름으로 뜨고 클릭이 터미널을 연다. 배포 번들에서는 번들 식별자 `com.sije.meeting-summarizer`로 뜬다. OS 알림 설정과 개인정보 보호 및 보안의 앱 이름은 번들 이름(`productName` = `meeting-summarizer`)이다. M6에서 이 이름을 그대로 두기로 했고(2026-10-16), 그 목록을 가리키는 안내 문구(일반 탭의 알림 안내, 시스템 오디오 테스트의 권한 안내)는 `'meeting-summarizer'`라고 쓴다. 헤더·트레이·알림 제목은 "회의 요약"이다.
   - **기다리는 스레드의 비용**: 메인 스레드가 아닌 곳에서 기다리는 알림마다 mac-notification-sys는 메인 런 루프에 0.5초마다 도는 `NSTimer`를 걸어 `deliveredNotifications`를 훑는다. 스레드와 타이머는 알림이 알림 센터에서 사라질 때(클릭, 닫기, 알림 센터에서 지우기)에야 끝난다. 그래서 몇 주씩 켜 두는 트레이 앱에서는 읽지 않은 알림만큼 쌓인다.
   - 지우면 끝난다: 알림이 `deliveredNotifications`에서 빠지면 다음 타이머가 자동 닫힘으로 처리해 스레드가 돌아온다. 플러그인 2.7.0의 `remove_active`·`remove_all_active`는 macOS·Windows에서 아무것도 하지 않고 mac-notification-sys에도 지우는 API가 없어, objc2-foundation(이미 쓰는 크레이트에 `NSUserNotification`·`NSBundle` 기능만 더했다)으로 직접 지운다.
   - **포커스 때 지우기**: 메인 창이 포커스를 얻으면(`WindowEvent::Focused(true)`, 메인 스레드에서 온다) `NSUserNotificationCenter::removeAllDeliveredNotifications`를 부른다. 녹음자가 앱을 보고 있으므로 남은 알림은 이미 지난 것이다. 그래서 이 앱의 알림은 앱이 앞으로 올 때마다 알림 센터에서도 사라지고, 0.5초 안에 기다리던 스레드와 타이머가 모두 끝난다. 쌓이는 것은 창을 보지 않는 동안 온 알림뿐이다. 알림을 눌러 앱이 열려도 같다(누른 알림은 그 자리에서 끝나고, 창이 앞으로 오며 나머지가 지워진다). 상한은 두지 않는다: 몇 개 뒤에 완료 알림이 조용히 끊기는 편이 더 나쁘다.
@@ -780,11 +788,18 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 
 ### 11.2 Windows
 
-- **설치 파일**: NSIS, `installMode: "currentUser"`. 관리자 권한 없이 사용자 단위로 설치한다(NFR-06). 파일럿 동안 새 버전은 같은 설치 파일로 덮어 설치한다. MSI는 쓰지 않는다.
+- **설치 파일**: NSIS, `installMode: "currentUser"`, 설치 화면은 한국어(`src-tauri/tauri.windows.conf.json`). 관리자 권한 없이 사용자 단위로 설치한다(NFR-06). 파일럿 동안 새 버전은 같은 설치 파일로 덮어 설치한다. MSI는 쓰지 않는다.
 - **WebView2**: Tauri 기본값(`downloadBootstrapper`)을 그대로 쓴다. Windows 10/11 대부분에는 WebView2가 이미 설치돼 있다. 없는 PC에서는 WebView2 설치에 관리자 권한을 요구할 수 있다(NFR-06의 예외).
-- **Vulkan 로더**: `vulkan-1.dll`을 동봉한다(5.4).
+- **Vulkan 로더**: `vulkan-1.dll`을 `$INSTDIR`(실행 파일 옆)에 설치한다(5.4).
 - **CPU**: AVX2가 없는 CPU는 전사가 4~10배 느리다(Meetily #306). 첫 실행 때 감지해서 "이 PC는 처리가 오래 걸릴 수 있습니다"를 안내한다.
 - **OS 알림** (APP-03): 토스트(`tauri-winrt-notification`)의 클릭은 토스트가 화면에 있는 동안만 앱으로 온다. 알림 센터로 넘어간 뒤 누르면 OS가 앱을 실행하고, 단일 실행(APP-06)이 메인 창만 앞으로 가져온다(회의로 가지 않는다). 토스트의 앱 ID(AUMID)는 설치된 앱에서만 번들 식별자이고, `target\debug`·`target\release`에서 실행하면 PowerShell의 것을 쓴다. 실제 토스트 클릭은 아직 Windows에서 확인하지 않았다(로드맵 M5). 기다리는 스레드는 토스트가 화면에서 사라질 때(`Dismissed`, 시간 초과 포함) 끝나 쌓이지 않으므로, 11.1의 포커스 때 지우기는 Windows에서 하지 않는다.
+
+### 11.3 배포 빌드
+
+- **워크플로** (`.github/workflows/build.yml`): 수동 실행(workflow_dispatch)이나 `v*` 태그 push에서 macOS Apple Silicon(`aarch64-apple-darwin`, `.dmg`)과 Windows x64(NSIS `-setup.exe`)를 만든다. GitHub 릴리스는 만들지 않고 workflow artifact로 올리며, artifact는 30일 뒤 지워진다. 액션은 모두 커밋 SHA로 고정했다. 태그 실행이면 태그(`v` 제외)가 `tauri.conf.json`의 `version`과 같은지 먼저 확인한다.
+- **번들 대상**: macOS `app`·`dmg`(`tauri.conf.json`), Windows `nsis`(`tauri.windows.conf.json`, Tauri가 Windows에서 병합한다).
+- **배포**: 관리자가 artifact를 OneDrive에 올리고 동료에게 링크를 보낸다. 설치·업데이트·삭제 안내는 `docs/install.md`다. 자동 업데이트는 없다(eng review D2).
+- macOS 빌드는 로컬 `tauri build`로 확인했다(11.1의 ad-hoc 서명). 워크플로는 아직 실행하지 않았고, Windows 빌드는 첫 Actions 실행에서 처음 확인한다.
 
 ## 12. 테스트 전략
 
@@ -824,7 +839,9 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 | 녹음 중 덮개 닫기 1분 / 6분 | ✓ | ✓ |
 | 녹음 중 앱 강제 종료 → 재실행 복구 | ✓ | ✓ |
 | 처리 중 새 녹음 시작 → 전사 즉시 중단 확인 | ✓ | ✓ |
-| **서명·공증된 배포 빌드**에서 마이크·시스템 오디오가 0이 아닌지 | ✓ | - |
+| **배포 빌드(ad-hoc 서명)**에서 마이크·시스템 오디오가 0이 아닌지 | ✓ | - |
+| 설정 오디오 탭: 권한 없음에서 시스템 오디오 테스트 실패, 허용 뒤 통과. 출력 음량을 꺼도 통과하는지 기록. 마이크 테스트의 레벨 막대가 말소리에 움직임 (ONB-03) | ✓ | ✓ |
+| 설정 Slack 탭: 저장한 웹훅과 입력만 한 URL로 테스트 메시지가 채널에 옴 (ONB-06) | ✓ | ✓ |
 | Vulkan 런타임이 없는 PC에서 실행 | - | ✓ |
 | 녹음 중 앱을 한 번 더 실행 → 인스턴스 하나, 녹음 영향 없음 (D14) | ✓ | ✓ |
 
@@ -848,9 +865,10 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 
 ## 13. 차용 코드
 
-- 차용 대상: Meetily(`Zackriya-Solutions/meetily`), Handy(`cjpais/Handy`). 둘 다 MIT 라이선스다.
-- 차용한 파일 맨 위에 출처 URL, 커밋 해시, 라이선스를 주석으로 남긴다.
-- 루트에 `THIRD_PARTY_NOTICES.md`를 두고 함께 배포하는 서드파티의 라이선스 전문을 모은다.
-  - MIT: Meetily, Handy, whisper.cpp, Silero VAD
+- 차용한 코드: Handy(`cjpais/Handy`, MIT)의 `build.rs`에서 macOS 링크 수정만 따왔다(`src-tauri/build.rs`, 11.1). Meetily(`Zackriya-Solutions/meetily`, MIT)는 참고만 했고 코드는 들어 있지 않다.
+- 차용한 코드 옆에 출처 URL, 커밋 해시, 라이선스를 주석으로 남긴다.
+- 루트에 `THIRD_PARTY_NOTICES.md`를 두고 함께 배포하는 서드파티의 라이선스 전문을 모은다. 번들 리소스로도 들어간다(macOS `Contents/Resources`, Windows 설치 폴더).
+  - MIT: whisper.cpp, Whisper 모델 가중치(OpenAI), Silero VAD, Handy
   - Apache-2.0: Vulkan Loader(`vulkan-1.dll`)
-  - 그 외 Rust·npm 의존성 라이선스는 빌드 시 도구로 생성한다(예: `cargo about`).
+  - SIL OFL 1.1: Pretendard, Instrument Serif, Noto Serif KR
+  - 그 외 Rust·npm 의존성 라이선스는 아직 모으지 않았다. 후속으로 빌드 때 `cargo about`으로 생성한다. 그때까지는 `THIRD_PARTY_NOTICES.md` 끝의 명령으로 목록을 본다.

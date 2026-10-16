@@ -1,0 +1,99 @@
+# Installers for internal distribution (docs/install.md): macOS Apple Silicon .dmg and Windows x64
+# NSIS setup.exe, uploaded as workflow artifacts. No GitHub release is created.
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos-arm64
+            args: --target aarch64-apple-darwin
+            rust-targets: aarch64-apple-darwin
+            installer: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          - os: windows-latest
+            name: windows-x64
+            args: ''
+            rust-targets: ''
+            installer: src-tauri/target/release/bundle/nsis/*-setup.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The installer file name carries tauri.conf.json's version, so a v0.2.0 tag must build 0.2.0.
+      # jq -j: no trailing newline, so no stray \r on Windows.
+      - name: Check tag matches app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version=$(jq -j .version src-tauri/tauri.conf.json)
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match src-tauri/tauri.conf.json version $version"
+            exit 1
+          fi
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - run: bun install --frozen-lockfile
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch, 2026-10-09
+        with:
+          toolchain: stable
+          targets: ${{ matrix.rust-targets }}
+
+      - uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+
+      # whisper-rs-sys needs VULKAN_SDK (Lib\vulkan-1.lib) and glslc for the Vulkan backend
+      # (architecture 5.4). 1.4.313.2 is what llama.cpp's Windows release used for the same ggml.
+      - name: Install Vulkan SDK
+        if: runner.os == 'Windows'
+        uses: jakoch/install-vulkan-sdk-action@d17de7e2f5e50efb5d2123efed18497d3c58c533 # v1.7.0
+        with:
+          vulkan_version: 1.4.313.2
+          install_runtime: true
+          cache: true
+          stripdown: true
+
+      # The app does not start without vulkan-1.dll. tauri.windows.conf.json installs this copy
+      # next to the exe.
+      - name: Copy vulkan-1.dll
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item "$env:VULKAN_SDK\runtime\x64\vulkan-1.dll" src-tauri\vulkan-1.dll
+
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        # macOS is ad-hoc signed (bundle.macOS.signingIdentity "-"), not notarized. For Developer ID
+        # signing and notarization, add these repository secrets and uncomment. APPLE_SIGNING_IDENTITY
+        # overrides the "-" in tauri.conf.json.
+        # env:
+        #   APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+        #   APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        #   APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        #   APPLE_ID: ${{ secrets.APPLE_ID }}
+        #   APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+        #   APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          args: ${{ matrix.args }}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: meeting-summarizer-${{ matrix.name }}
+          path: ${{ matrix.installer }}
+          if-no-files-found: error
+          retention-days: 30

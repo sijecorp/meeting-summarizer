@@ -399,7 +399,9 @@ export default function App() {
                   onSetup={(tab) => go({ name: "settings", tab })}
                 />
               )}
-              {screen.name === "settings" && <Settings tab={screen.tab} barSlot={barSlot} onHome={home} />}
+              {screen.name === "settings" && (
+                <Settings tab={screen.tab} barSlot={barSlot} recording={recording || starting} onHome={home} />
+              )}
             </Present>
           </motion.div>
         </AnimatePresence>
