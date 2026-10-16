@@ -77,17 +77,35 @@ jobs:
         shell: pwsh
         run: Copy-Item "$env:VULKAN_SDK\runtime\x64\vulkan-1.dll" src-tauri\vulkan-1.dll
 
+      # With the Visual Studio generator (VS 18 2026), ggml-vulkan's nested vulkan-shaders-gen
+      # project finds no C compiler. Ninja inside the MSVC developer environment (cl.exe on PATH)
+      # works for both, since the nested project inherits the generator.
+      - name: MSVC developer environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - name: Check cl and ninja
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Command cl, ninja | Format-Table Name, Source
+          ninja --version
+
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
-        # macOS is ad-hoc signed (bundle.macOS.signingIdentity "-"), not notarized. For Developer ID
-        # signing and notarization, add these repository secrets and uncomment. APPLE_SIGNING_IDENTITY
-        # overrides the "-" in tauri.conf.json.
-        # env:
-        #   APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-        #   APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-        #   APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        #   APPLE_ID: ${{ secrets.APPLE_ID }}
-        #   APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-        #   APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        env:
+          # The cmake crate reads CMAKE_GENERATOR_<target> first, so this only applies on Windows.
+          CMAKE_GENERATOR_x86_64_pc_windows_msvc: Ninja
+          # macOS is ad-hoc signed (bundle.macOS.signingIdentity "-"), not notarized. For Developer ID
+          # signing and notarization, add these repository secrets and uncomment. APPLE_SIGNING_IDENTITY
+          # overrides the "-" in tauri.conf.json.
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_ID: ${{ secrets.APPLE_ID }}
+          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           args: ${{ matrix.args }}
 
