@@ -53,7 +53,7 @@ $flags = @(Get-Content $flagsFile | ForEach-Object {
     })
 $hash = (Get-FileHash -Algorithm SHA256 $flagsFile).Hash.Substring(0, 12).ToLower()
 
-$cacheRoot = if ($env:MS_LLAMA_SERVER_CACHE) { $env:MS_LLAMA_SERVER_CACHE } else { "$env:LOCALAPPDATA\meeting-summarizer\llama-server" }
+$cacheRoot = if ($env:MS_LLAMA_SERVER_CACHE) { $env:MS_LLAMA_SERVER_CACHE } else { "$env:LOCALAPPDATA\meeting-summarizer-dev\llama-server" }
 $cached = Join-Path $cacheRoot "$rev-$triple-$hash\llama-server.exe"
 if (Test-Path $cached) {
     Write-Host "Using the cached build $cached"

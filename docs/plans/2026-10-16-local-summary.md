@@ -2,7 +2,7 @@
 ## Implementation plan
 # 계획: 로컬 요약을 기본으로 (M6.5)
 
-- 상태: 승인 (2026-10-16, /autoplan 최종 관문)
+- 상태: 구현 완료(1~4, 6단계), 7단계 실측과 5단계(미룸) 남음. 승인 2026-10-16(/autoplan 최종 관문)
 - 관련: [요구사항](../requirements.md), [아키텍처 5·6·8](../architecture.md), [로드맵](../roadmap.md)
 
 ## 1. 왜

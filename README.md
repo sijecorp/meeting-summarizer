@@ -60,7 +60,7 @@ pwsh -File scripts\build-llama-server.ps1
 ```
 
 - llama.cpp 커밋은 `scripts/llama.cpp.rev`, CMake 옵션은 `scripts/llama-server.flags` 한 곳에만 있다.
-- 결과는 저장소 밖 캐시에 커밋·대상·옵션별로 남는다(macOS `~/Library/Caches/meeting-summarizer/llama-server`, Windows `%LOCALAPPDATA%\meeting-summarizer\llama-server`). 다른 worktree는 복사만 한다. 캐시 폴더는 `MS_LLAMA_SERVER_CACHE`로 바꾼다.
+- 결과는 저장소 밖 캐시에 커밋·대상·옵션별로 남는다(macOS `~/Library/Caches/meeting-summarizer/llama-server`, Windows `%LOCALAPPDATA%\meeting-summarizer-dev\llama-server`, 앱 설치 폴더와 겹치지 않게). 다른 worktree는 복사만 한다. 캐시 폴더는 `MS_LLAMA_SERVER_CACHE`로 바꾼다.
 - Windows는 MSVC의 260자 한계 때문에 `C:\t\lls`에서 빌드하고, 다 되면 그 폴더를 지운다. 다른 드라이브를 쓰려면 `MS_LLAMA_SERVER_WORK`에 상위 폴더를 준다(그 아래 `lls`만 쓰고 지운다).
 - 바이너리 옆의 도장(`llama-server-<target-triple>.stamp`)에 커밋과 옵션 해시가 있다. 사이드카가 없으면 디버그 빌드(`cargo check`, `cargo test`, rust-analyzer)는 빈 자리표시 파일을 만들고 경고만 한다. 릴리스 빌드는 자리표시이거나 도장이 없거나 다르면 멈춘다.
 

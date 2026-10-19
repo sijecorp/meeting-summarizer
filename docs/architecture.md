@@ -29,6 +29,7 @@
 ```
 
 - 무거운 일(녹음, 전사, 요약, 전송)은 모두 Rust에서 한다. React는 화면만 그린다.
+- 요약의 기본 경로는 앱이 띄우는 이 PC 요약 엔진(`llama-server` 사이드카, 127.0.0.1에서만 받는다, 6.6)이라 전사본이 PC 밖으로 나가지 않는다. 위 그림의 클라우드 API와 로컬 Ollama/LM Studio는 녹음자가 추가한 연결일 때만 쓴다(M6.5).
 - React → Rust는 `invoke`(명령), Rust → React는 이벤트(진행률, 레벨, 상태 변경)로 통신한다.
 - 데이터는 모두 녹음자 PC의 앱 데이터 폴더에 있다. DB와 서버는 없다.
 
@@ -49,6 +50,7 @@
 | 전사 | `whisper-rs` 0.16.0 (whisper.cpp 바인딩) | M3에서 0.16.0으로 고정했다(`whisper-rs-sys` 0.15.0, whisper.cpp 1.8.3 내장). 내장 VAD, `suppress_nst`, `no_context`, initial prompt, `use_gpu`, 진행률 콜백이 모두 있다. features는 `Cargo.toml`에서 대상별로 준다: macOS `metal`, Windows `vulkan`. 빌드에 `cmake`가 필요하다. Windows Vulkan 빌드는 배포 워크플로(11.3)가 하지만, 첫 Actions 실행 전이라 아직 확인하지 않았다 |
 | HTTP | `reqwest` 0.13 (`default-features = false`, `native-tls`, `system-proxy`) | LLM, Slack, 모델 다운로드. OS의 TLS와 인증서 저장소를 써서 사내 미러의 사내 CA를 따로 설정하지 않아도 믿는다. 기본값(rustls + aws-lc-rs)은 C 빌드가 하나 더 붙는다. M4·M5 모두 기능을 더하지 않았다(요청 본문은 `serde_json`으로 만든다) |
 | 해시 | `sha2` 0.10 | 모델 검증. 트리에 이미 있던 버전이라 중복이 없다 |
+| 요약 엔진 | llama.cpp `llama-server` v0.7.0(620d222)을 정적 링크한 사이드카, 요약 모델 Qwen3-4B-Instruct-2507 Q4_K_M | M6.5. 앱 안에 크레이트로 넣으면 whisper-rs의 ggml과 심볼이 겹쳐 별도 실행 파일로 둔다. 수명은 6.6, 빌드는 11.3, 모델은 5.1 |
 | 비밀값 | `keyring` 4.x | `tauri-plugin-stronghold`는 지원 중단돼 쓰지 않는다 |
 | 절전 방지 | `keepawake` | |
 | Tauri 플러그인 | `tauri-plugin-notification` 2.7.0(데스크톱 알림 클릭 보고가 2.6.0부터 동작한다. Rust의 `Notification::on_action`으로 받는다, 10.1), `tauri-plugin-dialog`(파일 선택), `tauri-plugin-log`(앱 로그, 8.1), `tauri-plugin-single-instance`(두 번째 실행 차단, eng review D14), 내장 tray-icon | 자동 업데이트(`tauri-plugin-updater`)는 파일럿 뒤로 미뤘다(eng review D2) |
@@ -57,7 +59,7 @@
 
 ```
 src-tauri/src/
-  main.rs            진입점 (기존). `--plan-chunks`·`--transcribe-worker` 인자로 실행되면 앱을 띄우지 않고 전사 워커로 동작 (5.3)
+  main.rs            진입점 (기존). `--plan-chunks`·`--transcribe-worker` 인자로 실행되면 앱을 띄우지 않고 전사 워커로 동작 (5.3), `--llm-supervisor`면 요약 엔진의 감독으로 동작 (6.6)
   lib.rs             Builder, 플러그인, 트레이, 명령 등록
   commands.rs        React에서 부르는 명령 모음
   settings.rs        settings.json 읽기·쓰기 + keyring 래퍼
@@ -74,9 +76,11 @@ src-tauri/src/
     engine.rs        whisper-rs 실행, 백엔드 선택, 중단 콜백, VAD 기반 10분 구간 나누기
     filter.rs        환각 필터, 비정상 결과 검사 (순수 로직)
   summarize.rs       OpenAI 호환 클라이언트, 연결 고르기, 프롬프트, 구간 요약, 실패 분류, 요약 eval(12.3)
+  sidecar.rs         이 PC 요약 엔진(`llama-server`)의 감독·띄우기·끄기·다시 띄우기, 내장 실패 문구 (6.6)
+  grounding.rs       근거 검사: 근거 없는 담당자·기한을 "미정"으로 (6.3, 순수 로직)
   slack.rs           페이로드 생성, 글자 수 계산, mrkdwn 대체, 수정 수 계산, 전송
   store.rs           폴더 구조, meta.json, 상태 전이, 앱 시작 시 복구, 요약 저장
-  queue.rs           처리 대기열(최대 2개 동시 처리, 한 자리에서 전사 → 요약, 나머지는 FIFO), 일시정지·중단
+  queue.rs           처리 대기열(최대 2개 동시 처리, 요약 모델이 있으면 1개, 한 자리에서 전사 → 요약, 나머지는 FIFO), 일시정지·중단, 요약 엔진의 주인
   resources/
     hallucinations.ko.txt   환각 문구 목록 (한 줄에 하나)
 src-tauri/tests/fixtures/   요약 eval 고정 전사본과 expected.json (12.3)
@@ -263,7 +267,7 @@ queue.rs ──spawn── 앱 실행 파일 --plan-chunks {회의 폴더} {VAD 
 - **무응답 감시**: 워커가 stdout에 5분 동안 한 줄도 내지 않으면 부모가 kill하고 크래시로 센다(5.4의 GPU 재시도 대상). 워커는 Whisper 창(30초 분량)마다, 구간 나누기는 10분 창마다 진행률을 낸다. 874MB 모델 로딩도 수 초다.
 - 부모는 stdout을 바이트로 읽어 한 줄씩 JSON으로 해석한다. 우리 줄이 아니거나 UTF-8이 아닌 줄은 건너뛴다. stdout이 닫힌 뒤에도 프로세스가 실제로 끝날 때까지는 kill할 수 있게 둔다.
 
-- **동시 실행** (TRN-01, 사용자 결정 2026-10-14): 워커 프로세스는 회의 2개까지 동시에 돈다. 나머지 회의는 대기열에서 들어온 순서(FIFO)대로 기다리고, 화면에 대기 순서를 보여 준다. 워커마다 모델을 따로 올리므로 메모리 사용이 두 배다. 8GB 기기에서 문제가 되는지 파일럿에서 본다.
+- **동시 실행** (TRN-01, 사용자 결정 2026-10-14): 워커 프로세스는 회의 2개까지 동시에 돈다(요약 모델이 설치돼 있으면 1개, 8.4). 나머지 회의는 대기열에서 들어온 순서(FIFO)대로 기다리고, 화면에 대기 순서를 보여 준다. 워커마다 모델을 따로 올리므로 메모리 사용이 두 배다. 8GB 기기에서 문제가 되는지 파일럿에서 본다.
 - 워커는 구간 하나를 처리하고 끝난다. 모델 로딩(수 초)은 구간마다 반복되지만, 구간이 10분 분량이라 비중이 작다.
 - 결과는 부모(`queue.rs`)가 받아 `transcript.partial.jsonl`에 쓴다. 워커는 회의 폴더의 오디오를 읽기만 한다.
 - **중단**: 녹음이 시작되면 부모가 실행 중인 워커 프로세스를 모두 kill한다. 그 구간의 결과는 버리고, 녹음이 끝나면 회의마다 그 구간부터 다시 처리한다. abort 콜백에 기대지 않는다. kill하기 전에 "멈춘 이유"(녹음, 삭제, 종료)를 먼저 기록하므로 kill은 크래시로 세지 않는다. 멈춘 회의는 `paused`로 기록하고 대기열 맨 앞으로 돌아간다(원래 순서대로). 워커 스레드가 끝나기 전에는 같은 회의를 다시 시작하지 않는다.
@@ -415,7 +419,7 @@ queue.rs ──spawn── 앱 실행 파일 --plan-chunks {회의 폴더} {VAD 
 
 ### 6.6 내장 요약 엔진 (M6.5 계획 5.3, sidecar.rs)
 
-앱은 `llama-server`를 직접 띄우지 않는다. 자기 실행 파일을 감독 모드로 띄우고 감독이 `llama-server`를 띄운다. 감독은 stdin이 닫히면(앱이 끄거나, 끝나거나, 죽으면) 바로 `llama-server`를 끝내므로 4GB를 잡은 프로세스가 앱보다 오래 남지 않는다.
+앱은 `llama-server`를 직접 띄우지 않는다(SUM-12). 자기 실행 파일을 감독 모드로 띄우고 감독이 `llama-server`를 띄운다. 감독은 stdin이 닫히면(앱이 끄거나, 끝나거나, 죽으면) 바로 `llama-server`를 끝내므로 4GB를 잡은 프로세스가 앱보다 오래 남지 않는다.
 
 ```
 Queue의 Sidecar ──spawn── 앱 실행 파일 --llm-supervisor {llama-server} {인자…}
@@ -879,7 +883,7 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 - **요약 엔진 사이드카** (M6.5 계획 5.1): llama.cpp의 `llama-server`를 정적 링크로 빌드해 `bundle.externalBin`(`binaries/llama-server`)으로 넣는다.
   - 커밋은 `scripts/llama.cpp.rev` 한 곳에 고정한다(지금 v0.7.0, 620d222). 새 모델이 필요하거나 보안 수정이 있을 때만 올린다. 올릴 때는 `THIRD_PARTY_NOTICES.md`의 커밋과 포함 코드 목록을 고치고, 1단계 확인(두 OS 빌드, CPU 기준, Metal·Vulkan 실행, q8_0 KV 캐시와 flash attention이 Metal·Vulkan·CPU에서 도는지, 회사 PC)을 다시 한다. Windows 내장 GPU에서는 1단계와 7단계에 `llama-server.log`의 "enabling flash_attn since it is required for quantized V cache"와 `graph splits`를 본다(2쯤이 정상이고 72쯤이면 flash attention이 CPU에서 돈 것이다). 나뉘면 Windows에서만 `-ctv q8_0`을 빼고 `-ctk q8_0`은 둔다.
   - CMake 옵션은 `scripts/llama-server.flags` 한 곳에 있다. 빌드는 `scripts/build-llama-server.sh`(macOS)와 `.ps1`(Windows)이 하고, CI도 같은 스크립트를 부른다.
-  - 결과는 저장소 밖 캐시에 커밋·대상·옵션 해시별로 남는다(macOS `~/Library/Caches/meeting-summarizer/llama-server`, Windows `%LOCALAPPDATA%\meeting-summarizer\llama-server`, `MS_LLAMA_SERVER_CACHE`로 바꾼다). Windows는 260자 한계 때문에 `C:\t\lls`에서 빌드한다(`MS_LLAMA_SERVER_WORK`로 바꾼다).
+  - 결과는 저장소 밖 캐시에 커밋·대상·옵션 해시별로 남는다(macOS `~/Library/Caches/meeting-summarizer/llama-server`, Windows `%LOCALAPPDATA%\meeting-summarizer-dev\llama-server`(설치 폴더 `%LOCALAPPDATA%\meeting-summarizer`와 겹치지 않게), `MS_LLAMA_SERVER_CACHE`로 바꾼다). Windows는 260자 한계 때문에 `C:\t\lls`에서 빌드한다(`MS_LLAMA_SERVER_WORK`로 바꾼다).
   - 바이너리 옆 도장(`llama-server-<target-triple>.stamp`, 커밋과 옵션 해시)을 `build.rs`가 본다. 개발 빌드는 사이드카가 없으면 빈 자리표시를 만들고, 자리표시이거나 도장이 다르면 경고만 한다. release 빌드와 `tauri build`(`--debug` 포함)는 자리표시, 도장 없음, 도장 불일치에서 멈춘다.
   - 워크플로는 사이드카를 빌드한 뒤 캐시를 바로 저장하고, `bun run app:dev --check`와 테스트를 돌린다. 설치 파일을 만든 뒤에는 이것을 확인한다. macOS: 앱과 dmg 안의 사이드카, `otool -L`이 시스템 라이브러리뿐, Hardened Runtime 서명. Windows: `dumpbin /dependents`가 시스템 DLL과 `vulkan-1.dll`뿐, zmm 명령 없음, 설치 파일 안에서 앱·`llama-server.exe`·`vulkan-1.dll`이 한 폴더.
 - **Windows 빌드 환경**: `windows-latest`(Visual Studio 18 2026, CMake 4.4)에서 두 가지를 맞췄다. (1) Visual Studio 생성기로는 ggml-vulkan이 따로 구성하는 `vulkan-shaders-gen`이 컴파일러를 찾지 못해, MSVC 개발 환경(`ilammy/msvc-dev-cmd`)에서 Ninja로 빌드한다(`CMAKE_GENERATOR_x86_64_pc_windows_msvc: Ninja`, cmake 크레이트가 대상 이름이 붙은 변수를 먼저 읽어 macOS에는 닿지 않는다). (2) `src-tauri\target` 아래에서는 그 하위 빌드의 pdb 경로가 269자로 MSVC의 260자 한계를 넘어(C1041), `CARGO_TARGET_DIR`을 `D:\a\t`로 둔다. rust-cache는 `CARGO_TARGET_DIR`을 읽지 않아 같은 폴더를 `src-tauri` 기준 상대 경로로 받는다.
@@ -899,7 +903,7 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 | `writer.rs` 기록 경로 | 쓰기 오류 주입 시 상태 `recorded` + 마지막 flush 길이만큼 읽히는 WAV (D7), `recorded`를 못 쓰면 중단된 녹음, 5분 넘는 절전은 절전 시점에서 종료, 3시간 50분 경고와 4시간 종료, 마이크 3초 0버퍼 경고, 48k 스테레오·44.1k 모노 → 16kHz 길이와 주파수 |
 | `filter.rs` | 정확히 일치할 때만 제거, 비슷한 문장은 남김, 반복 토큰·빈 결과 검사 |
 | `grounding.rs` | 근거 검사(6.3): 공유 예시 파일의 줄마다 `parseDoc`과 같은 결과(Vitest도 같은 파일을 읽는다), 있는 이름·없는 이름·여러 담당자 중 일부·호칭과 띄어쓰기·직함·구분자 및·&, 낱말 경계를 넘어 이어 붙인 이름은 근거가 아님("끝나서 연락"/"서연"), 용어집 세 글자 한글 이름의 두 글자 조각("김민수"/"민수 씨")과 두 글자 이름, 한글이 아닌 이름은 전체(대소문자 무시), "전원" 같은 담당자는 판단 안 함, 날짜 변형·조사·다른 달·ISO·기간, 상대 표현, 다른 섹션은 그대로, 읽지 못한 줄·제목 없음 → 검사 못 함. 큐 테스트로 `summary.raw.md`·`summary.generated.md`·`grounding_replaced`·`grounding_checked` |
-| `queue.rs` | 판단은 순수 함수로 확인한다: 2개 동시 실행과 FIFO 대기 순서, 녹음 시작 → 실행 중인 회의가 원래 순서로 맨 앞에 돌아가고(클라우드 요약은 자리를 지킴) 녹음 중에는 시작 안 함, 크래시 → GPU 1회 재시도 → `gpu_failed` → CPU (D5), 종료 코드 2·3과 OS의 SIGKILL → `gpu_failed` 아님 (5.3), 무응답은 크래시로 셈, GPU 결과가 비정상이면 CPU로 한 번, 마지막 완료 구간 다음부터 재개(찢어진 줄·계획과 다른 줄에서 멈춤), 진행률·남은 시간. 프로세스 처리는 `sh`를 가짜 워커로 써서 확인한다(unix): stdout 줄(잡음·UTF-8 아닌 줄 건너뜀)과 종료 코드·시그널, 녹음 시작 → 1초 안에 kill되고 크래시로 세지 않음, 무응답 → kill. 상태를 쓰는 경로 전체는 `tauri::test` 모의 런타임에서 셸 스크립트 워커, 스텁 LLM 서버, 가짜 키체인으로 확인한다: LLM 연결이 없으면 끝까지 → `transcript.json` + `transcribed`, 연결이 있으면 같은 자리에서 요약까지 → `review` + `summary.generated.md` + 제목, 연결을 나중에 저장하면 다시 전사하지 않고 요약, 30자 미만 → 요청 없이 `review` + `no_speech`, LLM 오류 → `summarize_failed` + `error` → 다른 연결로 다시 실행, 로컬 요약 중 녹음 → 요청 취소·`paused`·맨 앞 → 녹음 뒤 요약만 다시, 클라우드 요약 중 녹음 → 계속 돌아 녹음 중에 `review`, 요약 중 삭제 → 요청 취소 후 폴더 삭제, 클라우드 요약 중 종료 → 요청 취소 후 `paused`, `transcript.json`이 있어도 `transcribe_failed`면 다시 전사(상태로 판단), 녹음으로 멈춘 뒤 끝을 쓰기 전에 삭제가 오면 대기열에 다시 들어가지 않음, 녹음 → 디스크에 `paused` + 맨 앞 → 같은 구간부터 다시, CPU 크래시 → `transcribe_failed` + `error`, GPU 크래시 2번 → `gpu_failed` + CPU로 완료, 종료 코드 3 → 해시 확인 후 손상 안내와 파일 삭제, 동시에 두 번 삭제해도 둘 다 성공하고 처리가 끝난 뒤 폴더 삭제. 모델 실패 문구(메모리·손상·없음)는 따로 확인한다 |
+| `queue.rs` | 판단은 순수 함수로 확인한다: 2개 동시 실행(요약 모델이 있으면 1개)과 FIFO 대기 순서, 녹음 시작 → 실행 중인 회의가 원래 순서로 맨 앞에 돌아가고(클라우드 요약은 자리를 지킴) 녹음 중에는 시작 안 함, 크래시 → GPU 1회 재시도 → `gpu_failed` → CPU (D5), 종료 코드 2·3과 OS의 SIGKILL → `gpu_failed` 아님 (5.3), 무응답은 크래시로 셈, GPU 결과가 비정상이면 CPU로 한 번, 마지막 완료 구간 다음부터 재개(찢어진 줄·계획과 다른 줄에서 멈춤), 진행률·남은 시간. 프로세스 처리는 `sh`를 가짜 워커로 써서 확인한다(unix): stdout 줄(잡음·UTF-8 아닌 줄 건너뜀)과 종료 코드·시그널, 녹음 시작 → 1초 안에 kill되고 크래시로 세지 않음, 무응답 → kill. 상태를 쓰는 경로 전체는 `tauri::test` 모의 런타임에서 셸 스크립트 워커, 스텁 LLM 서버, 가짜 키체인으로 확인한다: 요약 모델도 저장한 연결도 없으면 끝까지 → `transcript.json` + `transcribed`, 연결이 있으면 같은 자리에서 요약까지 → `review` + `summary.generated.md` + 제목, 연결을 나중에 저장하면 다시 전사하지 않고 요약, 30자 미만 → 요청 없이 `review` + `no_speech`, LLM 오류 → `summarize_failed` + `error` → 다른 연결로 다시 실행, 로컬 요약 중 녹음 → 요청 취소·`paused`·맨 앞 → 녹음 뒤 요약만 다시, 클라우드 요약 중 녹음 → 계속 돌아 녹음 중에 `review`, 요약 중 삭제 → 요청 취소 후 폴더 삭제, 클라우드 요약 중 종료 → 요청 취소 후 `paused`, `transcript.json`이 있어도 `transcribe_failed`면 다시 전사(상태로 판단), 녹음으로 멈춘 뒤 끝을 쓰기 전에 삭제가 오면 대기열에 다시 들어가지 않음, 녹음 → 디스크에 `paused` + 맨 앞 → 같은 구간부터 다시, CPU 크래시 → `transcribe_failed` + `error`, GPU 크래시 2번 → `gpu_failed` + CPU로 완료, 종료 코드 3 → 해시 확인 후 손상 안내와 파일 삭제, 동시에 두 번 삭제해도 둘 다 성공하고 처리가 끝난 뒤 폴더 삭제. 모델 실패 문구(메모리·손상·없음)는 따로 확인한다 |
 | 구간 나누기 (`engine.rs`) | 겹친 창의 음성 구간 합치기, 10분에 가장 가까운 무음에서 자름, 5~12분 범위, 무음 없는 연속 발화는 10분에서 자름, 무음·짧은 녹음 |
 | 음성만 잘라 잇기 (`engine.rs` `Speech`) | whisper.cpp와 같은 이어 붙이기(0.1초 겹침, 0.1초 무음), 조각 안은 1:1, 무음 자리에 떨어진 시작은 다음 조각 시작·끝은 앞 조각 끝, 오디오 끝을 넘은 시각, 음성이 없을 때 |
 | 워커 종료 코드 (`engine.rs`) | 인자 오류·녹음 없음 → 2, 모델 없음 → 3 |
@@ -930,6 +934,8 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 | Vulkan 런타임이 없는 PC에서 실행 | - | ✓ |
 | 녹음 중 앱을 한 번 더 실행 → 인스턴스 하나, 녹음 영향 없음 (D14) | ✓ | ✓ |
 | 내장 요약 중 앱 강제 종료 → `llama-server` 프로세스가 남지 않음 (6.6) | ✓ | ✓ |
+| 브라우저로 받은 설치 파일로 설치(macOS는 "그래도 열기") → 첫 내장 요약, 업데이트 설치 뒤 다시 내장 요약 (M6.5 DX8) | ✓ | ✓ |
+| 회사 관리 PC와 사내 백신에서 `llama-server`가 격리되지 않고 내장 요약이 됨. 막히면 `docs/install.md`의 "회사 PC에서 막힐 때"대로 풀리는지 | ✓ | ✓ |
 | Vulkan 런타임이 없는 PC, 디버그 빌드: `vulkan-1.dll`이 없는 폴더에 복사한 `llama-server.exe`를 `MS_LLAMA_SERVER`로 가리키고 내장 요약 → 오류 창 없이 "이 PC 요약 엔진을 실행할 수 없습니다" (6.6. 설치 폴더의 DLL을 빼면 앱 자체가 뜨지 않는다, 5.4) | - | ✓ |
 
 ### 12.3 요약 프롬프트 평가 (eng review D11)
@@ -957,7 +963,7 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 - 차용한 코드: Handy(`cjpais/Handy`, MIT)의 `build.rs`에서 macOS 링크 수정만 따왔다(`src-tauri/build.rs`, 11.1). Meetily(`Zackriya-Solutions/meetily`, MIT)는 참고만 했고 코드는 들어 있지 않다.
 - 차용한 코드 옆에 출처 URL, 커밋 해시, 라이선스를 주석으로 남긴다.
 - 루트에 `THIRD_PARTY_NOTICES.md`를 두고 함께 배포하는 서드파티의 라이선스 전문을 모은다. 번들 리소스로도 들어간다(macOS `Contents/Resources`, Windows 설치 폴더).
-  - MIT: whisper.cpp, Whisper 모델 가중치(OpenAI), Silero VAD, Handy
-  - Apache-2.0: Vulkan Loader(`vulkan-1.dll`)
+  - MIT: whisper.cpp, llama.cpp(`llama-server` 사이드카와 그 안에 든 코드), Whisper 모델 가중치(OpenAI), Silero VAD, Handy
+  - Apache-2.0: Vulkan Loader(`vulkan-1.dll`), Qwen3-4B-Instruct-2507 모델 가중치(첫 설정 때 받는다, 번들에는 없다)
   - SIL OFL 1.1: Pretendard, Instrument Serif, Noto Serif KR
   - 그 외 Rust·npm 의존성 라이선스는 아직 모으지 않았다. 후속으로 빌드 때 `cargo about`으로 생성한다. 그때까지는 `THIRD_PARTY_NOTICES.md` 끝의 명령으로 목록을 본다.
