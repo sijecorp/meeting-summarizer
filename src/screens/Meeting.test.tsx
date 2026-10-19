@@ -6,6 +6,7 @@ import { hhmm } from "../components/common";
 import type { LlmConnection, LoadedSettings, MeetingDetail, Meta, Progress, Segment, Settings } from "../lib/ipc";
 import Meeting from "./Meeting";
 import { parseDoc } from "./MeetingParts";
+import lines from "../../src-tauri/tests/fixtures/summary-lines.json";
 
 // Autosave state outlives the screen (one per meeting id), so each test opens a meeting of its own.
 let id = "";
@@ -159,39 +160,13 @@ test("renders HTML in a summary as text", async () => {
   expect(document.body.querySelector("img")).toBeNull();
 });
 
-// Our own line parser (architecture 10.4): the prompt's shapes, and everything else as typed.
-test("parses a summary into headings, items with owner and due date, 없음 and literal text", () => {
-  expect(
-    parseDoc(
-      [
-        "## 결정사항",
-        "- 파일럿은 12명으로 시작한다",
-        "* [김지훈] 설치 안내 문서 작성 (10월 18일)",
-        "• [미정] 키 발급 요청 (미정)",
-        "- 없음",
-        "",
-        "# 제목 ### 셋",
-        "**굵게** 와 [링크](https://example.com)",
-        "- [링크](https://example.com) 그대로 (괄호) 뒤",
-        "#### 넷",
-        "-붙은 줄",
-      ].join("\n"),
-    ),
-  ).toEqual([
-    { kind: "heading", line: 0, text: "결정사항" },
-    { kind: "item", line: 1, owner: null, text: "파일럿은 12명으로 시작한다", due: null },
-    { kind: "item", line: 2, owner: "김지훈", text: "설치 안내 문서 작성", due: "10월 18일" },
-    { kind: "item", line: 3, owner: "미정", text: "키 발급 요청", due: "미정" },
-    { kind: "none", line: 4 },
-    { kind: "gap", line: 5 },
-    { kind: "heading", line: 6, text: "제목 ### 셋" },
-    { kind: "text", line: 7, text: "**굵게** 와 [링크](https://example.com)" },
-    { kind: "item", line: 8, owner: null, text: "[링크](https://example.com) 그대로 (괄호) 뒤", due: null },
-    { kind: "text", line: 9, text: "#### 넷" },
-    { kind: "text", line: 10, text: "-붙은 줄" },
-  ]);
-  // A line break from Windows does not stop an item from parsing.
-  expect(parseDoc("- [박서연] 웹훅 정리 (미정)\r")[0]).toMatchObject({ owner: "박서연", text: "웹훅 정리" });
+// Our own line parser (architecture 10.4): the prompt's shapes, and everything else as typed. The
+// grounding check's parser (grounding.rs) reads the same example lines, so the two cannot drift.
+test("parses every shared example line as the grounding check does", () => {
+  expect(lines.length).toBeGreaterThan(20);
+  for (const { line, block } of lines) expect(parseDoc(line), JSON.stringify(line)).toEqual([{ line: 0, ...block }]);
+  // Each block keeps its line, so a click can put the caret there.
+  expect(parseDoc("## 결정사항\n\n- 없음").map((b) => b.line)).toEqual([0, 1, 2]);
 });
 
 // Design-system 6.6: a formatted document, not Markdown source.
@@ -221,6 +196,35 @@ test("the summary reads as a document: headings, owner chips, due dates, 없음 
   expect(within(doc).getByText("없음").className).toMatch(/text-ink-2/);
   // Owners and items as one list per section.
   expect(within(doc).getAllByRole("list")).toHaveLength(2);
+});
+
+// Plan 5.6: the grounding check makes 미정 only the names nobody said, so 미정 can sit among names.
+test("미정 among an item's owners is on the marker, the names beside it are not", async () => {
+  mock({ meta: meta(), summary: "## 액션 아이템\n- [김지훈, 미정] 회의실 예약 (10월 18일)" });
+  render(<Meeting id={id} {...props} />);
+  // The document's item, not the 미정 list's.
+  const heading = await screen.findByRole("heading", { level: 2, name: "액션 아이템" });
+  const doc = heading.closest("[class*=whitespace-pre-wrap]") as HTMLElement;
+  const item = within(doc).getByRole("listitem");
+  const marks = [...item.querySelectorAll("mark")];
+  expect(marks.map((m) => m.textContent)).toEqual(["미정"]);
+  expect(marks[0].className).toMatch(/bg-marker/);
+  const chip = marks[0].parentElement!;
+  expect(chip.textContent).toBe("김지훈, 미정");
+  expect(chip.className).toMatch(/bg-sunken/);
+});
+
+// Plan 5.6, ENG11: a summary the grounding check could not read is not passed as checked.
+test("says when the grounding check could not read the action items, and only then", async () => {
+  const notice = "액션 아이템 형식을 읽지 못해 근거 검사를 하지 못했습니다";
+  for (const grounding_checked of [false, true, undefined]) {
+    id = `${id}x`;
+    mock({ meta: meta({ grounding_checked }), summary: "## 액션 아이템\n철수: 대시보드" });
+    render(<Meeting id={id} {...props} />);
+    await screen.findByRole("heading", { level: 2, name: "액션 아이템" });
+    expect(!!screen.queryByText(notice), String(grounding_checked)).toBe(grounding_checked === false);
+    cleanup();
+  }
 });
 
 // Design-system 6.6: a click on a line puts the caret at its start; Esc goes back to the document.

@@ -253,8 +253,8 @@ fn server_path(exe: &Path, debug: bool, var: Option<OsString>) -> PathBuf {
 /// for `--no-ui`. `-ngl 0` alone still
 /// lets large operations go to the GPU backend, hence `--device none --no-op-offload`. The key is
 /// not here: every user of the PC can read arguments.
-fn server_args(device: Device) -> Vec<String> {
-    let context = CONTEXT_TOKENS.to_string();
+fn server_args(device: Device, context: u32) -> Vec<String> {
+    let context = context.to_string();
     let mut args = vec![
         "-m",
         model::SUMMARY.file,
@@ -590,6 +590,8 @@ pub struct Sidecar {
     /// `app_log_dir()`: `llama-server.log` and `.prev.log`. `None` (no home folder): no log.
     logs: Option<PathBuf>,
     limits: Limits,
+    /// `-c`: `CONTEXT_TOKENS`, which the eval may lower (DX7, ENG20).
+    context: u32,
     /// The model would not load: hashes it, and a damaged file goes (`Models::check`).
     damaged: Box<dyn Fn() -> bool + Send + Sync>,
     /// Records `summary_gpu_failed`.
@@ -618,6 +620,7 @@ impl Sidecar {
             models,
             logs,
             limits: LIMITS,
+            context: CONTEXT_TOKENS,
             damaged: Box::new(damaged),
             gpu_failed: Box::new(gpu_failed),
             state: Mutex::default(),
@@ -703,7 +706,7 @@ impl Sidecar {
     }
 
     fn command(&self, device: Device, key: &str) -> Command {
-        let args = server_args(device);
+        let args = server_args(device, self.context);
         let mut command = Command::new(&self.supervisor[0]);
         command
             .args(&self.supervisor[1..])
@@ -1034,6 +1037,7 @@ pub(crate) mod tests {
                 ready: Duration::from_secs(20),
                 reap,
             },
+            context: CONTEXT_TOKENS,
             damaged: Box::new(move || {
                 hashes.fetch_add(1, Ordering::SeqCst);
                 false
@@ -1050,6 +1054,34 @@ pub(crate) mod tests {
             marked,
             logs,
         }
+    }
+
+    /// The real engine for `summary_eval` (DX7): this test binary as the supervisor and the
+    /// llama-server `tauri-build` copies next to the app in target/debug (`MS_LLAMA_SERVER` in its
+    /// place), with the product's arguments and `-c context`.
+    pub(crate) fn engine(models: PathBuf, logs: PathBuf, context: u32) -> Sidecar {
+        let exe = std::env::current_exe().unwrap();
+        // Tests run from target/debug/deps.
+        let app = exe.parent().and_then(Path::parent).unwrap().join("app");
+        let server = server_path(&app, true, std::env::var_os("MS_LLAMA_SERVER"));
+        Sidecar {
+            supervisor: this("supervisor", &[]),
+            server: vec![server.into()],
+            models,
+            logs: Some(logs),
+            limits: LIMITS,
+            context,
+            damaged: Box::new(|| false),
+            gpu_failed: Box::new(|| {}),
+            state: Mutex::default(),
+            stopping: Arc::default(),
+        }
+    }
+
+    /// The running llama-server's pid.
+    pub(crate) fn pid(sidecar: &Sidecar) -> Option<u32> {
+        let state = lock(&sidecar.state);
+        state.server.as_ref().and_then(|s| lock(&s.seen).pid)
     }
 
     impl Fake {

@@ -706,13 +706,15 @@ async fn parts(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::grounding;
     use crate::store::Status;
+    use crate::transcribe::engine::Device;
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Instant;
@@ -1284,6 +1286,8 @@ pub(crate) mod tests {
             no_speech: false,
             error: None,
             sent: None,
+            grounding_replaced: 0,
+            grounding_checked: None,
             wait: None,
         }
     }
@@ -1836,6 +1840,90 @@ pub(crate) mod tests {
         group.iter().all(|k| text.contains(k.as_str()))
     }
 
+    /// The gold rule for an owner: in the transcript as written, or a glossary name.
+    fn gold_owner(name: &str, transcript: &str, glossary: &[String]) -> bool {
+        transcript.contains(name) || glossary.iter().any(|g| g == name)
+    }
+
+    /// ENG11: owners the gold rule accepts that the grounding check would make "미정", so its
+    /// relaxed rule's misses show.
+    fn false_undecided(summary: &str, transcript: &str, glossary: &[String]) -> usize {
+        let heard = grounding::Heard::new(transcript);
+        let actions = section(summary, "액션 아이템").unwrap_or_default();
+        actions
+            .lines()
+            .filter_map(owner)
+            .flat_map(|o| o.split(grounding::SEPARATORS))
+            .map(str::trim)
+            .filter(|name| {
+                *name != "미정"
+                    && gold_owner(name, transcript, glossary)
+                    && !grounding::named(name, &heard, glossary)
+            })
+            .count()
+    }
+
+    /// Plan 5.3: a short question's raw answer holds thinking, as `<think>` in its content or as
+    /// llama-server's `reasoning_content`.
+    fn thinks(base_url: &str, key: &str) -> bool {
+        let body = serde_json::json!({
+            "messages": [{ "role": "user", "content": "회의록이 무엇인지 한 문장으로 답해 주세요." }],
+            "max_tokens": 300,
+        });
+        let reply = block_on(async {
+            let http = reqwest::Client::builder().no_proxy().build().unwrap();
+            let request = http
+                .post(completions(base_url))
+                .bearer_auth(key)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.to_string());
+            request.send().await.unwrap().text().await.unwrap()
+        });
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        let message = &reply["choices"][0]["message"];
+        let content = message["content"].as_str().unwrap_or_default();
+        eprintln!("생각 모드 확인 답: {content}");
+        content.contains("<think>")
+            || message["reasoning_content"]
+                .as_str()
+                .is_some_and(|r| !r.trim().is_empty())
+    }
+
+    /// Runs its closure when dropped, in a panic too.
+    struct Defer<F: FnMut()>(F);
+
+    impl<F: FnMut()> Drop for Defer<F> {
+        fn drop(&mut self) {
+            (self.0)()
+        }
+    }
+
+    /// llama-server's largest resident memory in MB while `run` runs, by `ps` twice a second (unix
+    /// only). Metal's own buffers may not all count there. A panic in `run` still ends the polling,
+    /// or the scope would wait for it forever.
+    fn peak_mb<T>(engine: &sidecar::Sidecar, run: impl FnOnce() -> T) -> (T, u64) {
+        let (done, peak) = (AtomicBool::new(false), AtomicU64::new(0));
+        thread::scope(|s| {
+            let _done = Defer(|| done.store(true, Ordering::SeqCst));
+            s.spawn(|| {
+                while !done.load(Ordering::SeqCst) {
+                    let pid = sidecar::tests::pid(engine).filter(|_| cfg!(unix));
+                    let kb = pid.and_then(|pid| {
+                        let ps = std::process::Command::new("ps")
+                            .args(["-o", "rss=", "-p", &pid.to_string()])
+                            .output()
+                            .ok()?;
+                        String::from_utf8_lossy(&ps.stdout).trim().parse().ok()
+                    });
+                    peak.fetch_max(kb.unwrap_or(0), Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(500));
+                }
+            });
+            let result = run();
+            (result, peak.load(Ordering::SeqCst) / 1024)
+        })
+    }
+
     /// Every way a summary misses its fixture, so one run reports them all.
     fn check(summary: &str, transcript: &str, expected: &Expected) -> Vec<String> {
         let mut failures = Vec::new();
@@ -1855,13 +1943,10 @@ pub(crate) mod tests {
         for line in actions.lines() {
             for name in owner(line)
                 .into_iter()
-                .flat_map(|o| o.split([',', '·', '/']))
+                .flat_map(|o| o.split(grounding::SEPARATORS))
             {
                 let name = name.trim();
-                if name != "미정"
-                    && !transcript.contains(name)
-                    && !expected.glossary.iter().any(|g| g == name)
-                {
+                if name != "미정" && !gold_owner(name, transcript, &expected.glossary) {
                     failures.push(format!("전사본·용어집에 없는 담당자 '{name}': {line}"));
                 }
             }
@@ -1940,28 +2025,59 @@ pub(crate) mod tests {
     }
 
     /// Calls a real LLM, so it is left out of the normal run. Reads every `tests/fixtures/*.txt`
-    /// (one utterance per line) with its `*.expected.json`.
+    /// (one utterance per line) with its `*.expected.json`, and scores the LLM's own text. With
+    /// `SUMMARY_EVAL_BUILTIN=1` that LLM is the built-in route's (DX7): a server per case, started
+    /// as the app starts it, at the product's 16,384 context unless `SUMMARY_EVAL_CONTEXT_TOKENS`.
     #[test]
     #[ignore]
     fn summary_eval() {
         let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
-        let (Some(base_url), Some(model)) =
-            (var("SUMMARY_EVAL_BASE_URL"), var("SUMMARY_EVAL_MODEL"))
-        else {
-            panic!(
-                "SUMMARY_EVAL_BASE_URL과 SUMMARY_EVAL_MODEL을 설정하세요. 선택: SUMMARY_EVAL_API_KEY, SUMMARY_EVAL_CONTEXT_TOKENS(기본 128000), SUMMARY_EVAL_LOCAL=1"
+        let context = var("SUMMARY_EVAL_CONTEXT_TOKENS").map(|v| {
+            v.parse::<u32>()
+                .expect("SUMMARY_EVAL_CONTEXT_TOKENS는 숫자")
+        });
+        let file = crate::transcribe::model::SUMMARY.file;
+        let (connection, engine) = if var("SUMMARY_EVAL_BUILTIN").as_deref() == Some("1") {
+            let model = PathBuf::from(
+                var("SUMMARY_EVAL_MODEL_PATH")
+                    .unwrap_or_else(|| panic!("SUMMARY_EVAL_MODEL_PATH에 {file} 경로를 주세요")),
             );
+            assert!(
+                model.ends_with(file) && model.is_file(),
+                "SUMMARY_EVAL_MODEL_PATH가 {file} 파일이 아닙니다: {}",
+                model.display()
+            );
+            let context = context.unwrap_or(sidecar::CONTEXT_TOKENS);
+            let logs = std::env::temp_dir().join("summary-eval-logs");
+            eprintln!("엔진 로그: {}", logs.display());
+            let engine = sidecar::tests::engine(model.parent().unwrap().into(), logs, context);
+            let connection = LlmConnection {
+                context_tokens: context,
+                ..crate::settings::builtin()
+            };
+            (connection, Some(Arc::new(engine)))
+        } else {
+            let (Some(base_url), Some(model)) =
+                (var("SUMMARY_EVAL_BASE_URL"), var("SUMMARY_EVAL_MODEL"))
+            else {
+                panic!(
+                    "SUMMARY_EVAL_BASE_URL과 SUMMARY_EVAL_MODEL을 설정하세요(선택: SUMMARY_EVAL_API_KEY, SUMMARY_EVAL_CONTEXT_TOKENS(기본 128000), SUMMARY_EVAL_LOCAL=1). 이 PC 요약 엔진이면 SUMMARY_EVAL_BUILTIN=1과 SUMMARY_EVAL_MODEL_PATH"
+                );
+            };
+            let is_local = var("SUMMARY_EVAL_LOCAL").as_deref() == Some("1");
+            let connection = LlmConnection {
+                name: "eval".into(),
+                base_url,
+                model,
+                context_tokens: context.unwrap_or(128_000),
+                is_local,
+                timeout_secs: if is_local { 900 } else { 300 },
+            };
+            (connection, None)
         };
-        let is_local = var("SUMMARY_EVAL_LOCAL").as_deref() == Some("1");
-        let connection = LlmConnection {
-            name: "eval".into(),
-            base_url,
-            model,
-            context_tokens: var("SUMMARY_EVAL_CONTEXT_TOKENS").map_or(128_000, |v| {
-                v.parse().expect("SUMMARY_EVAL_CONTEXT_TOKENS는 숫자")
-            }),
-            is_local,
-            timeout_secs: if is_local { 900 } else { 300 },
+        let device = match var("SUMMARY_EVAL_DEVICE").as_deref() {
+            Some("cpu") => Device::Cpu,
+            _ => Device::Gpu,
         };
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let mut fixtures: Vec<PathBuf> = fs::read_dir(&dir)
@@ -1974,7 +2090,7 @@ pub(crate) mod tests {
             "{}에 고정 전사본(*.txt)과 *.expected.json을 넣으세요",
             dir.display()
         );
-        let mut report = Vec::new();
+        let (mut report, mut rows) = (Vec::new(), Vec::new());
         for path in fixtures {
             let name = path.file_name().unwrap().to_string_lossy().to_string();
             let transcript = fs::read_to_string(&path).unwrap();
@@ -1990,25 +2106,90 @@ pub(crate) mod tests {
                 .filter(|l| !l.is_empty())
                 .map(String::from)
                 .collect();
-            let summary = block_on(summarize(
-                &connection,
-                var("SUMMARY_EVAL_API_KEY"),
-                &expected.glossary,
-                &lines,
-                |done, known| eprintln!("{name}: 요청 {done}/{known}"),
-                None,
-            ));
+            let ask = |connection: &LlmConnection, key: Option<String>, recover| {
+                let started = Instant::now();
+                let on_step = |done, known| eprintln!("{name}: 요청 {done}/{known}");
+                let summary = block_on(summarize(
+                    connection,
+                    key,
+                    &expected.glossary,
+                    &lines,
+                    on_step,
+                    recover,
+                ));
+                (summary, started.elapsed().as_secs_f64())
+            };
+            let mut row = format!("{name}:");
+            let (summary, secs) = match &engine {
+                None => ask(&connection, var("SUMMARY_EVAL_API_KEY"), None),
+                Some(engine) => {
+                    let started = Instant::now();
+                    // A panic in a case still stops its server.
+                    let stop = Defer(|| engine.stop("평가 끝"));
+                    let (asked, peak) = peak_mb(engine, || {
+                        let endpoint = engine
+                            .start(engine.generation(), device)
+                            .unwrap_or_else(|f| panic!("{name}: {}", f.message()));
+                        let ready = started.elapsed().as_secs_f64();
+                        let thinking = thinks(&endpoint.base_url, &endpoint.key);
+                        let connection = LlmConnection {
+                            base_url: endpoint.base_url.clone(),
+                            ..connection.clone()
+                        };
+                        let key = Some(endpoint.key.clone());
+                        (
+                            ready,
+                            thinking,
+                            ask(&connection, key, Some(engine.on_failure(endpoint))),
+                        )
+                    });
+                    drop(stop);
+                    let (ready, thinking, asked) = asked;
+                    let peak = match cfg!(unix) {
+                        true => format!("{peak}MB"),
+                        false => "측정 안 함".into(),
+                    };
+                    row += &format!(
+                        " {} 준비 {ready:.1}초 · 최대 메모리 {peak} · 생각 모드 {} ·",
+                        device.name(),
+                        if thinking { "켜짐" } else { "꺼짐" }
+                    );
+                    asked
+                }
+            };
+            row += &format!(" 요약 {secs:.1}초");
             match summary {
-                Ok((summary, _)) => {
+                Ok((summary, timings)) => {
                     eprintln!("=== {name} ===\n{summary}\n");
+                    let speed = |n: u64, ms: f64| n as f64 / (ms / 1000.0).max(f64::EPSILON);
+                    row += &format!(
+                        " · 입력 {}토큰 {:.0}토큰/초 · 출력 {}토큰 {:.1}토큰/초",
+                        timings.prompt_n,
+                        speed(timings.prompt_n, timings.prompt_ms),
+                        timings.predicted_n,
+                        speed(timings.predicted_n, timings.predicted_ms)
+                    );
+                    let grounded = grounding::check(&summary, &transcript, &expected.glossary);
+                    if grounded.text != summary {
+                        eprintln!("=== {name} 근거 검사 뒤 ===\n{}\n", grounded.text);
+                    }
+                    row += &format!(
+                        " · 근거 검사 {} 미정 처리 {}곳, 맞는 담당자를 미정으로 {}명",
+                        if grounded.checked { "함" } else { "못 함" },
+                        grounded.replaced,
+                        false_undecided(&summary, &transcript, &expected.glossary)
+                    );
                     let failures = check(&summary, &transcript, &expected);
+                    row += &format!(" · 채점 실패 {}개", failures.len());
                     if !failures.is_empty() {
                         report.push(format!("{name}:\n  {}", failures.join("\n  ")));
                     }
                 }
                 Err(e) => report.push(format!("{name}: 요약 실패: {}", e.message())),
             }
+            rows.push(row);
         }
+        eprintln!("\n{}", rows.join("\n"));
         assert!(report.is_empty(), "\n{}", report.join("\n"));
     }
 }

@@ -674,6 +674,10 @@ export default function Meeting({
           // SUM-10 (6.5): no LLM was asked, so there is nothing to edit, copy or send.
           <Banner kind="warning">음성이 거의 감지되지 않았습니다</Banner>
         )}
+        {/* Plan 5.6, ENG11: a summary the grounding check could not read is not passed as checked. */}
+        {text && meta?.grounding_checked === false && (
+          <Banner kind="warning">액션 아이템 형식을 읽지 못해 근거 검사를 하지 못했습니다</Banner>
+        )}
         {text && (
           <>
             {/* The one being left pops out of the flow, so the two cross in place. No `initial={false}`:

@@ -5,7 +5,7 @@
 //! Pure and tested without a server: `markdown` (header and length), `payload`, `sections` (the
 //! mrkdwn fallback) and `edit_count`. The requests are tested against local stub servers.
 
-use crate::settings::{self, SecretKind, SettingsStore};
+use crate::settings::{self, BUILTIN, BUILTIN_LABEL, SecretKind, Settings, SettingsStore};
 use crate::store::{self, Meta, Sent, Status, Store, can_transition, one_line};
 use crate::summarize::{cut, loopback, pack, split_title};
 use serde_json::{Value, json};
@@ -158,9 +158,52 @@ fn sections(markdown: &str) -> Vec<String> {
         .collect()
 }
 
+/// The footer (SND-03, plan 5.8 H3): the edit count, then for the pilot's tally the grounding
+/// check, "미정 처리 M곳" when it replaced any or "근거 검사 못 함" when it could not read the action
+/// items, and where the summary was made.
+fn footer(edits: u32, meta: &Meta, settings: &Settings) -> String {
+    let mut parts = vec![format!("수정 {edits}곳")];
+    match (meta.grounding_checked, meta.grounding_replaced) {
+        (Some(false), _) => parts.push("근거 검사 못 함".into()),
+        (_, 0) => {}
+        (_, n) => parts.push(format!("미정 처리 {n}곳")),
+    }
+    parts.extend(route(meta, settings).map(|r| format!("{r} 요약")));
+    format!("AI 요약 · 녹음자 검토 완료 ({})", parts.join(" · "))
+}
+
+/// Where the summary was made (DX9): 이 PC, the cloud or a local server, as it ran
+/// (`summarize_local`). A local one by its connection's port first (Ollama 11434, LM Studio 1234),
+/// then by its name, while that connection still exists; else "로컬 LLM". Nothing when no LLM was
+/// asked.
+fn route(meta: &Meta, settings: &Settings) -> Option<&'static str> {
+    let name = meta.llm_connection.as_deref()?;
+    if name == BUILTIN {
+        return Some(BUILTIN_LABEL);
+    }
+    if !meta.summarize_local {
+        return Some("클라우드");
+    }
+    let connection = settings.connections().into_iter().find(|c| c.name == name);
+    let server = connection.and_then(|c| {
+        let port = reqwest::Url::parse(c.base_url.trim())
+            .ok()
+            .and_then(|u| u.port());
+        let name = c.name.to_lowercase().replace(' ', "");
+        match port {
+            Some(11434) => Some("Ollama"),
+            Some(1234) => Some("LM Studio"),
+            _ if name.contains("ollama") => Some("Ollama"),
+            _ if name.contains("lmstudio") => Some("LM Studio"),
+            _ => None,
+        }
+    });
+    Some(server.unwrap_or("로컬 LLM"))
+}
+
 /// The webhook's JSON (7.1). `fallback`: `section` blocks in mrkdwn instead of the `markdown`
 /// block [S5].
-fn payload(title: &str, text: &str, edits: u32, fallback: bool) -> Value {
+fn payload(title: &str, text: &str, footer: &str, fallback: bool) -> Value {
     let mut blocks: Vec<Value> = if fallback {
         sections(text)
             .into_iter()
@@ -171,7 +214,7 @@ fn payload(title: &str, text: &str, edits: u32, fallback: bool) -> Value {
     };
     blocks.push(json!({
         "type": "context",
-        "elements": [{ "type": "mrkdwn", "text": format!("AI 요약 · 녹음자 검토 완료 (수정 {edits}곳)") }],
+        "elements": [{ "type": "mrkdwn", "text": footer }],
     }));
     // The notification preview, in mrkdwn: an LLM-written `<!channel>` must stay text.
     json!({ "text": format!("{} 회의 요약", escape(heading(title))), "blocks": blocks })
@@ -531,10 +574,11 @@ impl Slack {
             ));
         }
         let edits = edit_count(&generated(store, &meta.id)?, &meta.title, body);
+        let footer = footer(edits, meta, &settings);
         let url = webhook_url((self.url)(webhook)?).map_err(|f| f.message())?;
         let mut sent = post(
             &url,
-            &payload(&meta.title, &text, edits, false),
+            &payload(&meta.title, &text, &footer, false),
             self.timeout,
         )
         .await;
@@ -542,7 +586,7 @@ impl Slack {
         if matches!(sent, Err(Failure::Blocks(_))) {
             sent = post(
                 &url,
-                &payload(&meta.title, &text, edits, true),
+                &payload(&meta.title, &text, &footer, true),
                 self.timeout,
             )
             .await;
@@ -559,7 +603,7 @@ impl Slack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{Settings, Webhook};
+    use crate::settings::{LlmConnection, Webhook};
     use crate::summarize::tests::{Request, Stub, reply, serve};
     use std::fs;
     use std::net::TcpListener;
@@ -587,6 +631,8 @@ mod tests {
             no_speech: false,
             error: None,
             sent: None,
+            grounding_replaced: 0,
+            grounding_checked: None,
             wait: None,
         }
     }
@@ -632,25 +678,106 @@ mod tests {
     #[test]
     fn the_payload_has_the_markdown_block_and_the_footer() {
         let text = "**<주간> 회의**\n2026-10-13 (화) 14:00 · 42분\n\n- 없음";
+        let footer = "AI 요약 · 녹음자 검토 완료 (수정 3곳)";
         assert_eq!(
-            payload("<주간> 회의", text, 3, false),
+            payload("<주간> 회의", text, footer, false),
             json!({
                 "text": "&lt;주간&gt; 회의 회의 요약",
                 "blocks": [
                     { "type": "markdown", "text": text },
                     { "type": "context", "elements": [
-                        { "type": "mrkdwn", "text": "AI 요약 · 녹음자 검토 완료 (수정 3곳)" }
+                        { "type": "mrkdwn", "text": footer }
                     ]}
                 ]
             })
         );
-        let fallback = payload("<주간> 회의", text, 3, true);
+        let fallback = payload("<주간> 회의", text, footer, true);
         assert_eq!(
             fallback["blocks"][0],
             json!({ "type": "section", "text": { "type": "mrkdwn",
                 "text": "*&lt;주간&gt; 회의*\n2026-10-13 (화) 14:00 · 42분\n\n- 없음" } })
         );
         assert_eq!(fallback["blocks"][1]["type"], "context");
+    }
+
+    /// Plan 5.8 H3, DX9: the grounding check and the route next to the edit count.
+    #[test]
+    fn the_footer_tells_the_grounding_and_where_the_summary_was_made() {
+        let local = |name: &str, url: &str| LlmConnection {
+            name: name.into(),
+            base_url: url.into(),
+            model: "m".into(),
+            context_tokens: 8192,
+            is_local: true,
+            timeout_secs: 900,
+        };
+        let settings = Settings {
+            llm_connections: vec![
+                local("내 Ollama", "http://gpu-box.lan:8080/v1"),
+                local("맥미니", "http://localhost:11434/v1"),
+                local("모델 서버", "http://127.0.0.1:1234/v1"),
+                local("vLLM", "http://localhost:8000/v1"),
+                local("Ollama 대신 LM Studio", "http://localhost:1234/v1"),
+                LlmConnection {
+                    is_local: false,
+                    ..local("회사 클라우드", "https://api.example.com/v1")
+                },
+            ],
+            ..Settings::default()
+        };
+        let footer = |connection: Option<&str>, local: bool, replaced, checked| {
+            let meta = Meta {
+                llm_connection: connection.map(String::from),
+                summarize_local: local,
+                grounding_replaced: replaced,
+                grounding_checked: checked,
+                ..meta("2026-10-13T05:00:03Z", 0)
+            };
+            footer(3, &meta, &settings)
+        };
+        let done = "AI 요약 · 녹음자 검토 완료";
+        assert_eq!(
+            footer(Some(BUILTIN), true, 1, Some(true)),
+            format!("{done} (수정 3곳 · 미정 처리 1곳 · 이 PC 요약)")
+        );
+        // Nothing replaced: no count. A cloud one, and one deleted since that was not local.
+        for name in ["회사 클라우드", "지운 연결"] {
+            assert_eq!(
+                footer(Some(name), false, 0, Some(true)),
+                format!("{done} (수정 3곳 · 클라우드 요약)")
+            );
+        }
+        // A local server by its port first, else by its connection's name.
+        for (name, server) in [
+            ("맥미니", "Ollama"),
+            ("내 Ollama", "Ollama"),
+            ("모델 서버", "LM Studio"),
+            ("Ollama 대신 LM Studio", "LM Studio"),
+            ("vLLM", "로컬 LLM"),
+            ("지운 로컬 연결", "로컬 LLM"),
+        ] {
+            assert_eq!(
+                footer(Some(name), true, 2, Some(true)),
+                format!("{done} (수정 3곳 · 미정 처리 2곳 · {server} 요약)"),
+                "{name}"
+            );
+        }
+        // What ran decides local or cloud: a connection changed since does not.
+        assert_eq!(
+            footer(Some("회사 클라우드"), true, 0, Some(true)),
+            format!("{done} (수정 3곳 · 로컬 LLM 요약)")
+        );
+        assert_eq!(
+            footer(Some("맥미니"), false, 0, Some(true)),
+            format!("{done} (수정 3곳 · 클라우드 요약)")
+        );
+        // The action items could not be read: said, whatever the count.
+        assert_eq!(
+            footer(Some(BUILTIN), true, 0, Some(false)),
+            format!("{done} (수정 3곳 · 근거 검사 못 함 · 이 PC 요약)")
+        );
+        // No LLM asked, or a summary from before the check: as it always was.
+        assert_eq!(footer(None, false, 0, None), format!("{done} (수정 3곳)"));
     }
 
     #[test]
@@ -701,7 +828,7 @@ mod tests {
              <\u{200B}!here> 확인 <\u{200B}@U123> <\u{200B}#C456> <\u{200B}!subteam^S1|팀> [x](!here)"
         );
         for fallback in [false, true] {
-            let sent = payload("<!channel> 회의", &text, 0, fallback).to_string();
+            let sent = payload("<!channel> 회의", &text, "", fallback).to_string();
             assert!(
                 !["<!", "<@", "<#"].iter().any(|m| sent.contains(m)),
                 "{sent}"

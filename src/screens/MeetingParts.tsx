@@ -113,7 +113,8 @@ export type Block =
 
 /** Our own line parser, not a Markdown library (architecture 10.4). It knows the prompt's few
  * shapes (architecture 6.2): `#` headings, `- [담당자] 할 일 (기한)` and `- 없음`. Everything else,
- * bold, links and HTML included, stays the text it is. */
+ * bold, links and HTML included, stays the text it is. The grounding check (grounding.rs) reads lines
+ * the same way: change both with `src-tauri/tests/fixtures/summary-lines.json`, which both test. */
 export function parseDoc(text: string): Block[] {
   return text.split("\n").map((raw, line): Block => {
     const heading = /^#{1,3} (.*)/s.exec(raw);
@@ -149,7 +150,7 @@ function Line({ block: b }: { block: Exclude<Block, { kind: "item" }> }) {
 }
 
 /** A list item: a quiet bullet with a hanging indent, the owner as a chip, the due date after it.
- * Nobody named (미정) is on the marker. */
+ * Nobody named (미정) is on the marker: the whole chip, or the 미정 among names ("민수, 미정"). */
 function Item({ block: b }: { block: Extract<Block, { kind: "item" }> }) {
   return (
     <li data-line={b.line} className="relative pl-5">
@@ -161,7 +162,7 @@ function Item({ block: b }: { block: Extract<Block, { kind: "item" }> }) {
             b.owner === "미정" ? "bg-marker" : "bg-sunken",
           )}
         >
-          {b.owner}
+          {b.owner === "미정" ? b.owner : highlight(b.owner)}
         </span>
       )}
       {highlight(b.text)}

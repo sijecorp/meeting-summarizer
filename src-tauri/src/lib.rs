@@ -1,5 +1,6 @@
 mod audio;
 mod commands;
+mod grounding;
 mod queue;
 mod settings;
 mod sidecar;

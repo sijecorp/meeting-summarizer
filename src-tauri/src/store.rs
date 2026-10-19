@@ -72,6 +72,14 @@ pub struct Meta {
     pub error: Option<String>,
     #[serde(default)]
     pub sent: Option<Sent>,
+    /// The grounding check (plan 5.6): owners and deadlines it made "미정"
+    /// (`grounding::Grounded`).
+    #[serde(default)]
+    pub grounding_replaced: u32,
+    /// Whether it could read the action items. `None`: no summary checked (none yet, no speech,
+    /// or made before the check existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grounding_checked: Option<bool>,
     /// Why a meeting with a transcript waits in `transcribed` or `paused` instead of summarizing
     /// (plan 5.4). Written by the queue, gone once its summary starts or its connection is changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -317,6 +325,8 @@ impl Store {
             no_speech: false,
             error: None,
             sent: None,
+            grounding_replaced: 0,
+            grounding_checked: None,
             wait: None,
         };
         // create_dir (not _all) fails on an id collision instead of reusing a folder.
@@ -405,8 +415,8 @@ impl Store {
         self.update(id, |meta| transition(meta, to))
     }
 
-    /// REV-01: the recorder's title and summary. `summary.generated.md` stays as the LLM wrote it
-    /// (SUM-05). The title is kept to one line (`one_line`).
+    /// REV-01: the recorder's title and summary. `summary.generated.md` stays as the grounding check
+    /// left it (SUM-05). The title is kept to one line (`one_line`).
     pub fn save_summary(&self, id: &str, title: &str, body: &str) -> Result<Meta, String> {
         let path = self.dir_for(id)?.join("summary.md");
         let title = one_line(title);

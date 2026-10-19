@@ -72,6 +72,25 @@ cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 ```
 
+### 요약 평가
+
+`src-tauri/tests/fixtures`의 전사본을 실제 LLM으로 요약해 채점한다(아키텍처 12.3). 이 PC 요약 엔진으로 돌리려면 사이드카와 요약 모델 파일(`Qwen3.5-4B-Q4_K_M.gguf`)이 있어야 한다. 아래 경로는 앱이 받아 둔 모델이다.
+
+```sh
+SUMMARY_EVAL_BUILTIN=1 SUMMARY_EVAL_MODEL_PATH="$HOME/Library/Application Support/com.sije.meeting-summarizer/models/Qwen3.5-4B-Q4_K_M.gguf" cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --exact summarize::tests::summary_eval --nocapture
+```
+
+```powershell
+$env:SUMMARY_EVAL_BUILTIN = "1"; $env:SUMMARY_EVAL_MODEL_PATH = "$env:LOCALAPPDATA\com.sije.meeting-summarizer\models\Qwen3.5-4B-Q4_K_M.gguf"; cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --exact summarize::tests::summary_eval --nocapture
+Remove-Item Env:SUMMARY_EVAL_BUILTIN, Env:SUMMARY_EVAL_MODEL_PATH
+```
+
+PowerShell의 `$env:` 값은 창을 닫을 때까지 남으므로 마지막 줄로 지운다.
+
+- 컨텍스트는 제품과 같은 16,384다. `SUMMARY_EVAL_CONTEXT_TOKENS`로 바꾸면 서버의 `-c`도 같이 바뀐다. `SUMMARY_EVAL_DEVICE=cpu`면 CPU로 돈다.
+- 전사본마다 엔진 준비·요약 시간, 입력·출력 초당 토큰, 최대 메모리(macOS만, Windows는 "측정 안 함"), 생각 모드가 꺼졌는지, 근거 검사 결과를 찍는다. 서버 출력은 임시 폴더의 `summary-eval-logs/llama-server.log`에 남는다.
+- 클라우드나 Ollama 같은 연결로 돌리는 법은 `src-tauri/tests/fixtures/README.md`에 있다.
+
 ### 설치 파일 빌드
 
 ```sh

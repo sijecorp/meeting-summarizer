@@ -56,6 +56,8 @@ export type Meta = {
   no_speech: boolean;
   error: string | null;
   sent: { channel: string; at: string; edit_count: number } | null;
+  /** The grounding check (plan 5.6) could read the action items. Absent: no summary checked. */
+  grounding_checked?: boolean;
   /** Why a meeting with its transcript waits in `transcribed` or `paused` instead of summarizing
    * (plan 5.4). Absent once its summary starts or its connection is changed. */
   wait?: Wait;
@@ -179,7 +181,7 @@ export const summaryRoute = (id: string) => invoke<SummaryRoute>("summary_route"
 export const setSummarizeLocal = (id: string, local: boolean) =>
   invoke<SummaryRoute>("set_summarize_local", { id, local });
 /** REV-01, in `review` only. The title is stored as one line. `summary.generated.md` stays as the
- * LLM wrote it. */
+ * grounding check left it. */
 export const saveSummary = (id: string, title: string, body: string) =>
   invoke<Meta>("save_summary", { id, title, body });
 /** REV-03 "전송 안 함": `review` → `archived`. */

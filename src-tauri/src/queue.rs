@@ -10,6 +10,7 @@
 //! line, the built-in engine's lease), `ChunkRun` (GPU retry, CPU fallback, TRN-07),
 //! `read_partial` (where to resume), `percent` and `eta_secs`.
 
+use crate::grounding;
 use crate::settings::{self, BUILTIN, Backend, LlmConnection, SecretKind, Settings, SettingsStore};
 use crate::sidecar::{self, Sidecar};
 use crate::store::{Meta, SCHEMA_VERSION, Status, Store, can_transition, write_atomic};
@@ -1207,19 +1208,29 @@ impl<R: Runtime> Queue<R> {
                 .filter(|t| !t.is_empty())
                 .collect::<Vec<String>>()
         });
-        let review = |summary: Option<&str>| {
+        // `summary`: the LLM's text and what the grounding check made of it.
+        let review = |summary: Option<(&str, &grounding::Grounded)>| {
             store.update(id, |m| {
                 if m.status != Status::Summarizing {
                     return Err(format!("요약을 마칠 수 없는 상태입니다: {:?}", m.status));
                 }
-                // The LLM's own text, kept for the edit count (SUM-05).
-                if let Some(summary) = summary {
-                    write_atomic(&dir.join("summary.generated.md"), summary.as_bytes())
-                        .map_err(|e| format!("summary.generated.md 저장 실패: {e}"))?;
-                    if let (Some(title), _) = summarize::split_title(summary) {
+                // The checked text that review edits and the edit count compares against, then
+                // the LLM's own (SUM-05, SND-03). A failure in between fails the summary, so a new
+                // raw text never sits next to an old checked one.
+                if let Some((raw, checked)) = summary {
+                    for (name, text) in [
+                        ("summary.generated.md", checked.text.as_str()),
+                        ("summary.raw.md", raw),
+                    ] {
+                        write_atomic(&dir.join(name), text.as_bytes())
+                            .map_err(|e| format!("{name} 저장 실패: {e}"))?;
+                    }
+                    if let (Some(title), _) = summarize::split_title(&checked.text) {
                         m.title = title;
                     }
                 }
+                m.grounding_replaced = summary.map_or(0, |(_, g)| g.replaced);
+                m.grounding_checked = summary.map(|(_, g)| g.checked);
                 m.no_speech = summary.is_none();
                 m.status = Status::Review;
                 Ok(())
@@ -1271,7 +1282,8 @@ impl<R: Runtime> Queue<R> {
             },
         };
         let (cloud, builtin) = (!connection.is_local, recover.is_some());
-        let (app, run_id, glossary) = (self.app.clone(), id.to_string(), settings.glossary);
+        let (transcript, glossary) = (lines.join("\n"), settings.glossary);
+        let (app, run_id, asked) = (self.app.clone(), id.to_string(), glossary.clone());
         let task = async move {
             let on_step = |done: u32, known: u32| {
                 app.state::<Queue<R>>().set_progress(&run_id, |p| {
@@ -1280,7 +1292,7 @@ impl<R: Runtime> Queue<R> {
                     p.percent = (done * 100 / known.max(1)) as u8;
                 });
             };
-            summarize::summarize(&connection, key, &glossary, &lines, on_step, recover).await
+            summarize::summarize(&connection, key, &asked, &lines, on_step, recover).await
         };
         let (summary, timings) = match self.request(id, cloud, task) {
             Ok(Ok(done)) => done,
@@ -1296,7 +1308,11 @@ impl<R: Runtime> Queue<R> {
                 timings.predicted_ms / 1000.0
             );
         }
-        match review(Some(&summary)) {
+        let grounded = grounding::check(&summary, &transcript, &glossary);
+        if !grounded.checked {
+            log::warn!("요약의 액션 아이템을 읽지 못해 근거 검사를 하지 못했습니다 ({id})");
+        }
+        match review(Some((&summary, &grounded))) {
             Ok(_) => End::Done(Status::Review),
             Err(e) => End::Failed(e),
         }
@@ -2430,7 +2446,12 @@ mod tests {
         #[test]
         fn a_meeting_is_transcribed_then_summarized_in_the_same_slot() {
             let f = fixture(SPEECH, Backend::Auto);
-            let stub = serve(|_| Some(completion(SUMMARY)));
+            // Nobody named 철수 or a 18th (plan 5.6).
+            let item = "- [민수] 릴리스 노트 초안 (금요일)";
+            let raw = SUMMARY.replace(item, "- [민수, 철수] 릴리스 노트 초안 (18일)");
+            let checked = SUMMARY.replace(item, "- [민수, 미정] 릴리스 노트 초안 (미정)");
+            let answer = raw.clone();
+            let stub = serve(move |_| Some(completion(&answer)));
             f.connect(vec![connection(&stub.url, "내 Ollama", true)]);
             let id = f.recorded();
             f.queue().enqueue_pending();
@@ -2445,9 +2466,16 @@ mod tests {
                 (meta.llm_connection.as_deref(), meta.summarize_local),
                 (Some("내 Ollama"), true)
             );
-            // The LLM's text as it came (SUM-05); the body without its title for the review.
-            assert_eq!(f.generated(&id).unwrap(), SUMMARY);
-            assert_eq!(f.store().summary(&id).unwrap(), split_title(SUMMARY).1);
+            // The LLM's text as it came, and as checked for review (SUM-05); the body without its
+            // title for the review.
+            let dir = f.store().dir_for(&id).unwrap();
+            assert_eq!(fs::read_to_string(dir.join("summary.raw.md")).unwrap(), raw);
+            assert_eq!(f.generated(&id).unwrap(), checked);
+            assert_eq!(f.store().summary(&id).unwrap(), split_title(&checked).1);
+            assert_eq!(
+                (meta.grounding_replaced, meta.grounding_checked),
+                (2, Some(true))
+            );
             let requests = stub.requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
             let user = requests[0].body["messages"][1]["content"].as_str().unwrap();

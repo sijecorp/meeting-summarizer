@@ -9,6 +9,8 @@ SUMMARY_EVAL_BASE_URL=https://api.example.com/v1 SUMMARY_EVAL_MODEL=모델 SUMMA
 ```
 
 - 로컬 LLM이면 `SUMMARY_EVAL_LOCAL=1`을 주고 키는 생략한다. 컨텍스트가 128,000토큰이 아니면 `SUMMARY_EVAL_CONTEXT_TOKENS`로 준다.
+- 이 PC 요약 엔진으로 돌리는 명령(`SUMMARY_EVAL_BUILTIN=1`)은 저장소 README의 "요약 평가"에 있다.
+- `summary-lines.json`은 eval이 아니라 요약 줄 파서의 예시다. 회의 문서의 `parseDoc`(Vitest)과 근거 검사(`grounding.rs`)가 함께 읽어 두 파서가 같은 결과를 내는지 본다.
 - 전사본마다 `{이름}.txt`(한 줄에 발화 하나)와 `{이름}.expected.json`을 둔다.
 
 ## expected.json
