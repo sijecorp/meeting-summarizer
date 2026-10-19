@@ -1,17 +1,18 @@
-//! Processing queue (architecture 5.3, 8.4, TRN-01). Up to two meetings are processed at once;
-//! the rest wait first in, first out. Each running meeting has a thread that transcribes and then
-//! summarizes it in the same slot. Transcribing starts one worker process per chunk and saves every
-//! finished chunk, so a stopped meeting resumes from the chunk after its last finished one
-//! (STO-03). A meeting with `transcript.json` is only summarized (architecture 6): a paused
-//! summary, a `summarize_failed` retry. With no LLM connection it stays `transcribed`.
+//! Processing queue (architecture 5.3, 8.4, TRN-01). Up to two meetings are processed at once,
+//! one once the summary model is installed (ENG1); the rest wait first in, first out. Each running
+//! meeting has a thread that transcribes and then summarizes it in the same slot. Transcribing
+//! starts one worker process per chunk and saves every finished chunk, so a stopped meeting
+//! resumes from the chunk after its last finished one (STO-03). A meeting with `transcript.json`
+//! is only summarized (architecture 6): a paused summary, a `summarize_failed` retry. While its
+//! route does not resolve it waits in `transcribed` (or `paused`) with the reason (plan 5.4).
 //!
 //! The decisions are pure and tested without the app: `Sched` (who runs, who waits, places in
-//! line), `ChunkRun` (GPU retry, CPU fallback, TRN-07), `read_partial` (where to resume),
-//! `percent` and `eta_secs`.
+//! line, the built-in engine's lease), `ChunkRun` (GPU retry, CPU fallback, TRN-07),
+//! `read_partial` (where to resume), `percent` and `eta_secs`.
 
-use crate::settings::{self, Backend, SecretKind, Settings, SettingsStore};
-use crate::sidecar::Sidecar;
-use crate::store::{SCHEMA_VERSION, Status, Store, can_transition, write_atomic};
+use crate::settings::{self, BUILTIN, Backend, LlmConnection, SecretKind, Settings, SettingsStore};
+use crate::sidecar::{self, Sidecar};
+use crate::store::{Meta, SCHEMA_VERSION, Status, Store, can_transition, write_atomic};
 use crate::summarize;
 use crate::transcribe::engine::{self, Chunk, Device, Line, Segment};
 use crate::transcribe::filter;
@@ -27,13 +28,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, Runtime, Wry};
 
-/// TRN-01 (user decision 2026-10-14).
-const MAX_RUNNING: usize = 2;
+/// Meetings processed at once: two (TRN-01, user decision 2026-10-14), one once the summary model
+/// is installed (ENG1), so whisper and the 4B model never share the memory and the GPU. By the
+/// model, not the default connection: any meeting can ask for "로컬로 요약".
+fn slots(builtin_ready: bool) -> usize {
+    if builtin_ready { 1 } else { 2 }
+}
 /// A worker that prints nothing for this long is killed and counted as a crash. It prints a
 /// progress line at least once per 30 s Whisper window (once per 10 min window when planning),
 /// and loading even the 874 MB model takes seconds.
@@ -77,6 +82,11 @@ struct Sched {
     running: Vec<String>,
     /// TRN-09: nothing starts while recording.
     recording: bool,
+    /// ENG1: the meeting whose summary holds the built-in engine, one at a time. Taken before
+    /// `summarizing` is written, given back in `end`.
+    lease: Option<String>,
+    /// Meetings that found the lease taken: back in line, passed over until it is given back.
+    blocked: Vec<String>,
 }
 
 impl Sched {
@@ -89,21 +99,54 @@ impl Sched {
         true
     }
 
-    /// Meetings to start now: the front of the line, two at most, none while recording.
-    fn start_next(&mut self) -> Vec<String> {
+    /// Meetings to start now, in line order, up to `slots` running, none while recording. One
+    /// `can_start` turns down (its model is missing, ENG2) or that waits for the lease keeps its
+    /// place and the next one may go.
+    fn start_next(&mut self, slots: usize, can_start: impl Fn(&str) -> bool) -> Vec<String> {
         let mut started = Vec::new();
-        while !self.recording && self.running.len() < MAX_RUNNING {
-            // The front may still be winding down from a stop: it waits for its thread to end.
-            match self.waiting.front() {
-                Some(id) if !self.running.contains(id) => {
-                    let id = self.waiting.pop_front().expect("front exists");
-                    self.running.push(id.clone());
-                    started.push(id);
-                }
-                _ => break,
+        let mut at = 0;
+        while !self.recording && self.running.len() < slots && at < self.waiting.len() {
+            let id = &self.waiting[at];
+            // Still winding down from a stop: it and the line behind it wait for its thread.
+            if self.running.contains(id) {
+                break;
             }
+            if self.blocked.contains(id) || !can_start(id) {
+                at += 1;
+                continue;
+            }
+            let id = self.waiting.remove(at).expect("in line");
+            self.running.push(id.clone());
+            started.push(id);
         }
         started
+    }
+
+    /// ENG1: the built-in engine for `id`. False while another summary holds it: `id` then waits
+    /// in line, passed over, until it is given back.
+    fn take_lease(&mut self, id: &str) -> bool {
+        match &self.lease {
+            Some(holder) if holder != id => {
+                if !self.blocked.iter().any(|b| b == id) {
+                    self.blocked.push(id.to_string());
+                }
+                false
+            }
+            _ => {
+                self.lease = Some(id.to_string());
+                true
+            }
+        }
+    }
+
+    /// True when `id` held the lease, which is free now.
+    fn release_lease(&mut self, id: &str) -> bool {
+        if self.lease.as_deref() != Some(id) {
+            return false;
+        }
+        self.lease = None;
+        self.blocked.clear();
+        true
     }
 
     /// TRN-09: a recording started. Running meetings go back to the front of the line, in the
@@ -160,8 +203,6 @@ struct Job {
     abort: Option<Box<dyn Fn() + Send>>,
     /// A cloud summary is in flight: a recording lets it run on (SUM-09).
     cloud: bool,
-    /// A built-in summary is in flight (stage 4 sets it): deleting the meeting stops the engine.
-    builtin: bool,
 }
 
 impl Job {
@@ -259,13 +300,27 @@ fn killed_by_os(status: Option<ExitStatus>) -> bool {
     }
 }
 
-/// TRN-05 / architecture 5.4: the device a chunk starts on.
-fn first_device(settings: &Settings) -> Device {
-    match settings.backend {
+/// TRN-05 / architecture 5.4: the device a chunk starts on, and plan 5.3's for the built-in
+/// engine, from the one device setting. `failed`: `gpu_failed`, or `summary_gpu_failed`.
+fn first_device(backend: Backend, failed: bool) -> Device {
+    match backend {
         Backend::Cpu => Device::Cpu,
         Backend::Gpu => Device::Gpu,
-        Backend::Auto if settings.gpu_failed => Device::Cpu,
+        Backend::Auto if failed => Device::Cpu,
         Backend::Auto => Device::Gpu,
+    }
+}
+
+/// Only the summary is left (architecture 8.4): from its status, and for `paused` from
+/// `transcript.json`. Not from the file alone: a `transcribe_failed` meeting whose
+/// `transcript.json` was written before its status could be transcribes again.
+fn summary_only(store: &Store, meta: &Meta) -> bool {
+    match meta.status {
+        Status::Transcribed | Status::Summarizing | Status::SummarizeFailed => true,
+        Status::Paused => store
+            .dir_for(&meta.id)
+            .is_ok_and(|dir| dir.join("transcript.json").exists()),
+        _ => false,
     }
 }
 
@@ -528,14 +583,15 @@ fn run_worker(
 }
 
 enum End {
-    /// Finished in this status: `review`, or `transcribed` when there is no LLM connection.
+    /// Finished in this status: `review` (`transcribe` hands `transcribed` on to the summary).
     Done(Status),
     Stopped(Stop),
     /// `transcribe_failed`, or `summarize_failed` once summarizing started, with the reason.
     Failed(String),
     /// Not in a state to process (finished meanwhile, being deleted).
     Skipped(String),
-    /// A model went missing after `pump` checked: back in line until it is there again.
+    /// Back in line as it is: a model went missing after `pump` checked, or another summary holds
+    /// the built-in engine (ENG1). `start_next` passes it over until that changes.
     Requeue,
 }
 
@@ -551,7 +607,8 @@ pub struct Queue<R: Runtime = Wry> {
     secret: Secret,
     inner: Mutex<Inner>,
     /// The built-in summary engine, one for the app (plan 5.3). Its lock comes after `inner`'s.
-    sidecar: Sidecar,
+    /// Shared with its summary's `on_failure` hook.
+    sidecar: Arc<Sidecar>,
 }
 
 impl<R: Runtime> Queue<R> {
@@ -577,7 +634,7 @@ impl<R: Runtime> Queue<R> {
             exe,
             secret: Box::new(|name| settings::get_secret(SecretKind::Llm, name)),
             inner: Mutex::new(Inner::default()),
-            sidecar,
+            sidecar: Arc::new(sidecar),
         }
     }
 
@@ -636,20 +693,27 @@ impl<R: Runtime> Queue<R> {
         self.publish_positions(&mut inner);
     }
 
-    /// TRN-01: every `recorded` and `paused` meeting, oldest first, and the `transcribed` ones
-    /// once there is an LLM connection to summarize them with. At startup (after recovery paused
-    /// what was running), when a recording ends, and when settings are saved.
+    /// TRN-01: every `recorded` and `paused` meeting, oldest first, but one with only its summary
+    /// left (`transcribed`, `paused` after transcribing) once its route resolves (plan 5.4); until
+    /// then it says why it waits. At startup (after recovery paused what was running), when a
+    /// recording ends, when settings are saved and when the summary model arrives.
     pub fn enqueue_pending(&self) {
-        let summarize = !self.settings().llm_connections.is_empty();
-        let mut metas = self.app.state::<Store>().list();
+        let (settings, ready) = (self.settings(), self.builtin_ready());
+        let store = self.app.state::<Store>();
+        let mut metas = store.list();
         metas.reverse();
         for meta in metas {
+            if meta.schema_version > SCHEMA_VERSION {
+                continue;
+            }
             let pending = match meta.status {
+                Status::Paused | Status::Transcribed if summary_only(&store, &meta) => {
+                    self.routes(&store, &settings, &meta, ready)
+                }
                 Status::Recorded | Status::Paused => true,
-                Status::Transcribed => summarize,
                 _ => false,
             };
-            if meta.schema_version <= SCHEMA_VERSION && pending {
+            if pending {
                 self.add(&meta.id, meta.status);
             }
         }
@@ -657,28 +721,52 @@ impl<R: Runtime> Queue<R> {
         crate::refresh_tray(&self.app);
     }
 
+    /// Plan 5.4: the meeting's route resolves. `meta.json` says why not, or no longer says it.
+    fn routes(&self, store: &Store, settings: &Settings, meta: &Meta, ready: bool) -> bool {
+        let wait = summarize::route(settings, meta, ready).err();
+        if meta.wait != wait {
+            let waits = store.update(&meta.id, |m| {
+                // Not one that started summarizing meanwhile.
+                if matches!(m.status, Status::Transcribed | Status::Paused) {
+                    m.wait = wait;
+                }
+                Ok(())
+            });
+            if let Err(e) = waits {
+                log::warn!("요약 대기 이유 기록 실패 ({}): {e}", meta.id);
+            }
+        }
+        wait.is_none()
+    }
+
     /// `resume_meeting`: a continued interrupted recording, or a `transcribe_failed` retry.
-    /// `retry_summary`: a `summarize_failed` one.
+    /// `retry_summary`: a `summarize_failed` one, or a waiting one given another connection.
     pub fn enqueue(&self, id: &str, status: Status) {
         self.add(id, status);
         self.pump();
         crate::refresh_tray(&self.app);
     }
 
-    /// Starts whatever may start. Nothing does while a model is missing: meetings wait until a
-    /// download or import finishes (ONB-01), which calls this again.
-    /// ponytail: that holds back summaries too, which need no model; skip ahead to them if
-    /// switching to a model not yet downloaded leaves summaries waiting in practice.
+    /// Plan 5.4: the summary model is installed, so the built-in route can summarize.
+    pub fn builtin_ready(&self) -> bool {
+        self.app.state::<Models>().installed(&model::SUMMARY)
+    }
+
+    /// Starts whatever may start (`slots`). ENG2: a meeting to transcribe waits for the Whisper
+    /// and VAD models, until a download or import finishes (ONB-01) and calls this again; one with
+    /// only its summary left starts without them.
     pub fn pump(&self) {
-        let model = self.settings().model;
-        if self.app.state::<Models>().ready(&model).is_none() {
-            return;
-        }
+        let settings = self.settings();
+        let store = self.app.state::<Store>();
+        let transcribable = self.app.state::<Models>().ready(&settings.model).is_some();
+        let slots = slots(self.builtin_ready());
+        let can_start =
+            |id: &str| transcribable || store.get(id).is_ok_and(|m| summary_only(&store, &m));
         let mut inner = lock(&self.inner);
         if inner.closed {
             return;
         }
-        for id in inner.sched.start_next() {
+        for id in inner.sched.start_next(slots, can_start) {
             let app = self.app.clone();
             let run_id = id.clone();
             let spawned = thread::Builder::new()
@@ -726,7 +814,7 @@ impl<R: Runtime> Queue<R> {
                 && let Some(job) = inner.jobs.get_mut(id)
             {
                 job.halt(Stop::Delete);
-                if job.builtin {
+                if inner.sched.lease.as_deref() == Some(id) {
                     self.sidecar.stop("요약 중인 회의 삭제");
                 }
             }
@@ -754,21 +842,34 @@ impl<R: Runtime> Queue<R> {
         self.sidecar.running()
     }
 
-    /// ENG3: a built-in summary of `id` is about to start the engine. Under the lock, with the
-    /// job's stop: `Stopped` if the run was stopped or deleted already, else the job is marked
-    /// `builtin` (a delete or its end stops the engine) and the generation for `Sidecar::start`
-    /// comes back, so a stop after this is never missed.
-    #[allow(dead_code)] // ponytail: stage 4's summarize() calls it; drop the allow then.
+    /// ENG1, ENG3: a built-in summary of `id` is about to start the engine. Under the lock, with
+    /// the job's stop: `Stopped` if the run was stopped or deleted already, `Requeue` while another
+    /// summary holds the lease, else `id` holds it (a delete or its end stops the engine) and the
+    /// generation for `Sidecar::start` comes back, so a stop after this is never missed.
     fn engine_generation(&self, id: &str) -> Result<u64, End> {
         let mut inner = lock(&self.inner);
-        let Some(job) = inner.jobs.get_mut(id) else {
+        let Some(job) = inner.jobs.get(id) else {
             return Err(End::Stopped(Stop::Delete));
         };
         if let Some(stop) = job.stop {
             return Err(End::Stopped(stop));
         }
-        job.builtin = true;
+        if !inner.sched.take_lease(id) {
+            return Err(End::Requeue);
+        }
         Ok(self.sidecar.generation())
+    }
+
+    /// A built-in summary whose engine did not come up: a stop's own end, else the engine's words.
+    fn engine_end(&self, id: &str, failure: sidecar::Failure) -> End {
+        match lock(&self.inner)
+            .jobs
+            .get(id)
+            .map_or(Some(Stop::Delete), |j| j.stop)
+        {
+            Some(stop) => End::Stopped(stop),
+            None => End::Failed(failure.message()),
+        }
     }
 
     fn settings(&self) -> Settings {
@@ -858,7 +959,8 @@ impl<R: Runtime> Queue<R> {
         (model, vad): (&Path, &Path),
         mut on_pct: impl FnMut(u8),
     ) -> Result<(Vec<Segment>, Device), End> {
-        let mut run = ChunkRun::new(first_device(&self.settings()));
+        let settings = self.settings();
+        let mut run = ChunkRun::new(first_device(settings.backend, settings.gpu_failed));
         loop {
             let (start, end) = (chunk.start_ms.to_string(), chunk.end_ms.to_string());
             let args = [
@@ -1019,51 +1121,63 @@ impl<R: Runtime> Queue<R> {
         }
     }
 
-    /// Transcribes, then summarizes in the same slot (architecture 8.4). A meeting past
-    /// transcribing, or paused while summarizing (`transcript.json` tells), is only summarized.
-    /// The status decides, not the file: a `transcribe_failed` meeting whose `transcript.json` was
-    /// written before its status could be transcribes again.
+    /// Transcribes, then summarizes in the same slot (architecture 8.4), or only summarizes
+    /// (`summary_only`).
     fn process(&self, store: &Store, id: &str) -> End {
-        let status = match store.get(id) {
-            Ok(meta) => meta.status,
+        let meta = match store.get(id) {
+            Ok(meta) => meta,
             Err(e) => return End::Skipped(e),
         };
-        let summary_only = match status {
-            Status::Transcribed | Status::Summarizing | Status::SummarizeFailed => true,
-            Status::Paused => store
-                .dir_for(id)
-                .is_ok_and(|dir| dir.join("transcript.json").exists()),
-            _ => false,
-        };
-        if !summary_only {
+        if !summary_only(store, &meta) {
             match self.transcribe(store, id) {
                 End::Done(_) => {}
                 end => return end,
-            }
-            // Nothing to summarize with: it waits in `transcribed` for a connection (8.4).
-            if self.settings().llm_connections.is_empty() {
-                return End::Done(Status::Transcribed);
             }
         }
         self.summarize(store, id)
     }
 
-    /// Architecture 6. A transcript with almost no speech is not sent anywhere (SUM-10).
-    /// Otherwise the meeting's connection (`summarize::route`) gets it, with its key from the
-    /// keychain, as a task this thread waits on.
-    fn summarize(&self, store: &Store, id: &str) -> End {
-        let started = store.update(id, |m| {
-            // `summarizing` itself too, like `transcribing` above.
-            if m.status != Status::Summarizing && !can_transition(m.status, Status::Summarizing) {
-                return Err(format!("요약할 수 없는 상태입니다: {:?}", m.status));
-            }
-            m.status = Status::Summarizing;
-            m.error = None;
-            Ok(())
-        });
-        if let Err(e) = started {
-            return End::Skipped(e);
-        }
+    /// `summarizing`, written in `m`. With `send` false (SUM-10, or a transcript that cannot be
+    /// read) nothing goes anywhere, so no route is needed and none is pinned. Otherwise only once
+    /// the meeting's route resolves (plan 5.4) and, for the built-in route, once it holds the lease
+    /// (ENG1), with the connection pinned; else the meeting stays as it is, with the reason when
+    /// the route does not resolve, back in line when the lease is taken. Under the meeting's lock,
+    /// so a change of connection cannot slip in between.
+    fn begin(
+        &self,
+        id: &str,
+        m: &mut Meta,
+        (settings, ready): (&Settings, bool),
+        send: bool,
+    ) -> Result<Option<(LlmConnection, Option<u64>)>, End> {
+        let sending = if send {
+            let connection = summarize::route(settings, m, ready).map_err(|wait| {
+                // Only where it waits: a `summarize_failed` one keeps its error, and a retry
+                // offers only a connection that resolves (`commands::retry_summary`).
+                if matches!(m.status, Status::Transcribed | Status::Paused) {
+                    m.wait = Some(wait);
+                }
+                // Not a failure: no notification, and it stays as it is.
+                End::Skipped(format!("요약 경로를 기다립니다: {wait:?}"))
+            })?;
+            let generation = if connection.name == BUILTIN {
+                Some(self.engine_generation(id)?)
+            } else {
+                None
+            };
+            m.llm_connection = Some(connection.name.clone());
+            m.summarize_local = connection.is_local;
+            Some((connection, generation))
+        } else {
+            None
+        };
+        m.wait = None;
+        m.status = Status::Summarizing;
+        m.error = None;
+        Ok(sending)
+    }
+
+    fn summarizing(&self, id: &str) {
         self.set_progress(id, |p| {
             *p = Progress {
                 id: p.id.clone(),
@@ -1075,18 +1189,24 @@ impl<R: Runtime> Queue<R> {
                 position: None,
             };
         });
-        let lines: Vec<String> = match store.transcript(id) {
-            Ok(segments) => segments
-                .into_iter()
-                .map(|s| s.text.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect(),
-            Err(e) => return End::Failed(e),
-        };
+    }
+
+    /// Architecture 6. A transcript with almost no speech is not sent anywhere (SUM-10), and
+    /// neither it nor one that cannot be read needs a connection. Otherwise the meeting's
+    /// connection (`begin`) gets it as a task this thread waits on, with its key from the keychain;
+    /// the built-in route's key and address come from its engine, which starts here first.
+    fn summarize(&self, store: &Store, id: &str) -> End {
         let dir = match store.dir_for(id) {
             Ok(dir) => dir,
             Err(e) => return End::Failed(e),
         };
+        let lines = store.transcript(id).map(|segments| {
+            segments
+                .into_iter()
+                .map(|s| s.text.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<String>>()
+        });
         let review = |summary: Option<&str>| {
             store.update(id, |m| {
                 if m.status != Status::Summarizing {
@@ -1105,32 +1225,52 @@ impl<R: Runtime> Queue<R> {
                 Ok(())
             })
         };
-        if summarize::too_short(&lines) {
-            return match review(None) {
-                Ok(_) => End::Done(Status::Review),
-                Err(e) => End::Failed(e),
-            };
-        }
-
-        let settings = self.settings();
-        let mut chosen = Err(String::new());
-        let routed = store.update(id, |m| {
-            chosen = summarize::route(&settings, m).cloned();
-            if let Ok(c) = &chosen {
-                m.llm_connection = Some(c.name.clone());
-                m.summarize_local = c.is_local;
+        // SUM-10, and a transcript that cannot be read: nothing is sent.
+        let send = lines.as_ref().is_ok_and(|l| !summarize::too_short(l));
+        let (settings, ready) = (self.settings(), self.builtin_ready());
+        let mut begun = Err(End::Skipped(String::new()));
+        let started = store.update(id, |m| {
+            // `summarizing` itself too, like `transcribing` above.
+            if m.status != Status::Summarizing && !can_transition(m.status, Status::Summarizing) {
+                return Err(format!("요약할 수 없는 상태입니다: {:?}", m.status));
             }
+            begun = self.begin(id, m, (&settings, ready), send);
             Ok(())
         });
-        let connection = match routed.and(chosen) {
-            Ok(connection) => connection,
-            Err(e) => return End::Failed(e),
+        if let Err(e) = started {
+            return End::Skipped(e);
+        }
+        let begun = match begun {
+            Ok(begun) => begun,
+            Err(end) => return end,
         };
-        let key = match (self.secret)(&connection.name) {
-            Ok(key) => key,
-            Err(e) => return End::Failed(e),
+        self.summarizing(id);
+        let (mut connection, generation, lines) = match (begun, lines) {
+            (Some((connection, generation)), Ok(lines)) => (connection, generation, lines),
+            (_, lines) => {
+                return match lines.and_then(|_| review(None)) {
+                    Ok(_) => End::Done(Status::Review),
+                    Err(e) => End::Failed(e),
+                };
+            }
         };
-        let cloud = !connection.is_local;
+        let (key, recover) = match generation {
+            Some(generation) => {
+                let device = first_device(settings.backend, settings.summary_gpu_failed);
+                let endpoint = match self.sidecar.start(generation, device) {
+                    Ok(endpoint) => endpoint,
+                    Err(failure) => return self.engine_end(id, failure),
+                };
+                connection.base_url = endpoint.base_url.clone();
+                let key = Some(endpoint.key.clone());
+                (key, Some(self.sidecar.on_failure(endpoint)))
+            }
+            None => match (self.secret)(&connection.name) {
+                Ok(key) => (key, None),
+                Err(e) => return End::Failed(e),
+            },
+        };
+        let (cloud, builtin) = (!connection.is_local, recover.is_some());
         let (app, run_id, glossary) = (self.app.clone(), id.to_string(), settings.glossary);
         let task = async move {
             let on_step = |done: u32, known: u32| {
@@ -1140,13 +1280,22 @@ impl<R: Runtime> Queue<R> {
                     p.percent = (done * 100 / known.max(1)) as u8;
                 });
             };
-            summarize::summarize(&connection, key, &glossary, &lines, on_step).await
+            summarize::summarize(&connection, key, &glossary, &lines, on_step, recover).await
         };
-        let summary = match self.request(id, cloud, task) {
-            Ok(Ok(summary)) => summary,
+        let (summary, timings) = match self.request(id, cloud, task) {
+            Ok(Ok(done)) => done,
             Ok(Err(failure)) => return End::Failed(failure.message()),
             Err(end) => return end,
         };
+        if builtin {
+            log::info!(
+                "이 PC 요약 끝 ({id}): 입력 {}토큰 {:.1}초, 출력 {}토큰 {:.1}초",
+                timings.prompt_n,
+                timings.prompt_ms / 1000.0,
+                timings.predicted_n,
+                timings.predicted_ms / 1000.0
+            );
+        }
         match review(Some(&summary)) {
             Ok(_) => End::Done(Status::Review),
             Err(e) => End::Failed(e),
@@ -1185,8 +1334,8 @@ impl<R: Runtime> Queue<R> {
         result.map_err(|e| End::Failed(format!("요약 작업이 비정상 종료했습니다: {e}")))
     }
 
-    /// Writes how the run ended, frees its slot and starts the next meeting. Only a recording
-    /// stop or a missing model keeps the meeting in line.
+    /// Writes how the run ended, frees its slot and the lease and starts the next meeting. Only a
+    /// recording stop and `Requeue` keep the meeting in line.
     fn end(&self, store: &Store, id: &str, end: End) {
         let requeue = matches!(end, End::Stopped(Stop::Recording) | End::Requeue);
         let finished = matches!(end, End::Done(_) | End::Failed(_));
@@ -1226,7 +1375,8 @@ impl<R: Runtime> Queue<R> {
                 log::info!("처리 건너뜀 ({id}): {reason}");
                 store.get(id).ok().map(|m| m.status)
             }
-            End::Requeue => None,
+            // Its place in line shows the status it waits in, maybe `transcribed` by now.
+            End::Requeue => store.get(id).ok().map(|m| m.status),
         };
         {
             let mut inner = lock(&self.inner);
@@ -1236,8 +1386,9 @@ impl<R: Runtime> Queue<R> {
                 Some(Stop::Delete | Stop::Quit)
             );
             let requeue = requeue && !halted;
-            // Plan 5.3: no idle engine. It would hold 4 GB while the next transcription runs.
-            if inner.jobs.get(id).is_some_and(|j| j.builtin) {
+            // Plan 5.3: no idle engine. It would hold 4 GB while the next transcription runs. The
+            // meetings passed over for the lease may start now.
+            if inner.sched.release_lease(id) {
                 self.sidecar.stop("요약 끝");
             }
             inner.sched.finished(id);
@@ -1319,8 +1470,8 @@ mod tests {
             assert!(s.enqueue(id));
         }
         assert!(!s.enqueue("c"));
-        assert_eq!(s.start_next(), ids(&["a", "b"]));
-        assert_eq!(s.start_next(), Vec::<String>::new());
+        assert_eq!(s.start_next(2, |_| true), ids(&["a", "b"]));
+        assert_eq!(s.start_next(2, |_| true), Vec::<String>::new());
         assert_eq!(
             (s.position("a"), s.position("c"), s.position("d")),
             (None, Some(1), Some(2))
@@ -1329,7 +1480,7 @@ mod tests {
         assert!(!s.enqueue("a"));
 
         s.finished("b");
-        assert_eq!(s.start_next(), ids(&["c"]));
+        assert_eq!(s.start_next(2, |_| true), ids(&["c"]));
         assert_eq!(s.position("d"), Some(1));
         assert!(s.remove("c"));
         assert!(!s.remove("d"));
@@ -1342,22 +1493,64 @@ mod tests {
         for id in ["a", "b", "c"] {
             s.enqueue(id);
         }
-        s.start_next();
+        s.start_next(2, |_| true);
         assert_eq!(s.suspend(|_| false), ids(&["a", "b"]));
         assert_eq!(
             (s.position("a"), s.position("b"), s.position("c")),
             (Some(1), Some(2), Some(3))
         );
-        assert!(s.start_next().is_empty());
+        assert!(s.start_next(2, |_| true).is_empty());
 
         // Recording over, but a's stopped run has not wound down: nothing jumps ahead of it.
         s.recording = false;
-        assert!(s.start_next().is_empty());
+        assert!(s.start_next(2, |_| true).is_empty());
         s.finished("b");
-        assert!(s.start_next().is_empty());
+        assert!(s.start_next(2, |_| true).is_empty());
         s.finished("a");
-        assert_eq!(s.start_next(), ids(&["a", "b"]));
+        assert_eq!(s.start_next(2, |_| true), ids(&["a", "b"]));
         assert_eq!(s.position("c"), Some(1));
+    }
+
+    /// ENG1: one at a time once the summary model is in. ENG2: a meeting that cannot start yet
+    /// keeps its place, and the ones behind it go.
+    #[test]
+    fn slots_follow_the_summary_model_and_a_meeting_that_cannot_start_is_passed_over() {
+        assert_eq!((slots(true), slots(false)), (1, 2));
+        let mut s = Sched::default();
+        for id in ["a", "b", "c"] {
+            s.enqueue(id);
+        }
+        assert_eq!(s.start_next(slots(true), |_| true), ids(&["a"]));
+        assert!(s.start_next(slots(true), |_| true).is_empty());
+        assert_eq!(s.start_next(slots(false), |id| id != "b"), ids(&["c"]));
+        assert_eq!(s.position("b"), Some(1));
+    }
+
+    /// ENG1: the built-in engine serves one summary; a meeting that finds it taken goes back
+    /// first in line and is passed over, never started again, until the lease is given back.
+    #[test]
+    fn a_meeting_blocked_by_the_lease_waits_without_respinning() {
+        let mut s = Sched::default();
+        for id in ["a", "b", "c"] {
+            s.enqueue(id);
+        }
+        assert_eq!(s.start_next(2, |_| true), ids(&["a", "b"]));
+        assert!(s.take_lease("a") && s.take_lease("a"));
+        assert!(!s.take_lease("b"));
+        // b's run ends as `Requeue` does.
+        s.finished("b");
+        s.waiting.push_front("b".into());
+        assert_eq!(s.start_next(2, |_| true), ids(&["c"]));
+        s.finished("c");
+        for _ in 0..3 {
+            assert!(s.start_next(2, |_| true).is_empty());
+        }
+        assert_eq!(s.position("b"), Some(1));
+        assert!(!s.release_lease("b"));
+        assert!(s.release_lease("a"));
+        s.finished("a");
+        assert_eq!(s.start_next(1, |_| true), ids(&["b"]));
+        assert!(s.take_lease("b"));
     }
 
     /// SUM-09: a cloud summary keeps its slot through a recording; the freed slot stays empty.
@@ -1367,14 +1560,14 @@ mod tests {
         for id in ["a", "b", "c"] {
             s.enqueue(id);
         }
-        s.start_next();
+        s.start_next(2, |_| true);
         assert_eq!(s.suspend(|id| id == "b"), ids(&["a"]));
         assert_eq!(
             (s.position("a"), s.position("b"), s.position("c")),
             (Some(1), None, Some(2))
         );
         s.finished("b");
-        assert!(s.start_next().is_empty());
+        assert!(s.start_next(2, |_| true).is_empty());
     }
 
     #[test]
@@ -1473,15 +1666,10 @@ mod tests {
 
     #[test]
     fn backend_setting_picks_the_first_device() {
-        let with = |backend, gpu_failed| Settings {
-            backend,
-            gpu_failed,
-            ..Settings::default()
-        };
-        assert_eq!(first_device(&with(Backend::Auto, false)), Device::Gpu);
-        assert_eq!(first_device(&with(Backend::Auto, true)), Device::Cpu);
-        assert_eq!(first_device(&with(Backend::Gpu, true)), Device::Gpu);
-        assert_eq!(first_device(&with(Backend::Cpu, false)), Device::Cpu);
+        assert_eq!(first_device(Backend::Auto, false), Device::Gpu);
+        assert_eq!(first_device(Backend::Auto, true), Device::Cpu);
+        assert_eq!(first_device(Backend::Gpu, true), Device::Gpu);
+        assert_eq!(first_device(Backend::Cpu, false), Device::Cpu);
     }
 
     fn chunk(start_ms: u64, end_ms: u64) -> Chunk {
@@ -1554,7 +1742,7 @@ mod tests {
     fn job(inner: &Mutex<Inner>, id: &str) {
         let mut inner = lock(inner);
         inner.sched.enqueue(id);
-        inner.sched.start_next();
+        inner.sched.start_next(2, |_| true);
         inner.jobs.insert(id.into(), Job::default());
     }
 
@@ -1664,7 +1852,7 @@ mod tests {
         app.manage(SettingsStore::new(dir.join("settings.json")));
         let fake = fake(dir, supervisor, fake_llama("ready"), reap);
         let queue = Queue {
-            sidecar: fake.sidecar,
+            sidecar: Arc::new(fake.sidecar),
             ..Queue::new(app.handle().clone(), PathBuf::new())
         };
         (app, queue)
@@ -1693,7 +1881,7 @@ mod tests {
     fn running(queue: &Queue<tauri::test::MockRuntime>, id: &str) {
         let mut inner = lock(&queue.inner);
         inner.sched.enqueue(id);
-        inner.sched.start_next();
+        inner.sched.start_next(2, |_| true);
         inner.jobs.insert(id.into(), Job::default());
     }
 
@@ -1764,10 +1952,37 @@ mod tests {
         assert!(allowed.is_ok());
     }
 
+    /// ENG1: two meetings running when the summary model arrives both reach the built-in route;
+    /// the second leaves the engine alone, waits first in line without starting again, and goes
+    /// once the first gives the lease back.
+    #[test]
+    fn the_model_arriving_mid_run_never_lets_two_builtin_summaries_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, queue) = engine_queue(tmp.path(), "supervisor", Duration::from_secs(10));
+        running(&queue, "a");
+        running(&queue, "b");
+        let generation = queue.engine_generation("a").ok().unwrap();
+        assert!(matches!(queue.engine_generation("b"), Err(End::Requeue)));
+        assert_eq!(queue.sidecar.generation(), generation);
+
+        let store = app.state::<Store>();
+        queue.end(&store, "b", End::Requeue);
+        {
+            let mut inner = lock(&queue.inner);
+            assert_eq!(inner.sched.position("b"), Some(1));
+            assert!(inner.sched.start_next(2, |_| true).is_empty());
+        }
+        queue.end(&store, "a", End::Done(Status::Review));
+        let mut inner = lock(&queue.inner);
+        assert_eq!(inner.sched.start_next(1, |_| true), ids(&["b"]));
+        assert!(inner.sched.take_lease("b"));
+    }
+
     /// The queue end to end on the mock runtime, with a shell script as the worker, the `tiny`
-    /// model "installed" as sparse files of the right size, stub LLM servers and a stand-in
-    /// keychain.
-    #[cfg(unix)]
+    /// model "installed" as sparse files of the right size, stub LLM servers, the sidecar tests'
+    /// fake llama-server and a stand-in keychain. Tests that run the worker are unix-only; the
+    /// rest (meetings that start from a transcript) run on Windows too.
+    #[cfg_attr(not(unix), allow(dead_code, unused_imports))]
     mod app {
         use super::*;
         use crate::settings::LlmConnection;
@@ -1795,9 +2010,22 @@ mod tests {
             tmp: tempfile::TempDir,
         }
 
+        /// One test with a summary model on disk at a time (`Fixture::install_summary`): taken
+        /// before the fixture, so it is dropped after the fixture's temp folder, model and all.
+        fn summary_model() -> MutexGuard<'static, ()> {
+            static ONE: Mutex<()> = Mutex::new(());
+            ONE.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
         /// `transcribe`: the shell for `--transcribe-worker <dir> <start> <end> <device> ...`.
         fn fixture(transcribe: &str, backend: Backend) -> Fixture {
-            use std::os::unix::fs::PermissionsExt;
+            fixture_with(transcribe, backend, "ready")
+        }
+
+        /// The built-in engine's llama-server is the sidecar tests' fake doing `behave`, in
+        /// `engine/`. It only runs once the summary model is "installed" (`install_summary`).
+        fn fixture_with(transcribe: &str, backend: Backend, behave: &str) -> Fixture {
+            use crate::sidecar::tests::{fake, fake_llama};
             let tmp = tempfile::tempdir().unwrap();
             let app = tauri::test::mock_app();
             app.manage(Store::new(tmp.path().join("meetings")).unwrap());
@@ -1821,10 +2049,21 @@ mod tests {
                 "#!/bin/sh\ncase \"$1\" in\n--plan-chunks)\n echo '{{\"type\":\"progress\",\"pct\":50}}'; echo '{PLAN}' ;;\n--transcribe-worker)\n {transcribe} ;;\nesac\n"
             );
             fs::write(&exe, script).unwrap();
-            fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let engine = fake(
+                &tmp.path().join("engine"),
+                "supervisor",
+                fake_llama(behave),
+                crate::sidecar::LIMITS.reap,
+            );
             // Never the real keychain.
             app.manage(Queue {
                 secret: Box::new(|_| Ok(Some("sk-test".into()))),
+                sidecar: Arc::new(engine.sidecar),
                 ..Queue::new(app.handle().clone(), exe)
             });
 
@@ -1924,6 +2163,57 @@ mod tests {
                 fs::read_to_string(dir.join("summary.generated.md")).ok()
             }
 
+            /// The summary model, as a file of its size: the built-in route is ready. Only under
+            /// `summary_model`'s lock.
+            fn install_summary(&self) {
+                let path = self.app.state::<Models>().dir.join(model::SUMMARY.file);
+                let file = fs::File::create(&path).unwrap();
+                // NTFS allocates a file's whole length unless it is sparse. Best effort: the lock
+                // still keeps it to one at a time.
+                #[cfg(windows)]
+                let _ = Command::new("fsutil")
+                    .args(["sparse", "setflag"])
+                    .arg(&path)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                file.set_len(model::SUMMARY.size).unwrap();
+            }
+
+            /// A meeting that waits with its transcript, as one transcribed before would.
+            fn transcribed(&self, summarize_local: bool, pinned: Option<&str>) -> String {
+                let id = self.store().create("", summarize_local).unwrap().id;
+                self.store().finish_recording(&id, 0, vec![]).unwrap();
+                let segments = serde_json::json!({"segments": [
+                    {"start_ms": 0, "end_ms": 10000, "text": "이번 주 배포는 목요일 오후에 하고 릴리스 노트는 민수 씨가 금요일까지 씁니다"}
+                ]});
+                let dir = self.store().dir_for(&id).unwrap();
+                fs::write(dir.join("transcript.json"), segments.to_string()).unwrap();
+                self.store()
+                    .update(&id, |m| {
+                        m.status = Status::Transcribed;
+                        m.llm_connection = pinned.map(String::from);
+                        Ok(())
+                    })
+                    .unwrap();
+                id
+            }
+
+            /// Chat requests the fake llama-servers were sent.
+            fn asked(&self) -> usize {
+                crate::sidecar::tests::asked(&self.tmp.path().join("engine/models"))
+            }
+
+            fn engine_log(&self) -> String {
+                let log = self.tmp.path().join("engine/logs/llama-server.log");
+                fs::read_to_string(log).unwrap_or_default()
+            }
+
+            /// No engine runs, nor winds down.
+            fn engine_gone(&self) {
+                self.wait("engine gone", || !self.queue().engine_running());
+            }
+
             fn gpu_failed(&self) -> bool {
                 self.app
                     .state::<SettingsStore>()
@@ -1934,8 +2224,11 @@ mod tests {
             }
         }
 
+        /// Transcribed, then SUM-10 before any route: with no summary model and the built-in route
+        /// the default, a silent meeting still reaches review, with no connection pinned.
+        #[cfg(unix)]
         #[test]
-        fn a_meeting_runs_through_to_transcribed() {
+        fn a_silent_meeting_runs_through_to_review_without_waiting_for_a_route() {
             let f = fixture(RESULT, Backend::Auto);
             let id = f.recorded();
             f.queue().enqueue_pending();
@@ -1943,7 +2236,10 @@ mod tests {
             f.wait("done", || f.queue().snapshot().is_empty());
 
             let meta = f.store().get(&id).unwrap();
-            assert_eq!(meta.status, Status::Transcribed);
+            assert_eq!(
+                (meta.status, meta.no_speech, meta.llm_connection, meta.wait),
+                (Status::Review, true, None, None)
+            );
             assert_eq!(
                 (meta.chunks_done, meta.backend.as_deref()),
                 (2, Some("gpu"))
@@ -1972,10 +2268,11 @@ mod tests {
             let last = events.last().unwrap();
             assert_eq!(
                 (&last["status"], &last["percent"]),
-                (&"transcribed".into(), &100.into())
+                (&"review".into(), &100.into())
             );
         }
 
+        #[cfg(unix)]
         #[test]
         fn recording_pauses_a_run_and_it_resumes_first_from_the_same_chunk() {
             // Hangs the first time any chunk runs, answers after that.
@@ -2012,13 +2309,15 @@ mod tests {
             assert_eq!(f.status(&second), Status::Recorded);
 
             f.queue().recording_finished();
-            f.wait("both transcribed", || {
-                f.status(&first) == Status::Transcribed && f.status(&second) == Status::Transcribed
+            // Too little speech to summarize (SUM-10): both done once transcribed.
+            f.wait("both done", || {
+                f.status(&first) == Status::Review && f.status(&second) == Status::Review
             });
             // The stopped chunk ran again from its start.
             assert_eq!(f.runs(&first), ["gpu", "gpu"]);
         }
 
+        #[cfg(unix)]
         #[test]
         fn a_run_ending_after_a_recording_requeued_it_leaves_no_place_in_line() {
             let f = fixture(RESULT, Backend::Auto);
@@ -2028,7 +2327,7 @@ mod tests {
             {
                 // Started (without a thread, so nothing races this test).
                 let mut inner = lock(&queue.inner);
-                inner.sched.start_next();
+                inner.sched.start_next(2, |_| true);
                 queue.publish_positions(&mut inner);
             }
             // A recording puts it back in line, but the run finishes before its kill lands.
@@ -2044,6 +2343,7 @@ mod tests {
             assert!(queue.snapshot().is_empty());
         }
 
+        #[cfg(unix)]
         #[test]
         fn a_cpu_crash_fails_the_meeting_with_the_workers_last_words() {
             let f = fixture("echo 'whisper exploded' >&2; exit 1", Backend::Cpu);
@@ -2057,6 +2357,7 @@ mod tests {
             assert!(!f.gpu_failed());
         }
 
+        #[cfg(unix)]
         #[test]
         fn two_gpu_crashes_mark_gpu_failed_and_the_cpu_finishes() {
             let f = fixture(
@@ -2065,7 +2366,8 @@ mod tests {
             );
             let id = f.recorded();
             f.queue().enqueue_pending();
-            f.wait("transcribed", || f.status(&id) == Status::Transcribed);
+            // Too little speech to summarize (SUM-10): done once transcribed.
+            f.wait("done", || f.status(&id) == Status::Review);
             assert_eq!(f.runs(&id), ["gpu", "gpu", "cpu"]);
             assert_eq!(f.store().get(&id).unwrap().backend.as_deref(), Some("cpu"));
             assert!(f.gpu_failed());
@@ -2074,6 +2376,7 @@ mod tests {
 
         /// Exit code 3 hashes the model: the fixture's sparse files have the right size but not
         /// the right bytes, so the message says damaged and the file is gone for "다시 받기".
+        #[cfg(unix)]
         #[test]
         fn a_model_that_will_not_load_is_hashed_and_a_damaged_one_deleted() {
             let f = fixture("echo 'failed to load model' >&2; exit 3", Backend::Auto);
@@ -2090,6 +2393,7 @@ mod tests {
             assert!(!f.gpu_failed());
         }
 
+        #[cfg(unix)]
         #[test]
         fn delete_waits_for_the_run_before_the_folder_goes() {
             let f = fixture(
@@ -2122,6 +2426,7 @@ mod tests {
             assert!(f.tmp.path().join("meetings").exists());
         }
 
+        #[cfg(unix)]
         #[test]
         fn a_meeting_is_transcribed_then_summarized_in_the_same_slot() {
             let f = fixture(SPEECH, Backend::Auto);
@@ -2165,6 +2470,7 @@ mod tests {
             );
         }
 
+        #[cfg(unix)]
         #[test]
         fn without_a_connection_it_waits_transcribed_until_one_is_saved() {
             let f = fixture(SPEECH, Backend::Auto);
@@ -2189,6 +2495,7 @@ mod tests {
 
         /// E3: a transcription file in place only pumps; the summary model, downloaded or imported
         /// (`commands::arrived`), also queues the `transcribed` meetings.
+        #[cfg(unix)]
         #[test]
         fn the_summary_model_arriving_queues_the_transcribed_meetings() {
             let f = fixture(SPEECH, Backend::Auto);
@@ -2207,6 +2514,7 @@ mod tests {
         }
 
         /// SUM-10: no LLM request at all.
+        #[cfg(unix)]
         #[test]
         fn too_little_speech_goes_to_review_without_asking_the_llm() {
             let f = fixture(RESULT, Backend::Auto);
@@ -2225,6 +2533,7 @@ mod tests {
             assert_eq!(stub.connections.load(Ordering::SeqCst), 0);
         }
 
+        #[cfg(unix)]
         #[test]
         fn an_llm_error_fails_the_summary_and_a_retry_takes_another_connection() {
             let f = fixture(SPEECH, Backend::Auto);
@@ -2260,6 +2569,7 @@ mod tests {
         }
 
         /// SUM-09: a local summary stops for a recording and runs again from the transcript after.
+        #[cfg(unix)]
         #[test]
         fn a_recording_aborts_a_local_summary_which_runs_again_after_it() {
             let f = fixture(SPEECH, Backend::Auto);
@@ -2290,6 +2600,7 @@ mod tests {
         }
 
         /// SUM-09: a cloud summary is not stopped by a recording.
+        #[cfg(unix)]
         #[test]
         fn a_cloud_summary_runs_on_through_a_recording() {
             let f = fixture(SPEECH, Backend::Auto);
@@ -2324,6 +2635,7 @@ mod tests {
         }
 
         /// Quit stops even a cloud summary; `pause_busy` leaves it `paused` for the next start.
+        #[cfg(unix)]
         #[test]
         fn quit_aborts_a_cloud_summary_and_leaves_it_paused() {
             let f = fixture(SPEECH, Backend::Auto);
@@ -2345,6 +2657,7 @@ mod tests {
 
         /// The status decides what runs: a `transcribe_failed` meeting is transcribed again even
         /// with a `transcript.json` there (written before its status could be, disk full).
+        #[cfg(unix)]
         #[test]
         fn a_transcribe_failed_meeting_with_a_transcript_file_is_transcribed_again() {
             let f = fixture(SPEECH, Backend::Auto);
@@ -2367,6 +2680,7 @@ mod tests {
 
         /// A delete landing after a recording stopped the run, before its end is written: the
         /// meeting does not come back in line.
+        #[cfg(unix)]
         #[test]
         fn a_delete_after_a_recording_stop_leaves_no_ghost_in_line() {
             let f = fixture(RESULT, Backend::Auto);
@@ -2376,7 +2690,7 @@ mod tests {
             {
                 // Started without a thread, so the test drives its end.
                 let mut inner = lock(&queue.inner);
-                inner.sched.start_next();
+                inner.sched.start_next(2, |_| true);
                 inner.jobs.insert(id.clone(), Job::default());
             }
             queue.recording_started();
@@ -2394,6 +2708,7 @@ mod tests {
         }
 
         /// Delete (and quit) stop even a cloud summary.
+        #[cfg(unix)]
         #[test]
         fn delete_aborts_a_summary_in_flight() {
             let f = fixture(SPEECH, Backend::Auto);
@@ -2413,6 +2728,304 @@ mod tests {
             let queue = f.queue();
             let inner = lock(&queue.inner);
             assert!(inner.sched.running.is_empty() && inner.jobs.is_empty());
+        }
+
+        // The built-in route (plan 5.3-5.5) through the fake llama-server.
+
+        /// Plan 5.4: no route yet (the built-in one without its model) is a wait in `transcribed`
+        /// with the reason, not a failure; the model arriving (E3) then summarizes it end to end on
+        /// the built-in route, its engine on the device the settings give (stage 2's deferred
+        /// check).
+        #[cfg(unix)]
+        #[test]
+        fn the_summary_model_arriving_summarizes_a_waiting_meeting_on_this_pc() {
+            let _model = summary_model();
+            let f = fixture(SPEECH, Backend::Auto);
+            let id = f.recorded();
+            f.queue().enqueue_pending();
+            f.wait("transcribed", || f.queue().snapshot().is_empty());
+            let meta = f.store().get(&id).unwrap();
+            assert_eq!(
+                (meta.status, meta.wait, meta.error),
+                (
+                    Status::Transcribed,
+                    Some(crate::store::Wait::SummaryModel),
+                    None
+                )
+            );
+            assert_eq!(meta.llm_connection, None);
+            // Nothing changes while the model is missing.
+            f.queue().enqueue_pending();
+            assert!(f.queue().snapshot().is_empty());
+
+            // The GPU failed the summary engine before: automatic mode starts it on the CPU.
+            let settings = f.app.state::<SettingsStore>();
+            settings.mark_summary_gpu_failed().unwrap();
+            f.install_summary();
+            crate::commands::arrived(&f.queue(), &model::SUMMARY);
+            f.wait("review", || f.status(&id) == Status::Review);
+            let meta = f.store().get(&id).unwrap();
+            assert_eq!(
+                (meta.llm_connection.as_deref(), meta.summarize_local),
+                (Some(BUILTIN), true)
+            );
+            assert_eq!((meta.wait, meta.title.as_str()), (None, "주간 회의"));
+            assert_eq!(f.generated(&id).unwrap(), SUMMARY);
+            assert_eq!(f.asked(), 1);
+            assert!(f.engine_log().contains("--device none"));
+            // Plan 5.3: no idle engine once it is done.
+            f.engine_gone();
+        }
+
+        /// ENG2: a meeting with only its summary left starts without the Whisper model, a cloud
+        /// one too; one still to transcribe keeps its place meanwhile.
+        #[test]
+        fn a_summary_only_meeting_starts_without_the_whisper_model() {
+            let _model = summary_model();
+            let f = fixture(SPEECH, Backend::Auto);
+            let stub = serve(|_| Some(completion(SUMMARY)));
+            let settings = f.app.state::<SettingsStore>();
+            let current = settings.load().unwrap().settings;
+            let cloud = connection(&stub.url, "회사 클라우드", false);
+            settings
+                .save(Settings {
+                    llm_connections: vec![cloud],
+                    ..current
+                })
+                .unwrap();
+            f.install_summary();
+            let whisper = model::needed("tiny").unwrap()[0];
+            fs::remove_file(f.app.state::<Models>().dir.join(whisper.file)).unwrap();
+
+            let waiting = f.recorded();
+            let on_this_pc = f.transcribed(false, None);
+            let to_cloud = f.transcribed(false, Some("회사 클라우드"));
+            f.queue().enqueue_pending();
+            f.wait("both summarized", || {
+                f.status(&on_this_pc) == Status::Review && f.status(&to_cloud) == Status::Review
+            });
+            assert_eq!(
+                f.store()
+                    .get(&on_this_pc)
+                    .unwrap()
+                    .llm_connection
+                    .as_deref(),
+                Some(BUILTIN)
+            );
+            assert_eq!(stub.requests.lock().unwrap().len(), 1);
+            assert_eq!(f.asked(), 1);
+            assert_eq!(f.status(&waiting), Status::Recorded);
+            assert_eq!(lock(&f.queue().inner).sched.position(&waiting), Some(1));
+        }
+
+        /// ENG1: with the summary model in, two "로컬로 요약" meetings beside a cloud default run one
+        /// after the other on this PC: no deadlock, never two at once, nothing to the cloud.
+        #[test]
+        fn two_local_summaries_with_a_cloud_default_run_one_after_the_other() {
+            let _model = summary_model();
+            let f = fixture(SPEECH, Backend::Auto);
+            let stub = serve(|_| Some(completion(SUMMARY)));
+            f.connect(vec![connection(&stub.url, "회사 클라우드", false)]);
+            f.install_summary();
+            let first = f.transcribed(true, None);
+            let second = f.transcribed(true, None);
+            f.queue().enqueue_pending();
+            let most = AtomicUsize::new(0);
+            f.wait("both summarized", || {
+                most.fetch_max(lock(&f.queue().inner).sched.running.len(), Ordering::SeqCst);
+                f.status(&first) == Status::Review && f.status(&second) == Status::Review
+            });
+            assert_eq!(most.load(Ordering::SeqCst), 1);
+            assert_eq!(f.asked(), 2);
+            assert_eq!(stub.connections.load(Ordering::SeqCst), 0);
+            for id in [&first, &second] {
+                let meta = f.store().get(id).unwrap();
+                assert_eq!(meta.llm_connection.as_deref(), Some(BUILTIN));
+            }
+        }
+
+        /// ENG15: a meeting pinned to a connection since deleted waits and says so, is never sent
+        /// elsewhere unasked, and takes the connection picked for it; one waiting for the summary
+        /// model can be given a cloud connection instead.
+        #[test]
+        fn a_waiting_meeting_takes_the_connection_picked_for_it() {
+            let f = fixture(SPEECH, Backend::Auto);
+            let stub = serve(|_| Some(completion(SUMMARY)));
+            let settings = f.app.state::<SettingsStore>();
+            let current = settings.load().unwrap().settings;
+            let cloud = connection(&stub.url, "새 클라우드", false);
+            settings
+                .save(Settings {
+                    llm_connections: vec![cloud.clone()],
+                    ..current
+                })
+                .unwrap();
+            let orphan = f.transcribed(false, Some("지운 연결"));
+            let modelless = f.transcribed(false, None);
+            f.queue().enqueue_pending();
+            f.wait("reasons written", || {
+                f.store().get(&orphan).unwrap().wait.is_some()
+                    && f.store().get(&modelless).unwrap().wait.is_some()
+            });
+            assert_eq!(
+                f.store().get(&orphan).unwrap().wait,
+                Some(crate::store::Wait::ConnectionDeleted)
+            );
+            assert_eq!(
+                f.store().get(&modelless).unwrap().wait,
+                Some(crate::store::Wait::SummaryModel)
+            );
+            assert!(f.queue().snapshot().is_empty());
+            assert_eq!(stub.connections.load(Ordering::SeqCst), 0);
+
+            for id in [&orphan, &modelless] {
+                let meta = f.store().retry_summary(id, &cloud).unwrap();
+                f.queue().enqueue(id, meta.status);
+            }
+            f.wait("both summarized", || {
+                f.status(&orphan) == Status::Review && f.status(&modelless) == Status::Review
+            });
+            let meta = f.store().get(&orphan).unwrap();
+            assert_eq!(
+                (meta.llm_connection.as_deref(), meta.wait),
+                (Some("새 클라우드"), None)
+            );
+            assert_eq!(f.asked(), 0);
+        }
+
+        /// SUM-09, plan 5.3: a recording stops the built-in engine, the meeting goes back first in
+        /// line, no server runs through the recording, and the summary runs again after it.
+        #[test]
+        fn a_recording_stops_a_builtin_summary_which_runs_again_after_it() {
+            let _model = summary_model();
+            let f = fixture_with(SPEECH, Backend::Auto, "stalls-once");
+            f.install_summary();
+            let id = f.transcribed(false, None);
+            f.queue().enqueue_pending();
+            f.wait("requested", || f.asked() == 1);
+
+            let started = Instant::now();
+            f.queue().recording_started();
+            f.wait("paused", || f.status(&id) == Status::Paused);
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_eq!(lock(&f.queue().inner).sched.position(&id), Some(1));
+            f.engine_gone();
+            thread::sleep(Duration::from_millis(300));
+            assert!(!f.queue().engine_running());
+            assert_eq!(f.asked(), 1);
+
+            f.queue().recording_finished();
+            f.wait("review", || f.status(&id) == Status::Review);
+            let asked = fs::read_to_string(f.tmp.path().join("engine/models/asked.log"));
+            assert_eq!(f.asked(), 2, "{asked:?}");
+            let meta = f.store().get(&id).unwrap();
+            assert_eq!(meta.llm_connection.as_deref(), Some(BUILTIN));
+        }
+
+        /// ENG1 through the processing thread: a meeting that finds the lease taken goes back
+        /// first in line unchanged, never starts again while it is held, and runs once it is free.
+        #[test]
+        fn a_meeting_blocked_by_the_lease_runs_once_it_is_given_back() {
+            let _model = summary_model();
+            let f = fixture(SPEECH, Backend::Auto);
+            f.install_summary();
+            // Another summary holds the engine; it has no thread here.
+            assert!(lock(&f.queue().inner).sched.take_lease("holder"));
+            let id = f.transcribed(false, None);
+            f.queue().enqueue_pending();
+            f.wait("passed over", || {
+                let queue = f.queue();
+                let inner = lock(&queue.inner);
+                inner.sched.blocked.contains(&id) && inner.sched.running.is_empty()
+            });
+            let events = || f.events.lock().unwrap().len();
+            let before = events();
+            thread::sleep(Duration::from_millis(300));
+            assert_eq!(events(), before, "started again");
+            assert_eq!(f.status(&id), Status::Transcribed);
+            assert_eq!(lock(&f.queue().inner).sched.position(&id), Some(1));
+            assert_eq!(f.asked(), 0);
+
+            f.queue()
+                .end(&f.store(), "holder", End::Skipped("테스트".into()));
+            f.wait("review", || f.status(&id) == Status::Review);
+            assert_eq!(f.asked(), 1);
+            f.engine_gone();
+        }
+
+        /// A reason that no longer holds leaves `meta.json` as soon as the line is looked at again,
+        /// before the meeting can start (here a recording holds it back).
+        #[test]
+        fn a_stale_wait_goes_once_the_route_resolves() {
+            let _model = summary_model();
+            let f = fixture(SPEECH, Backend::Auto);
+            let id = f.transcribed(false, None);
+            f.queue().enqueue_pending();
+            let wait = || f.store().get(&id).unwrap().wait;
+            assert_eq!(wait(), Some(crate::store::Wait::SummaryModel));
+            f.queue().recording_started();
+            f.install_summary();
+            f.queue().enqueue_pending();
+            assert_eq!((f.status(&id), wait()), (Status::Transcribed, None));
+            assert_eq!(lock(&f.queue().inner).sched.position(&id), Some(1));
+            f.queue().recording_finished();
+            f.wait("review", || f.status(&id) == Status::Review);
+        }
+
+        /// "로컬로 요약" turned on for a meeting waiting for the summary model: a saved local
+        /// connection takes it (`set_summarize_local` queues the waiting meetings again).
+        #[test]
+        fn turning_on_local_for_a_waiting_meeting_summarizes_it_on_a_saved_local_one() {
+            let f = fixture(SPEECH, Backend::Auto);
+            let stub = serve(|_| Some(completion(SUMMARY)));
+            let settings = f.app.state::<SettingsStore>();
+            let current = settings.load().unwrap().settings;
+            let ollama = connection(&stub.url, "내 Ollama", true);
+            settings
+                .save(Settings {
+                    llm_connections: vec![ollama],
+                    ..current
+                })
+                .unwrap();
+            let id = f.transcribed(false, None);
+            f.queue().enqueue_pending();
+            let waiting = f.store().get(&id).unwrap().wait;
+            assert_eq!(waiting, Some(crate::store::Wait::SummaryModel));
+            // The command's own path.
+            let current = settings.load().unwrap().settings;
+            let summarize_locally = crate::commands::summarize_locally;
+            let route = summarize_locally(&f.store(), &current, &f.queue(), &id, true).unwrap();
+            assert_eq!(route.connection.map(|c| c.name), Some("내 Ollama".into()));
+            f.wait("review", || f.status(&id) == Status::Review);
+            let meta = f.store().get(&id).unwrap();
+            assert_eq!(
+                (meta.llm_connection.as_deref(), meta.wait),
+                (Some("내 Ollama"), None)
+            );
+            assert_eq!(stub.requests.lock().unwrap().len(), 1);
+        }
+
+        /// A failed summary whose route no longer resolves (its model went) stays failed with its
+        /// error and no wait; a retry is then offered only a connection that resolves.
+        #[test]
+        fn a_failed_summary_without_a_route_keeps_its_error_and_no_wait() {
+            let f = fixture(SPEECH, Backend::Auto);
+            let id = f.transcribed(false, Some(BUILTIN));
+            f.store()
+                .update(&id, |m| {
+                    m.status = Status::SummarizeFailed;
+                    m.error = Some("앞의 실패".into());
+                    Ok(())
+                })
+                .unwrap();
+            f.queue().enqueue(&id, Status::SummarizeFailed);
+            f.wait("run ended", || f.queue().snapshot().is_empty());
+            let meta = f.store().get(&id).unwrap();
+            assert_eq!(
+                (meta.status, meta.error.as_deref(), meta.wait),
+                (Status::SummarizeFailed, Some("앞의 실패"), None)
+            );
+            assert_eq!(f.asked(), 0);
         }
     }
 }

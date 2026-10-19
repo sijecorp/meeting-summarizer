@@ -45,6 +45,7 @@ const mock = (handler: (cmd: string, args: Record<string, unknown>) => unknown) 
 
 const loaded: LoadedSettings = {
   read_only: false,
+  rename: [],
   settings: {
     schema_version: 1,
     recorder_name: "홍길동",

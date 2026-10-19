@@ -47,6 +47,7 @@ afterEach(async () => {
 
 const loaded: LoadedSettings = {
   read_only: false,
+  rename: [],
   settings: {
     schema_version: 1,
     recorder_name: "홍길동",
@@ -241,6 +242,29 @@ test("refuses to re-add a removed saved name before saving", async () => {
 
   expect(screen.getByText("저장한 뒤 다시 추가하세요")).toBeTruthy();
   expect(screen.queryByRole("button", { name: "연결 삭제" })).toBeNull();
+});
+
+// Plan 5.4: no default is this PC, so adding a connection (here the first, a cloud one) must not
+// make it the default.
+test("adding a connection never changes the default LLM", async () => {
+  const calls: Call[] = [];
+  const none = { ...loaded, settings: { ...loaded.settings, llm_connections: [], default_llm: null } };
+  mockIPC((cmd, args) => {
+    calls.push({ cmd, args: args as Call["args"] });
+    if (cmd === "get_settings") return none;
+    if (cmd === "has_secret") return false;
+  });
+  render(<Settings tab="llm" onHome={() => {}} />);
+  fireEvent.change(await screen.findByRole("textbox", { name: "새 LLM 연결 이름" }), {
+    target: { value: "회사 클라우드" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "연결 추가" }));
+  expect(screen.getByRole("combobox", { name: "기본 LLM" }).textContent).toBe("선택 안 함");
+
+  fireEvent.click(screen.getByRole("button", { name: "저장" }));
+  const saved = () => calls.filter((c) => c.cmd === "save_settings").map((c) => c.args.value);
+  await waitFor(() => expect(saved()).toHaveLength(1));
+  expect(saved()[0]).toMatchObject({ default_llm: null, llm_connections: [{ name: "회사 클라우드" }] });
 });
 
 test("a failed check opens the tab that holds the field", async () => {

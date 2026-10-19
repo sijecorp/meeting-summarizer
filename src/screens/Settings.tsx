@@ -372,7 +372,8 @@ export default function Settings({
           ? "저장한 뒤 다시 추가하세요"
           : "";
 
-  // A new entry opens, ready for its address and key.
+  // A new entry opens, ready for its address and key. It never becomes the default (plan 5.4):
+  // "선택 안 함" is this PC, and a cloud connection added must not take its place.
   const addLlm = (keyboard: boolean) => {
     const name = newLlm.trim();
     const problem = nameProblem(
@@ -386,7 +387,6 @@ export default function Settings({
         ...draft.llm_connections,
         { name, base_url: "", model: "", context_tokens: 8192, is_local: false, timeout_secs: cloudTimeout },
       ],
-      default_llm: draft.default_llm ?? name,
     });
     setNewLlm("");
     setNameError(null);

@@ -587,6 +587,7 @@ mod tests {
             no_speech: false,
             error: None,
             sent: None,
+            wait: None,
         }
     }
 

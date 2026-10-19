@@ -279,7 +279,7 @@ fn scoped(scope: Option<Scope>, settings: &Settings) -> Result<Vec<&'static Mode
         return Ok(vec![&model::SUMMARY]);
     }
     let mut files = model::needed(&settings.model)?.to_vec();
-    if scope != Some(Scope::Transcription) && settings.default_llm.is_none() {
+    if scope != Some(Scope::Transcription) && settings.default_connection().is_none() {
         files.push(&model::SUMMARY);
     }
     Ok(files)
@@ -391,10 +391,12 @@ pub fn import_model(
 pub fn summary_route(
     store: State<'_, Store>,
     settings: State<'_, SettingsStore>,
+    models: State<'_, Models>,
     id: String,
 ) -> Result<SummaryRoute, String> {
     let settings = settings.load()?.settings;
-    Ok(SummaryRoute::of(&settings, &store.get(&id)?))
+    let ready = models.installed(&model::SUMMARY);
+    Ok(SummaryRoute::of(&settings, &store.get(&id)?, ready))
 }
 
 /// SUM-08 "로컬로 요약", until summarizing starts.
@@ -402,15 +404,84 @@ pub fn summary_route(
 pub fn set_summarize_local(
     store: State<'_, Store>,
     settings: State<'_, SettingsStore>,
+    queue: State<'_, Queue>,
     id: String,
     local: bool,
 ) -> Result<SummaryRoute, String> {
-    let settings = settings.load()?.settings;
-    if local && !settings.llm_connections.iter().any(|c| c.is_local) {
+    summarize_locally(&store, &settings.load()?.settings, &queue, &id, local)
+}
+
+/// `set_summarize_local`'s work: the switch, and a meeting waiting for its route queued again, as
+/// it may have one now (plan 5.4).
+pub(crate) fn summarize_locally<R: Runtime>(
+    store: &Store,
+    settings: &Settings,
+    queue: &Queue<R>,
+    id: &str,
+    local: bool,
+) -> Result<SummaryRoute, String> {
+    let ready = queue.builtin_ready();
+    if local && !summarize::local_available(settings, ready) {
         return Err("로컬 LLM 연결이 없습니다".into());
     }
-    let meta = store.set_summarize_local(&id, local)?;
-    Ok(SummaryRoute::of(&settings, &meta))
+    let meta = store.set_summarize_local(id, local)?;
+    if meta.wait.is_some() {
+        queue.enqueue_pending();
+    }
+    Ok(SummaryRoute::of(settings, &meta, ready))
+}
+
+/// One entry of `list_connections` (plan 5.4): a connection a screen may offer, the built-in route
+/// as "이 PC". No secret.
+#[derive(Serialize, Debug, PartialEq)]
+pub struct ConnectionItem {
+    name: String,
+    label: String,
+    /// Where it sends a transcript, as SUM-07 names it. Empty for the built-in route.
+    host: String,
+    is_local: bool,
+    builtin: bool,
+}
+
+fn connection_items(settings: &Settings) -> Vec<ConnectionItem> {
+    let host = |url: &str| {
+        let url = url.trim();
+        reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| {
+                let host = u.host_str()?;
+                Some(
+                    u.port()
+                        .map_or(host.to_string(), |port| format!("{host}:{port}")),
+                )
+            })
+            .unwrap_or_else(|| url.to_string())
+    };
+    settings
+        .connections()
+        .into_iter()
+        .map(|c| {
+            let builtin = c.name == settings::BUILTIN;
+            ConnectionItem {
+                label: if builtin {
+                    settings::BUILTIN_LABEL.into()
+                } else {
+                    c.name.clone()
+                },
+                host: host(&c.base_url),
+                is_local: c.is_local,
+                builtin,
+                name: c.name,
+            }
+        })
+        .collect()
+}
+
+/// The saved connections and the built-in route (plan 5.4). `get_settings` never carries the
+/// built-in route; screens that pick a connection read this.
+#[tauri::command(async)]
+pub fn list_connections(settings: State<'_, SettingsStore>) -> Result<Vec<ConnectionItem>, String> {
+    Ok(connection_items(&settings.load()?.settings))
 }
 
 /// REV-01: the edited title and summary body, in `review` only.
@@ -499,7 +570,9 @@ pub async fn send_test_message(
     slack.send_test(&settings, &webhook, url).await
 }
 
-/// SUM-06 "요약 다시 실행" after `summarize_failed`, with the connection the recorder picked.
+/// SUM-06 "요약 다시 실행" after `summarize_failed`, and ENG15's change of connection for a meeting
+/// waiting with its transcript, with the connection the recorder picked (`list_connections`'s
+/// name, the built-in route's too).
 #[tauri::command(async)]
 pub fn retry_summary(
     store: State<'_, Store>,
@@ -509,14 +582,30 @@ pub fn retry_summary(
     connection: String,
 ) -> Result<Meta, String> {
     let settings = settings.load()?.settings;
-    let chosen = settings
-        .llm_connections
-        .iter()
-        .find(|c| c.name == connection)
-        .ok_or_else(|| format!("LLM 연결 '{connection}'을(를) 찾을 수 없습니다"))?;
-    let meta = store.retry_summary(&id, chosen)?;
+    let chosen = retry_connection(&settings, &connection, queue.builtin_ready())?;
+    let meta = store.retry_summary(&id, &chosen)?;
     queue.enqueue(&id, meta.status);
     Ok(meta)
+}
+
+/// What `retry_summary` pins: a connection the meeting's route then resolves to (plan 5.4), so a
+/// retry never ends as a wait, nor in `summarize_failed` waiting for nothing.
+fn retry_connection(
+    settings: &Settings,
+    name: &str,
+    builtin_ready: bool,
+) -> Result<settings::LlmConnection, String> {
+    let chosen = settings.connections().into_iter().find(|c| c.name == name);
+    let chosen = chosen.ok_or_else(|| {
+        format!("LLM 연결 '{name}'을(를) 찾을 수 없습니다. 다른 연결을 골라 주세요")
+    })?;
+    if chosen.name == settings::BUILTIN && !builtin_ready {
+        return Err(
+            "이 PC 요약 모델이 아직 없습니다. 설정 → 요약(LLM)에서 요약 모델을 먼저 받아 주세요"
+                .into(),
+        );
+    }
+    Ok(chosen)
 }
 
 /// REV-05: saves the summary and the transcript as one `.md` file. The save dialog opens here, so
@@ -573,10 +662,22 @@ mod tests {
     use super::*;
 
     /// DX12, E3: transcription first, the summary model only for the built-in default.
+    fn cloud(name: &str, base_url: &str) -> settings::LlmConnection {
+        settings::LlmConnection {
+            name: name.into(),
+            base_url: base_url.into(),
+            model: "m".into(),
+            context_tokens: 128_000,
+            is_local: false,
+            timeout_secs: 300,
+        }
+    }
+
     #[test]
     fn scopes_name_their_files_in_order() {
         let files = |scope, default_llm: Option<&str>| {
             let settings = Settings {
+                llm_connections: vec![cloud("클라우드", "https://api.example.com/v1")],
                 default_llm: default_llm.map(String::from),
                 ..Settings::default()
             };
@@ -594,6 +695,13 @@ mod tests {
         assert_eq!(files(Some(Scope::All), Some("클라우드")), transcription);
         assert_eq!(files(Some(Scope::Transcription), None), transcription);
         assert_eq!(files(Some(Scope::Summary), Some("클라우드")), [summary]);
+        // The built-in default however it is spelt (`Settings::default_connection`).
+        for builtin in [Some("builtin"), Some("지운 연결")] {
+            assert_eq!(
+                files(None, builtin),
+                [&transcription[..], &[summary]].concat()
+            );
+        }
         assert_eq!(
             serde_json::from_str::<[Scope; 3]>(r#"["all", "transcription", "summary"]"#).unwrap(),
             [Scope::All, Scope::Transcription, Scope::Summary]
@@ -612,6 +720,75 @@ mod tests {
         assert!(not_in_use(&all, false).is_ok());
         // The transcription files are not llama-server's.
         assert!(not_in_use(&transcription, true).is_ok());
+    }
+
+    /// Plan 5.4: the screens' list ends with the built-in route as "이 PC"; `get_settings` and the
+    /// file `save_settings` writes never hold it.
+    #[test]
+    fn list_connections_offers_this_pc_which_settings_never_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = SettingsStore::new(tmp.path().join("settings.json"));
+        store
+            .save(Settings {
+                llm_connections: vec![cloud("회사 클라우드", " https://api.example.com:8443/v1 ")],
+                ..Settings::default()
+            })
+            .unwrap();
+        let loaded = store.load().unwrap();
+        let item = |name: &str, label: &str, host: &str, local| ConnectionItem {
+            name: name.into(),
+            label: label.into(),
+            host: host.into(),
+            is_local: local,
+            builtin: local,
+        };
+        assert_eq!(
+            connection_items(&loaded.settings),
+            [
+                item(
+                    "회사 클라우드",
+                    "회사 클라우드",
+                    "api.example.com:8443",
+                    false
+                ),
+                item("builtin", "이 PC", "", true),
+            ]
+        );
+        let sent = serde_json::to_string(&loaded).unwrap();
+        let file = std::fs::read_to_string(tmp.path().join("settings.json")).unwrap();
+        for text in [sent, file] {
+            assert!(
+                !text.contains(settings::BUILTIN) && !text.contains("이 PC"),
+                "{text}"
+            );
+        }
+        assert_eq!(loaded.settings.default_llm, None);
+    }
+
+    /// Plan 5.4: a retry pins only a connection the meeting can be summarized with now, so it
+    /// never ends waiting (in `summarize_failed`, for a model nothing will queue it for).
+    #[test]
+    fn a_retry_takes_only_a_connection_that_can_summarize_now() {
+        let settings = Settings {
+            llm_connections: vec![cloud("회사 클라우드", "https://api.example.com/v1")],
+            ..Settings::default()
+        };
+        let picked = |name, ready| retry_connection(&settings, name, ready);
+        assert_eq!(
+            picked("회사 클라우드", false).unwrap().name,
+            "회사 클라우드"
+        );
+        assert_eq!(picked(settings::BUILTIN, true), Ok(settings::builtin()));
+        let modelless = picked(settings::BUILTIN, false).unwrap_err();
+        assert!(
+            modelless.contains("요약 모델을 먼저 받아 주세요"),
+            "{modelless}"
+        );
+        let gone = picked("지운 연결", true).unwrap_err();
+        assert!(
+            gone.contains("찾을 수 없습니다") && gone.contains("다른 연결"),
+            "{gone}"
+        );
     }
 
     #[test]

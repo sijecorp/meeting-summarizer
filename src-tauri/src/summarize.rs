@@ -3,12 +3,16 @@
 //! merged, every request within its token budget (6.3).
 //!
 //! Pure and tested without a server: `route` (which connection), `split_title`, `too_short` and the
-//! budget (`tokens`, `pack`). The requests are tested against local stub servers.
+//! budget (`tokens`, `pack`). The requests are tested against local stub servers, the built-in
+//! route's against the sidecar tests' fake llama-server.
 
-use crate::settings::{LlmConnection, Settings};
-use crate::store::{Meta, Status};
+use crate::settings::{BUILTIN, LlmConnection, Settings};
+use crate::sidecar;
+use crate::store::{Meta, Status, Wait};
 use crate::transcribe::engine::Segment;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 /// Architecture 6.1. The whole answer has the connection's `timeout_secs`.
@@ -21,6 +25,9 @@ const FINAL_TOKENS: u64 = 4000;
 const REASONING_TOKENS: u64 = 8000;
 /// SUM-10: below this many characters (whitespace aside) the LLM is not asked at all.
 const MIN_CHARS: usize = 30;
+/// llama-server's error `type` (with HTTP 400) for a request over its context, at the pinned
+/// commit: "request (N tokens) exceeds the available context size (M tokens), try increasing it".
+const CONTEXT_EXCEEDED: &str = "exceed_context_size_error";
 
 /// Architecture 6.2. The glossary line is added only when there is a glossary.
 const SYSTEM: &str = "\
@@ -71,6 +78,10 @@ pub enum Failure {
     /// The server read far fewer tokens than it was sent: it cut the input to its own context
     /// (Ollama's `/v1` and LM Studio ignore ours).
     Truncated,
+    /// The answer stopped at its token limit (`finish_reason: "length"`).
+    Length,
+    /// The built-in route's own failure (plan 5.3): its words are `sidecar::Failure::message`'s.
+    Builtin(sidecar::Failure),
     /// One partial summary of a long meeting failed (6.3): the whole summary fails with it.
     Part {
         n: usize,
@@ -101,6 +112,8 @@ impl Failure {
             Failure::Provider(detail) => format!("LLM 공급자 오류: {detail}"),
             Failure::TooSmall => "컨텍스트 토큰 설정이 너무 작습니다. 설정 → 요약(LLM)에서 모델의 실제 컨텍스트 길이를 입력해 주세요".into(),
             Failure::Truncated => "LLM 서버가 입력을 잘랐습니다. 서버의 컨텍스트 길이(Ollama: OLLAMA_CONTEXT_LENGTH, LM Studio: 모델 로드 시 Context Length)를 연결 설정의 컨텍스트 토큰 이상으로 맞춰 주세요".into(),
+            Failure::Length => "LLM 공급자 오류: 요약이 길이 제한에서 잘렸습니다. 컨텍스트 토큰 설정을 확인해 주세요".into(),
+            Failure::Builtin(engine) => engine.message(),
             Failure::Part { n, of, cause } => format!("{} (구간 {n}/{of}에서 실패)", cause.message()),
         }
     }
@@ -114,44 +127,68 @@ impl Failure {
     }
 }
 
-/// Which connection summarizes a meeting (SUM-08, architecture 6.1). A choice already made (a
-/// retry's, or an earlier start's) stands. "로컬로 요약" never falls back to the cloud: the recorder
-/// asked to keep the transcript on this machine.
-pub fn route<'a>(settings: &'a Settings, meta: &Meta) -> Result<&'a LlmConnection, String> {
-    let all = &settings.llm_connections;
-    if all.is_empty() {
-        return Err("LLM 연결이 없습니다. 설정에서 추가한 뒤 다시 실행해 주세요".into());
-    }
+/// Which connection summarizes a meeting (SUM-08, plan 5.4, architecture 6.1), out of
+/// `Settings::connections`: the one it is pinned to (a retry's, or an earlier start's); for
+/// "로컬로 요약" the default if it is local, else the built-in route, else the first saved local
+/// one; else the default, which is the built-in route when `default_llm` is `None` or names no
+/// connection. The built-in route takes `builtin_ready` (the summary model is installed). Nothing
+/// falls back to another connection unasked: "로컬로 요약" never goes to the cloud, and a meeting
+/// pinned to a connection that is gone waits for another to be picked.
+pub fn route(settings: &Settings, meta: &Meta, builtin_ready: bool) -> Result<LlmConnection, Wait> {
+    let all = settings.connections();
+    let usable = |c: &&LlmConnection| c.name != BUILTIN || builtin_ready;
     let named = |name: &str| all.iter().find(|c| c.name == name);
+    let builtin = named(BUILTIN);
     if let Some(name) = &meta.llm_connection {
-        return named(name).ok_or_else(|| format!("LLM 연결 '{name}'을(를) 찾을 수 없습니다"));
+        let pinned = named(name).ok_or(Wait::ConnectionDeleted)?;
+        return Some(pinned)
+            .filter(usable)
+            .cloned()
+            .ok_or(Wait::SummaryModel);
     }
-    let default = settings.default_llm.as_deref().and_then(named);
-    if meta.summarize_local {
-        return default
+    let default = settings
+        .default_connection()
+        .and_then(|d| named(&d.name))
+        .or(builtin);
+    let chosen = if meta.summarize_local {
+        default
             .filter(|c| c.is_local)
-            .or_else(|| all.iter().find(|c| c.is_local))
-            .ok_or_else(|| "로컬 LLM 연결이 없습니다".into());
-    }
-    Ok(default.unwrap_or(&all[0]))
+            .filter(usable)
+            .or(builtin.filter(usable))
+            .or_else(|| all.iter().filter(usable).find(|c| c.is_local))
+    } else {
+        default.filter(usable)
+    };
+    chosen.cloned().ok_or(Wait::SummaryModel)
+}
+
+/// SUM-08's toggle is offered (plan 5.4): the built-in route is ready, or a saved connection is
+/// local.
+pub fn local_available(settings: &Settings, builtin_ready: bool) -> bool {
+    builtin_ready
+        || settings
+            .connections()
+            .iter()
+            .any(|c| c.is_local && c.name != BUILTIN)
 }
 
 /// `summary_route`: where a meeting's summary goes, for the SUM-07 notice and the SUM-08 toggle.
 #[derive(Serialize, Debug, PartialEq)]
 pub struct SummaryRoute {
-    /// `None` without connections, when the meeting's choice cannot be met, or when nothing was
-    /// sent (no speech, or reviewed without a connection). Holds no secret.
+    /// `None` while the meeting's route does not resolve (`route`), or when nothing was sent (no
+    /// speech, or reviewed without a connection). The built-in route is `settings::BUILTIN`. Holds
+    /// no secret.
     pub connection: Option<LlmConnection>,
     /// The meeting's "로컬로 요약".
     pub local: bool,
-    /// Some connection is local, so the toggle is offered.
+    /// `local_available`, so the toggle is offered.
     pub local_available: bool,
     /// Summarizing has started: the route no longer changes.
     pub locked: bool,
 }
 
 impl SummaryRoute {
-    pub fn of(settings: &Settings, meta: &Meta) -> Self {
+    pub fn of(settings: &Settings, meta: &Meta, builtin_ready: bool) -> Self {
         // Nothing went anywhere: SUM-07 must not say "전송됨".
         let sent_nothing = meta.no_speech
             || (meta.llm_connection.is_none()
@@ -161,10 +198,10 @@ impl SummaryRoute {
                 ));
         Self {
             connection: (!sent_nothing)
-                .then(|| route(settings, meta).ok().cloned())
+                .then(|| route(settings, meta, builtin_ready).ok())
                 .flatten(),
             local: meta.summarize_local,
-            local_available: settings.llm_connections.iter().any(|c| c.is_local),
+            local_available: local_available(settings, builtin_ready),
             locked: meta.summary_started(),
         }
     }
@@ -309,13 +346,39 @@ fn strip_think(text: &str) -> &str {
     }
 }
 
-/// The answer of a Chat Completions reply to `input_chars` characters of input. A cut input, a
-/// cut answer (`finish_reason: "length"`) and an empty one are failures, not summaries.
-fn content(body: &str, key: Option<&str>, input_chars: usize) -> Result<String, Failure> {
+/// llama-server's `timings` of a summary's answers, added up (plan 5.3, 5.8): for the log, the eval
+/// (DX7) and later the speed hint (E2). Zero from servers that send none.
+#[derive(Deserialize, Default, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct Timings {
+    pub prompt_n: u64,
+    pub prompt_ms: f64,
+    pub predicted_n: u64,
+    pub predicted_ms: f64,
+}
+
+impl std::ops::AddAssign for Timings {
+    fn add_assign(&mut self, t: Self) {
+        self.prompt_n += t.prompt_n;
+        self.prompt_ms += t.prompt_ms;
+        self.predicted_n += t.predicted_n;
+        self.predicted_ms += t.predicted_ms;
+    }
+}
+
+/// The answer of a Chat Completions reply to `input_chars` characters of input, with its timings.
+/// A cut input, a cut answer (`finish_reason: "length"`) and an empty one are failures, not
+/// summaries.
+fn content(
+    body: &str,
+    key: Option<&str>,
+    input_chars: usize,
+) -> Result<(String, Timings), Failure> {
     #[derive(Deserialize)]
     struct Reply {
         choices: Vec<Choice>,
         usage: Option<Usage>,
+        timings: Option<Timings>,
     }
     #[derive(Deserialize)]
     struct Usage {
@@ -340,9 +403,7 @@ fn content(body: &str, key: Option<&str>, input_chars: usize) -> Result<String, 
     }
     let choice = reply.choices.into_iter().next().ok_or_else(unreadable)?;
     if choice.finish_reason.as_deref() == Some("length") {
-        return Err(Failure::Provider(
-            "요약이 길이 제한에서 잘렸습니다. 컨텍스트 토큰 설정을 확인해 주세요".into(),
-        ));
+        return Err(Failure::Length);
     }
     let text = strip_think(choice.message.content.as_deref().unwrap_or_default());
     if text.is_empty() {
@@ -351,7 +412,19 @@ fn content(body: &str, key: Option<&str>, input_chars: usize) -> Result<String, 
             choice.finish_reason.as_deref().unwrap_or("없음")
         )));
     }
-    Ok(text.to_string())
+    Ok((text.to_string(), reply.timings.unwrap_or_default()))
+}
+
+/// The built-in route's `on_failure` hook (plan 5.3, `Sidecar::on_failure`): told whether the
+/// request timed out and whether the server answered since the last call, it gives the base URL
+/// of a server to ask again, or why the summary ends.
+pub type Recover = Box<
+    dyn FnMut(bool, bool) -> Pin<Box<dyn Future<Output = Result<String, sidecar::Failure>> + Send>>
+        + Send,
+>;
+
+fn completions(base_url: &str) -> String {
+    format!("{}/chat/completions", base_url.trim().trim_end_matches('/'))
 }
 
 /// One summary's requests to one connection.
@@ -363,32 +436,64 @@ struct Llm<'a> {
     /// The server takes `max_completion_tokens` and no `temperature`: OpenAI's reasoning models
     /// reject `max_tokens` and a non-default temperature. Learned from its first 400, then kept.
     compat: bool,
+    /// The built-in route's only.
+    recover: Option<Recover>,
+    /// An answer came since `recover` was last called.
+    answered: bool,
+    timings: Timings,
 }
 
 impl<'a> Llm<'a> {
-    fn new(connection: &'a LlmConnection, key: Option<&'a str>) -> Result<Self, Failure> {
+    fn new(
+        connection: &'a LlmConnection,
+        key: Option<&'a str>,
+        recover: Option<Recover>,
+    ) -> Result<Self, Failure> {
         let mut http = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT);
         if direct(connection) {
             http = http.no_proxy();
         }
         let http = http.build().map_err(|e| Failure::Network(e.to_string()))?;
-        let base = connection.base_url.trim().trim_end_matches('/');
         Ok(Self {
             http,
-            url: format!("{base}/chat/completions"),
+            url: completions(&connection.base_url),
             connection,
             key,
             compat: false,
+            recover,
+            answered: false,
+            timings: Timings::default(),
         })
     }
 
-    /// A network failure (a timeout too) is tried once more; nothing else is (6.4).
+    /// A network failure (a timeout too) is tried once more; nothing else is (6.4). On the built-in
+    /// route, transport errors and timeouts go to `recover` instead (plan 5.3, ENG6): a server
+    /// brought back after a death gets this request again, a timeout is not asked again. An HTTP
+    /// status is a live server's answer and goes no further.
     async fn ask(&mut self, system: &str, user: &str, max_tokens: u64) -> Result<String, Failure> {
-        match self.send(system, user, max_tokens).await {
-            Err(Failure::Network(_) | Failure::Timeout) => {
-                self.send(system, user, max_tokens).await
-            }
-            result => result,
+        if self.recover.is_none() {
+            return match self.send(system, user, max_tokens).await {
+                Err(Failure::Network(_) | Failure::Timeout) => {
+                    self.send(system, user, max_tokens).await
+                }
+                result => result,
+            };
+        }
+        loop {
+            let timed_out = match self.send(system, user, max_tokens).await {
+                Err(Failure::Timeout) => true,
+                Err(Failure::Network(_) | Failure::LocalDown) => false,
+                result => {
+                    self.answered |= result.is_ok();
+                    return result;
+                }
+            };
+            let answered = std::mem::take(&mut self.answered);
+            let recover = self.recover.as_mut().expect("the built-in route");
+            let base_url = recover(timed_out, answered)
+                .await
+                .map_err(Failure::Builtin)?;
+            self.url = completions(&base_url);
         }
     }
 
@@ -425,7 +530,16 @@ impl<'a> Llm<'a> {
                 continue;
             }
             return match status.as_u16() {
-                200..=299 => content(&text, self.key, chars(system) + chars(user)),
+                200..=299 => {
+                    let (text, timings) = content(&text, self.key, chars(system) + chars(user))?;
+                    self.timings += timings;
+                    Ok(text)
+                }
+                // Our engine refused an input over its `-c`: the budget's estimate fell short, which
+                // is the cut input's failure (ENG12).
+                400 if self.recover.is_some() && text.contains(CONTEXT_EXCEEDED) => {
+                    Err(Failure::Truncated)
+                }
                 code @ (401 | 403) => Err(Failure::Key(code)),
                 429 => Err(Failure::Quota),
                 code => Err(Failure::Provider(format!(
@@ -450,24 +564,72 @@ impl<'a> Llm<'a> {
 /// Summarizes `lines` (the transcript, one segment per line) with `connection` (architecture 6).
 /// A transcript over 60% of the context goes in parts whose partial summaries are merged, in
 /// groups again while one request cannot hold them all (6.3). `on_step(done, known)` counts
-/// requests: `known` grows when a merge needs another pass.
+/// requests: `known` grows when a merge needs another pass. `recover`: the built-in route's hook,
+/// which also gives its failures the built-in words (`engine_failure`). Returns the summary and
+/// its answers' timings.
 pub async fn summarize(
     connection: &LlmConnection,
     key: Option<String>,
     glossary: &[String],
     lines: &[String],
     on_step: impl Fn(u32, u32),
-) -> Result<String, Failure> {
+    recover: Option<Recover>,
+) -> Result<(String, Timings), Failure> {
+    let builtin = recover.is_some();
     let key = key.filter(|k| !k.is_empty());
     if !connection.is_local && key.is_none() {
         return Err(Failure::NoKey);
     }
-    let mut llm = Llm::new(connection, key.as_deref())?;
+    let summary = match Llm::new(connection, key.as_deref(), recover) {
+        Ok(mut llm) => parts(&mut llm, glossary, lines, on_step)
+            .await
+            .map(|text| (text, llm.timings)),
+        Err(failure) => Err(failure),
+    };
+    if builtin {
+        summary.map_err(engine_failure)
+    } else {
+        summary
+    }
+}
+
+/// Plan 5.3, DX5, ENG12, ENG16: the built-in route's words for a failure. Its budget checks stay
+/// with words of their own; nothing about Ollama, context tokens or the internet reaches it. An
+/// HTTP error or an unreadable answer from our own server is the model's failure, logged.
+fn engine_failure(failure: Failure) -> Failure {
+    Failure::Builtin(match failure {
+        Failure::Builtin(engine) => engine,
+        Failure::Part { n, of, cause } => {
+            return Failure::Part {
+                n,
+                of,
+                cause: Box::new(engine_failure(*cause)),
+            };
+        }
+        Failure::TooSmall => sidecar::Failure::GlossaryTooLong,
+        Failure::Length => sidecar::Failure::Length,
+        Failure::Truncated => {
+            log::error!("이 PC 요약 엔진이 보낸 입력보다 훨씬 적게 읽었습니다");
+            sidecar::Failure::Truncated
+        }
+        other => {
+            log::error!("이 PC 요약 엔진의 답을 쓸 수 없습니다: {}", other.message());
+            sidecar::Failure::Unreadable
+        }
+    })
+}
+
+async fn parts(
+    llm: &mut Llm<'_>,
+    glossary: &[String],
+    lines: &[String],
+    on_step: impl Fn(u32, u32),
+) -> Result<String, Failure> {
     let mut system = SYSTEM.to_string();
     if !glossary.is_empty() {
         system += &format!("\n- 용어집의 표기를 따른다: {}", glossary.join(", "));
     }
-    let context = u64::from(connection.context_tokens);
+    let context = u64::from(llm.connection.context_tokens);
     let budget = context * 9 / 10;
     let input = |user: &str| tokens(chars(&system) + chars(user));
     let within = |user: &str| input(user) <= context * 6 / 10;
@@ -672,7 +834,9 @@ pub(crate) mod tests {
             &[],
             lines,
             |_, _| {},
+            None,
         ))
+        .map(|(summary, _)| summary)
     }
 
     const SPEECH: &str =
@@ -688,9 +852,11 @@ pub(crate) mod tests {
             &glossary,
             &lines(&format!("{SPEECH}\n둘째 줄")),
             |_, _| {},
+            None,
         ))
         .unwrap();
-        assert_eq!(summary, SUMMARY);
+        // A server without `timings` adds nothing to them.
+        assert_eq!(summary, (SUMMARY.to_string(), Timings::default()));
         let requests = stub.requests.lock().unwrap();
         let request = &requests[0];
         assert!(
@@ -897,17 +1063,19 @@ pub(crate) mod tests {
             })
             .to_string()
         };
-        let detail = |body: String| {
+        let failure = |body: String| {
             let stub = serve(move |_| Some(reply("200 OK", &body)));
-            match run(&connection(&stub.url, "l", true), None, &lines(SPEECH)) {
-                Err(Failure::Provider(detail)) => detail,
-                other => panic!("{other:?}"),
-            }
+            run(&connection(&stub.url, "l", true), None, &lines(SPEECH)).unwrap_err()
         };
-        let cut = detail(answer("# 회의\n## 결정사항\n- 배포는", "length"));
-        assert!(cut.contains("길이 제한에서 잘렸습니다"), "{cut}");
-        let thought = detail(answer("<think>끝나지 않은 생각", "length"));
-        assert!(thought.contains("길이 제한에서 잘렸습니다"), "{thought}");
+        let detail = |body: String| match failure(body) {
+            Failure::Provider(detail) => detail,
+            other => panic!("{other:?}"),
+        };
+        let cut = failure(answer("# 회의\n## 결정사항\n- 배포는", "length"));
+        assert_eq!(cut, Failure::Length);
+        assert!(cut.message().contains("길이 제한에서 잘렸습니다"));
+        let thought = failure(answer("<think>끝나지 않은 생각", "length"));
+        assert_eq!(thought, Failure::Length);
         let empty = detail(answer("  ", "stop"));
         assert!(
             empty.contains("빈 요약") && empty.contains("stop"),
@@ -1116,41 +1284,83 @@ pub(crate) mod tests {
             no_speech: false,
             error: None,
             sent: None,
+            wait: None,
         }
     }
 
     #[test]
-    fn route_follows_the_choice_then_local_then_the_default() {
+    fn route_follows_the_pin_then_local_then_the_default_then_the_builtin_route() {
         let all = vec![
             connection("u", "cloud", false),
             connection("u", "ollama", true),
             connection("u", "lmstudio", true),
         ];
-        let name = |s: &Settings, m: &Meta| route(s, m).map(|c| c.name.clone());
+        let name = |s: &Settings, m: &Meta, ready| route(s, m, ready).map(|c| c.name);
+        let both = |s: &Settings, m: &Meta| (name(s, m, true), name(s, m, false));
+        let ok = |n: &str| Ok(n.to_string());
+        let model = || Err(Wait::SummaryModel);
+
         let s = settings(all.clone(), Some("cloud"));
-        assert_eq!(name(&s, &meta(None, false)), Ok("cloud".into()));
-        // "로컬로 요약": the first local one unless the default is local.
-        assert_eq!(name(&s, &meta(None, true)), Ok("ollama".into()));
+        assert_eq!(both(&s, &meta(None, false)), (ok("cloud"), ok("cloud")));
+        // "로컬로 요약" with a cloud default: the built-in route when ready, else the first saved
+        // local one.
+        assert_eq!(both(&s, &meta(None, true)), (ok(BUILTIN), ok("ollama")));
+        // A local default comes first.
         let s = settings(all.clone(), Some("lmstudio"));
-        assert_eq!(name(&s, &meta(None, true)), Ok("lmstudio".into()));
-        // A choice made earlier stands, even against the toggle.
-        assert_eq!(name(&s, &meta(Some("cloud"), true)), Ok("cloud".into()));
         assert_eq!(
-            name(&s, &meta(Some("gone"), false)),
-            Err("LLM 연결 'gone'을(를) 찾을 수 없습니다".into())
+            both(&s, &meta(None, true)),
+            (ok("lmstudio"), ok("lmstudio"))
         );
-        // No default, or one that no longer exists: the first connection.
+        // A pin stands, even against the toggle; the built-in route's needs the model.
+        assert_eq!(
+            both(&s, &meta(Some("cloud"), true)),
+            (ok("cloud"), ok("cloud"))
+        );
+        assert_eq!(
+            both(&s, &meta(Some(BUILTIN), false)),
+            (ok(BUILTIN), model())
+        );
+        // ENG15: a pinned connection that is gone is never swapped for another.
+        let deleted = || Err(Wait::ConnectionDeleted);
+        assert_eq!(both(&s, &meta(Some("gone"), true)), (deleted(), deleted()));
+
+        // No default (the settings' first connection does not make one), or one that is gone:
+        // the built-in route, and while its model is missing the meeting waits for it.
         for default in [None, Some("gone")] {
             let s = settings(all.clone(), default);
-            assert_eq!(name(&s, &meta(None, false)), Ok("cloud".into()));
+            assert_eq!(both(&s, &meta(None, false)), (ok(BUILTIN), model()));
+            assert_eq!(both(&s, &meta(None, true)), (ok(BUILTIN), ok("ollama")));
         }
-        // Local asked, none there: never the cloud.
+        // Local asked, nothing local but the built-in route: never the cloud.
         let s = settings(vec![connection("u", "cloud", false)], Some("cloud"));
+        assert_eq!(both(&s, &meta(None, true)), (ok(BUILTIN), model()));
         assert_eq!(
-            name(&s, &meta(None, true)),
-            Err("로컬 LLM 연결이 없습니다".into())
+            both(&settings(vec![], None), &meta(None, false)),
+            (ok(BUILTIN), model())
         );
-        assert!(name(&settings(vec![], None), &meta(None, false)).is_err());
+        assert_eq!(
+            route(&s, &meta(None, true), true),
+            Ok(crate::settings::builtin())
+        );
+    }
+
+    /// d6: saved connections named like the built-in route never take its place.
+    #[test]
+    fn a_saved_connection_with_a_reserved_name_is_out_of_every_route() {
+        let s = settings(
+            vec![
+                connection("http://evil.example/v1", BUILTIN, false),
+                connection("http://evil.example/v1", "이 PC", true),
+            ],
+            Some(BUILTIN),
+        );
+        let builtin = Ok(crate::settings::builtin());
+        assert_eq!(route(&s, &meta(None, false), true), builtin);
+        assert_eq!(route(&s, &meta(Some(BUILTIN), false), true), builtin);
+        assert_eq!(route(&s, &meta(None, true), false), Err(Wait::SummaryModel));
+        let pinned = route(&s, &meta(Some("이 PC"), false), true);
+        assert_eq!(pinned, Err(Wait::ConnectionDeleted));
+        assert!(!local_available(&s, false) && local_available(&s, true));
     }
 
     #[test]
@@ -1160,9 +1370,9 @@ pub(crate) mod tests {
                 connection("u", "cloud", false),
                 connection("u", "ollama", true),
             ],
-            None,
+            Some("cloud"),
         );
-        let route = SummaryRoute::of(&s, &meta(None, false));
+        let route = SummaryRoute::of(&s, &meta(None, false), false);
         assert_eq!(
             (
                 route.connection.map(|c| c.name),
@@ -1171,16 +1381,22 @@ pub(crate) mod tests {
             ),
             (Some("cloud".into()), true, false)
         );
-        assert!(SummaryRoute::of(&s, &meta(Some("cloud"), false)).locked);
+        assert!(SummaryRoute::of(&s, &meta(Some("cloud"), false), false).locked);
         let review = Meta {
             status: Status::Review,
             ..meta(None, false)
         };
-        assert!(SummaryRoute::of(&s, &review).locked);
-        let none = SummaryRoute::of(&settings(vec![], None), &meta(None, true));
+        assert!(SummaryRoute::of(&s, &review, false).locked);
+        // Nothing saved: local only once the summary model is in, and no route before it.
+        let none = SummaryRoute::of(&settings(vec![], None), &meta(None, true), false);
         assert_eq!(
             (none.connection, none.local, none.local_available),
             (None, true, false)
+        );
+        let ready = SummaryRoute::of(&settings(vec![], None), &meta(None, true), true);
+        assert_eq!(
+            (ready.connection.map(|c| c.name), ready.local_available),
+            (Some(BUILTIN.into()), true)
         );
         // Nothing was sent: no speech, or a review that never had a connection.
         let no_speech = Meta {
@@ -1188,13 +1404,13 @@ pub(crate) mod tests {
             no_speech: true,
             ..meta(Some("cloud"), false)
         };
-        assert_eq!(SummaryRoute::of(&s, &no_speech).connection, None);
-        assert_eq!(SummaryRoute::of(&s, &review).connection, None);
+        assert_eq!(SummaryRoute::of(&s, &no_speech, true).connection, None);
+        assert_eq!(SummaryRoute::of(&s, &review, true).connection, None);
         let sent = Meta {
             status: Status::Review,
             ..meta(Some("ollama"), true)
         };
-        let route = SummaryRoute::of(&s, &sent).connection;
+        let route = SummaryRoute::of(&s, &sent, true).connection;
         assert_eq!(route.map(|c| c.name), Some("ollama".into()));
     }
 
@@ -1218,10 +1434,9 @@ pub(crate) mod tests {
             .collect();
         transcript.insert(20, "끊김 없는 긴 발화".repeat(1000));
         let steps = Mutex::new(Vec::new());
-        let summary = block_on(summarize(&small, None, &[], &transcript, |done, known| {
-            steps.lock().unwrap().push((done, known))
-        }));
-        assert_eq!(summary.unwrap(), SUMMARY);
+        let on_step = |done, known| steps.lock().unwrap().push((done, known));
+        let summary = block_on(summarize(&small, None, &[], &transcript, on_step, None));
+        assert_eq!(summary.unwrap().0, SUMMARY);
 
         let requests = stub.requests.lock().unwrap();
         assert!(requests.len() > 3, "{}", requests.len());
@@ -1365,6 +1580,222 @@ pub(crate) mod tests {
                 .ends_with(&format!("(구간 2/{of}에서 실패)"))
         );
         assert!(failure.message().starts_with("LLM 사용 한도"));
+    }
+
+    /// The built-in route (plan 5.3) against the sidecar tests' fake llama-server.
+    mod builtin {
+        use super::*;
+        use crate::sidecar::tests::{asked, fake, fake_llama};
+        use crate::sidecar::{LIMITS, Sidecar};
+        use crate::transcribe::engine::Device;
+
+        struct Ran {
+            result: Result<(String, Timings), Failure>,
+            /// Chat requests the fakes were sent.
+            asked: usize,
+            log: String,
+            prev_log: String,
+            /// `summary_gpu_failed` marks.
+            marked: usize,
+            sidecar: Arc<Sidecar>,
+            _tmp: tempfile::TempDir,
+        }
+
+        /// One summary on the built-in route, its engine started on the GPU as the queue does, the
+        /// server a fake doing `behave`.
+        fn builtin(behave: &str, timeout_secs: u32, lines: &[String]) -> Ran {
+            let tmp = tempfile::tempdir().unwrap();
+            let f = fake(tmp.path(), "supervisor", fake_llama(behave), LIMITS.reap);
+            let sidecar = Arc::new(f.sidecar);
+            let endpoint = sidecar.start(sidecar.generation(), Device::Gpu).unwrap();
+            let connection = LlmConnection {
+                base_url: endpoint.base_url.clone(),
+                timeout_secs,
+                ..crate::settings::builtin()
+            };
+            let key = Some(endpoint.key.clone());
+            let recover = Some(sidecar.on_failure(endpoint));
+            let result = block_on(summarize(&connection, key, &[], lines, |_, _| {}, recover));
+            let log = |name| fs::read_to_string(tmp.path().join("logs").join(name));
+            Ran {
+                result,
+                asked: asked(&tmp.path().join("models")),
+                log: log("llama-server.log").unwrap(),
+                prev_log: log("llama-server.prev.log").unwrap_or_default(),
+                marked: f.marked.load(Ordering::SeqCst),
+                sidecar,
+                _tmp: tmp,
+            }
+        }
+
+        impl Drop for Ran {
+            fn drop(&mut self) {
+                self.sidecar.stop("테스트 끝");
+            }
+        }
+
+        /// The engine's key (the fake refuses any other), and every answer's timings added up.
+        #[test]
+        fn a_summary_is_served_and_its_answers_timings_add_up() {
+            let ran = builtin("ready", 30, &talk(80));
+            let (summary, timings) = ran.result.as_ref().unwrap();
+            assert_eq!(summary, SUMMARY);
+            let n = ran.asked as u64;
+            assert!(n > 1, "parts and a merge: {n}");
+            let each = (120, 300.5, 40, 800.25);
+            assert_eq!(
+                *timings,
+                Timings {
+                    prompt_n: each.0 * n,
+                    prompt_ms: each.1 * n as f64,
+                    predicted_n: each.2 * n,
+                    predicted_ms: each.3 * n as f64,
+                }
+            );
+        }
+
+        #[test]
+        fn a_server_dying_mid_request_comes_back_on_the_same_device_and_is_asked_again() {
+            let ran = builtin("dies-once", 30, &lines(SPEECH));
+            assert_eq!(ran.result.as_ref().unwrap().0, SUMMARY);
+            assert_eq!(ran.asked, 2);
+            // The GPU once more, before any CPU try, and nothing recorded against it.
+            assert!(ran.prev_log.contains("-ngl 99") && ran.log.contains("-ngl 99"));
+            assert!(!ran.log.contains("--device none"));
+            assert_eq!(ran.marked, 0);
+        }
+
+        /// ENG6: a slow server is not asked the same again; its own words, not the cloud's.
+        #[test]
+        fn a_timeout_stops_the_server_and_asks_nothing_again() {
+            let started = Instant::now();
+            let ran = builtin("stalls", 1, &lines(SPEECH));
+            let failure = ran.result.as_ref().unwrap_err();
+            assert_eq!(*failure, Failure::Builtin(sidecar::Failure::Timeout));
+            assert!(failure.message().contains("요청 하나가 30분을 넘었습니다"));
+            assert_eq!(ran.asked, 1);
+            assert!(ran.prev_log.is_empty(), "{}", ran.prev_log);
+            assert!(started.elapsed() < Duration::from_secs(20));
+            let until = Instant::now() + Duration::from_secs(5);
+            while ran.sidecar.running() {
+                assert!(Instant::now() < until, "still running");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// A server that answers with an error is alive: no restart, no second request.
+        #[test]
+        fn an_http_error_is_not_recovered() {
+            let ran = builtin("http-500", 30, &lines(SPEECH));
+            let failure = ran.result.as_ref().unwrap_err();
+            assert_eq!(*failure, Failure::Builtin(sidecar::Failure::Unreadable));
+            assert_eq!(ran.asked, 1);
+            assert!(ran.sidecar.running() && ran.prev_log.is_empty());
+        }
+
+        /// A connection that broke while its server lives on is asked once more on that server:
+        /// no restart, no device change.
+        #[test]
+        fn a_dropped_request_on_a_live_server_is_asked_again_there() {
+            let ran = builtin("drops-once", 30, &lines(SPEECH));
+            assert_eq!(ran.result.as_ref().unwrap().0, SUMMARY);
+            assert_eq!(ran.asked, 2);
+            assert!(ran.prev_log.is_empty(), "{}", ran.prev_log);
+            assert_eq!(ran.marked, 0);
+        }
+
+        /// The one more ask comes back once the server answers: a later broken connection on the
+        /// same live server is asked again there too, not taken for a death.
+        #[test]
+        fn a_server_that_answered_gets_its_one_more_ask_back() {
+            let ran = builtin("drops-1-and-3", 30, &talk(80));
+            assert_eq!(ran.result.as_ref().unwrap().0, SUMMARY);
+            // Dropped, asked again, answered, dropped, asked again, answered (and any more).
+            assert!(ran.asked >= 4, "{}", ran.asked);
+            assert!(ran.prev_log.is_empty(), "{}", ran.prev_log);
+            assert_eq!(ran.marked, 0);
+        }
+
+        /// ENG12: our engine refusing an input over its context is the cut input's failure; other
+        /// HTTP errors stay "could not make a summary".
+        #[test]
+        fn an_input_over_the_engines_context_gets_the_truncated_words() {
+            let ran = builtin("context-400", 30, &lines(SPEECH));
+            let failure = ran.result.as_ref().unwrap_err();
+            assert_eq!(*failure, Failure::Builtin(sidecar::Failure::Truncated));
+            assert!(failure.message().contains("입력을 다 읽지 못했습니다"));
+            assert_eq!(ran.asked, 1);
+            assert!(ran.sidecar.running() && ran.prev_log.is_empty());
+        }
+
+        #[test]
+        fn a_cut_answer_gets_the_length_words() {
+            let ran = builtin("length", 30, &lines(SPEECH));
+            let failure = ran.result.as_ref().unwrap_err();
+            assert_eq!(*failure, Failure::Builtin(sidecar::Failure::Length));
+            assert!(
+                failure
+                    .message()
+                    .starts_with("요약이 길이 제한에서 끊겼습니다")
+            );
+            assert_eq!(ran.asked, 1);
+        }
+
+        /// DX5, ENG12: the budget checks stay on the built-in route with words of its own, and no
+        /// failure there says anything meant for Ollama, LM Studio, context tokens or the internet.
+        #[test]
+        fn no_external_words_reach_the_builtin_route() {
+            // Too long for any request to hold: refused before one is sent.
+            let glossary: Vec<String> = (0..100)
+                .map(|i| format!("{i}번 용어 {}", "가".repeat(150)))
+                .collect();
+            let recover: Recover =
+                Box::new(|_, _| Box::pin(async { Err(sidecar::Failure::Stopped) }));
+            let builtin = crate::settings::builtin();
+            let result = block_on(summarize(
+                &builtin,
+                None,
+                &glossary,
+                &lines(SPEECH),
+                |_, _| {},
+                Some(recover),
+            ));
+            let failure = result.unwrap_err();
+            assert_eq!(failure, Failure::Builtin(sidecar::Failure::GlossaryTooLong));
+            assert!(failure.message().contains("용어집"));
+
+            let external = || {
+                [
+                    Failure::LocalDown,
+                    Failure::TooSmall,
+                    Failure::Truncated,
+                    Failure::Network("connection reset".into()),
+                    Failure::Timeout,
+                ]
+            };
+            let words = external().map(|f| f.message());
+            let all = external().into_iter().chain([
+                Failure::NoKey,
+                Failure::Key(401),
+                Failure::Quota,
+                Failure::Provider("HTTP 500: boom".into()),
+                Failure::Length,
+                Failure::Truncated.at(2, 3),
+            ]);
+            for failure in all {
+                let shown = engine_failure(failure);
+                let message = shown.message();
+                assert!(!words.contains(&message), "{message}");
+                for word in ["Ollama", "LM Studio", "컨텍스트 토큰", "인터넷"] {
+                    assert!(!message.contains(word), "{message}");
+                }
+                let engine = match shown {
+                    Failure::Part { cause, .. } => *cause,
+                    shown => shown,
+                };
+                assert!(matches!(engine, Failure::Builtin(_)), "{engine:?}");
+            }
+        }
     }
 
     // Summary eval (architecture 12.3): `cargo test -- --ignored summary_eval`.
@@ -1565,9 +1996,10 @@ pub(crate) mod tests {
                 &expected.glossary,
                 &lines,
                 |done, known| eprintln!("{name}: 요청 {done}/{known}"),
+                None,
             ));
             match summary {
-                Ok(summary) => {
+                Ok((summary, _)) => {
                     eprintln!("=== {name} ===\n{summary}\n");
                     let failures = check(&summary, &transcript, &expected);
                     if !failures.is_empty() {

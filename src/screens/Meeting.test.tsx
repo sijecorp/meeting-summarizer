@@ -52,6 +52,7 @@ const connection = (name: string): LlmConnection => ({
 
 const settings = (patch: Partial<Settings> = {}): LoadedSettings => ({
   read_only: false,
+  rename: [],
   settings: {
     schema_version: 1,
     recorder_name: "홍길동",
@@ -575,6 +576,8 @@ test("says where the transcript went only when it went somewhere", async () => {
   const cases: [Partial<Meta>, string | null][] = [
     [{}, "회사 클라우드로 보내 요약함"],
     [{ llm_connection: "Ollama", summarize_local: true }, "이 PC에서 Ollama로 요약함"],
+    // The built-in route is this PC itself, never its internal name.
+    [{ llm_connection: "builtin", summarize_local: true }, "이 PC에서 요약함"],
     [{ llm_connection: null }, null],
     [{ no_speech: true }, null],
   ];

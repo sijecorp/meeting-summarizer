@@ -18,6 +18,8 @@ const cloud: LlmConnection = {
   timeout_secs: 300,
 };
 const ollama: LlmConnection = { ...cloud, name: "Ollama", base_url: "http://localhost:11434/v1", is_local: true };
+// `settings::builtin`: the built-in route, its address given at run time.
+const thisPc: LlmConnection = { ...ollama, name: "builtin", base_url: "", context_tokens: 16_384, timeout_secs: 1_800 };
 
 const route = (patch: Partial<SummaryRoute>): SummaryRoute => ({
   connection: cloud,
@@ -34,6 +36,11 @@ test("says where the summary goes, and offers 로컬로 요약 only with a local
     [
       route({ connection: ollama, local: true, local_available: true }),
       "이 PC의 Ollama로 요약합니다. 전사본은 밖으로 나가지 않습니다",
+      true,
+    ],
+    [
+      route({ connection: thisPc, local_available: true }),
+      "이 PC에서 요약합니다. 전사본은 밖으로 나가지 않습니다",
       true,
     ],
     [route({ connection: null }), "LLM 연결이 없어 전사까지만 합니다", false],
@@ -122,6 +129,11 @@ test("once locked: where it is being summarized while summarizing, never the swi
   rerender(<RouteNotice id="b" status="summarizing" />);
   expect(await screen.findByText("이 PC의 Ollama로 요약하고 있습니다")).toBeTruthy();
   expect(screen.queryByRole("switch")).toBeNull();
+
+  current = route({ connection: thisPc, local_available: true, locked: true });
+  rerender(<RouteNotice id="c" status="summarizing" />);
+  expect(await screen.findByText("이 PC에서 요약하고 있습니다")).toBeTruthy();
+  expect(container.textContent).not.toContain("builtin");
 
   rerender(<RouteNotice id="b" status="summarize_failed" />);
   await waitFor(() => expect(container.textContent).toBe(""));

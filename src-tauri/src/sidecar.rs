@@ -29,8 +29,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// The built-in route's context (plan 5.6): llama-server's `-c`, and stage 4's `context_tokens`.
+/// The built-in route's context (plan 5.6): llama-server's `-c`, and its `context_tokens`.
 pub const CONTEXT_TOKENS: u32 = 16_384;
+/// One request's limit on the built-in route (ENG6): a CPU-only PC's last merge can take 15 min.
+pub const TIMEOUT_SECS: u32 = 1_800;
 const LOG: &str = "llama-server.log";
 /// ENG19: the run before, so a GPU's death is still there after the CPU's run starts.
 const PREV_LOG: &str = "llama-server.prev.log";
@@ -106,25 +108,19 @@ pub enum Failure {
     Timeout,
     /// It would not load and the model's hash is wrong; the file is gone for "다시 받기".
     ModelDamaged,
-    // ponytail: stage 4 maps the answers' failures to these four; drop their allows then.
     /// `finish_reason: "length"`.
-    #[allow(dead_code)]
     Length,
-    /// An empty answer, or one that is not a summary.
-    #[allow(dead_code)]
+    /// An empty answer, one that is not a summary, or an HTTP error from our own server.
     Unreadable,
     /// The glossary leaves no room for the transcript (`TooSmall`).
-    #[allow(dead_code)]
     GlossaryTooLong,
     /// The server read less than it was sent (`Truncated`): an engine fault, logged.
-    #[allow(dead_code)]
     Truncated,
 }
 
 const SEE_LOG: &str = "로그: 설정 → 일반 → 로그 폴더 열기";
 
 impl Failure {
-    #[allow(dead_code)] // ponytail: stage 4 shows it.
     pub fn message(&self) -> String {
         match self {
             Failure::Stopped => "요약을 멈췄습니다".into(),
@@ -142,8 +138,9 @@ impl Failure {
             Failure::Length => "요약이 길이 제한에서 끊겼습니다. 다시 실행하거나 다른 연결을 골라 주세요".into(),
             Failure::Unreadable => "이 PC 요약 모델이 요약을 만들지 못했습니다. 다시 실행하거나 다른 연결을 골라 주세요".into(),
             Failure::GlossaryTooLong => "용어집이 너무 길어 이 PC에서 요약할 수 없습니다. 설정 → 전사의 용어집을 줄여 주세요".into(),
+            // The same input fails the same way: never "다시 실행" alone.
             Failure::Truncated => format!(
-                "이 PC 요약 엔진이 입력을 다 읽지 못했습니다. 다시 실행하거나 로그를 확인해 주세요. {SEE_LOG}"
+                "이 PC 요약 엔진이 입력을 다 읽지 못했습니다. 설정 → 전사의 용어집을 줄이거나 다른 연결로 다시 실행해 주세요. {SEE_LOG}"
             ),
         }
     }
@@ -513,6 +510,9 @@ pub struct Endpoint {
     pub key: String,
     generation: u64,
     run: Run,
+    /// This server was asked once more after a request failed while it lived on (`recover`), and
+    /// has not answered since (`on_failure`).
+    asked_again: bool,
 }
 
 impl std::fmt::Debug for Endpoint {
@@ -523,6 +523,7 @@ impl std::fmt::Debug for Endpoint {
             .field("key", &"***")
             .field("generation", &self.generation)
             .field("run", &self.run)
+            .field("asked_again", &self.asked_again)
             .finish()
     }
 }
@@ -573,11 +574,11 @@ enum Up {
 }
 
 /// The engine, one per app (owned by the queue). `start` and `recover` block for as long as a model
-/// loads, so stage 4 calls them from threads that may block: `start` on the queue's process thread
-/// in `summarize()` before `request()` (a plain std thread), `recover` from the async `on_failure`
+/// loads, so the queue calls them from threads that may block: `start` on its process thread in
+/// `summarize()` before `request()` (a plain std thread), `recover` from the async `on_failure`
 /// hook only through `tauri::async_runtime::spawn_blocking`. Never directly in the async task: it
 /// would hold a runtime worker for minutes. `stop` never blocks and is safe under the queue's lock.
-/// One `start` or `recover` at a time: stage 4 holds the queue's builtin lease (plan 5.5) around them.
+/// One `start` or `recover` at a time: the queue's builtin lease (ENG1) is held around them.
 pub struct Sidecar {
     /// This executable (tests: with arguments before `--llm-supervisor`).
     supervisor: Vec<OsString>,
@@ -642,9 +643,12 @@ impl Sidecar {
     /// Closes the server's stdin and leaves its end to a thread: the supervisor gets `reap` to exit,
     /// then its llama-server is killed by pid first, so it is not orphaned, and then it.
     fn retire(&self, state: &mut State, why: &str) {
-        let Some(mut server) = state.server.take() else {
-            return;
-        };
+        if let Some(server) = state.server.take() {
+            self.wind_down(server, why);
+        }
+    }
+
+    fn wind_down(&self, mut server: Server, why: &str) {
         drop(server.stdin.take());
         if lock(&server.seen).end.is_none() {
             log::info!(
@@ -750,20 +754,8 @@ impl Sidecar {
             device,
             since,
         };
-        {
-            // A stop never misses this server: one before this check bumped the generation, and
-            // the server goes here; one after it finds the server in `state` and retires it.
-            let mut state = lock(&self.state);
-            let stopped = state.generation != generation;
-            // One start or restart at a time (the queue's builtin lease): a second one is a bug, and
-            // the server it would orphan is retired, not dropped unreaped.
-            debug_assert!(state.server.is_none(), "two engine starts at once");
-            self.retire(&mut state, "겹친 시작");
-            state.server = Some(server);
-            if stopped {
-                self.retire(&mut state, "띄우는 사이에 끄기");
-                return Up::Stopped;
-            }
+        if !self.adopt(server, generation) {
+            return Up::Stopped;
         }
         log::info!("요약 엔진 시작: {why} ({})", device.name());
         wait_for(self.limits.ready, || {
@@ -799,6 +791,24 @@ impl Sidecar {
         Up::Died(wait_for(self.limits.reap * 2, || lock(&seen).end.clone()).unwrap_or_default())
     }
 
+    /// A server just spawned for `generation` goes in `state`. A stop that came after `generation`
+    /// sends it away at once instead, and leaves alone a server a newer start runs (an aborted
+    /// summary's late `recover`, `on_failure`): false then. A stop never misses this server: one
+    /// before this check bumped the generation, one after it finds the server in `state`.
+    fn adopt(&self, server: Server, generation: u64) -> bool {
+        let mut state = lock(&self.state);
+        if state.generation != generation {
+            self.wind_down(server, "띄우는 사이에 끄기");
+            return false;
+        }
+        // One start or restart at a time (the queue's builtin lease): a second one is a bug, and
+        // the server it would orphan is retired, not dropped unreaped.
+        debug_assert!(state.server.is_none(), "two engine starts at once");
+        self.retire(&mut state, "겹친 시작");
+        state.server = Some(server);
+        true
+    }
+
     /// Servers until one is ready or `Run` gives up.
     fn serve(&self, endpoint: &mut Endpoint, mut why: &str) -> Result<(), Failure> {
         loop {
@@ -806,6 +816,7 @@ impl Sidecar {
             match self.launch(endpoint.generation, device, &endpoint.key, why) {
                 Up::Ready(port) => {
                     endpoint.base_url = format!("http://127.0.0.1:{port}/v1");
+                    endpoint.asked_again = false;
                     // The GPU's own death, and now the CPU works (plan 5.3 (4)).
                     if endpoint.run.ready() {
                         (self.gpu_failed)();
@@ -836,8 +847,6 @@ impl Sidecar {
     }
 }
 
-// ponytail: stage 4's built-in route (summarize) calls these; drop this allow then.
-#[allow(dead_code)]
 impl Sidecar {
     /// Read under the queue's lock together with the job's stop, before `start`: a `stop` after
     /// that is never missed.
@@ -848,7 +857,7 @@ impl Sidecar {
     /// A summary's first server (plan 5.3), on `device` with a new key; a GPU that dies loading
     /// gets one CPU try. `Stopped` once a `stop` came after `generation`, so no server comes up in a
     /// recording that began meanwhile. Blocking, up to `Limits::ready` per server plus winding down
-    /// the one before: stage 4 runs it off the async runtime's workers.
+    /// the one before: the queue runs it off the async runtime's workers.
     pub fn start(&self, generation: u64, device: Device) -> Result<Endpoint, Failure> {
         {
             let mut state = lock(&self.state);
@@ -864,17 +873,19 @@ impl Sidecar {
             key,
             generation,
             run: Run::new(device),
+            asked_again: false,
         };
         self.serve(&mut endpoint, "요약 시작")?;
         Ok(endpoint)
     }
 
-    /// A request to the server failed (ENG3, ENG6). Stage 4 calls it only for transport errors
+    /// A request to the server failed (ENG3, ENG6). `Llm::ask` calls it only for transport errors
     /// (refused, reset, early EOF) and timeouts, never for an HTTP status: a server that answers
     /// with an error is alive and its answer is the failure. A timeout stops the server and nothing
-    /// is asked again; anything else is a death, and the next server comes up on the device `Run`
-    /// picks, with the same key. Returns its address, for the request to be sent again. `Stopped`
-    /// once a `stop` came after the summary's start. Blocking, like `start`.
+    /// is asked again. A server still alive `DYING` after the failure is asked once more; anything
+    /// else is a death, and the next server comes up on the device `Run` picks, with the same key.
+    /// Returns the address to send the request to again. `Stopped` once a `stop` came after the
+    /// summary's start. Blocking, like `start`.
     pub fn recover(&self, endpoint: &mut Endpoint, timed_out: bool) -> Result<String, Failure> {
         let seen = {
             let mut state = lock(&self.state);
@@ -889,11 +900,19 @@ impl Sidecar {
         };
         let end = match seen {
             Some(seen) => {
-                wait_for(DYING, || lock(&seen).end.clone());
+                let died = wait_for(DYING, || lock(&seen).end.clone()).is_some();
                 {
                     let mut state = lock(&self.state);
                     if state.generation != endpoint.generation {
                         return Err(Failure::Stopped);
+                    }
+                    // Alive: maybe only that connection broke. The same server gets the request
+                    // once more; the next failure on it is a death.
+                    if !died && !std::mem::replace(&mut endpoint.asked_again, true) {
+                        log::warn!(
+                            "요약 엔진에 요청이 닿지 않았지만 엔진이 살아 있어 한 번 더 묻습니다"
+                        );
+                        return Ok(endpoint.base_url.clone());
                     }
                     // Dead already, or alive and not serving: stopped either way.
                     self.retire(&mut state, "요청 실패");
@@ -905,6 +924,27 @@ impl Sidecar {
         self.next(&mut endpoint.run, &end, false)?;
         self.serve(endpoint, "요약 중 끝난 엔진 다시")?;
         Ok(endpoint.base_url.clone())
+    }
+
+    /// The summary's `on_failure` hook (plan 5.3, ENG3): `recover` on a blocking thread, so a
+    /// model loading for minutes never holds an async runtime worker. A summary task aborted
+    /// meanwhile leaves it to finish; a `stop` after the start makes that quick, and a server it
+    /// spawns then never displaces the next summary's (`adopt`).
+    /// A server that answered since its last failure gets its one more ask back (`recover`).
+    pub fn on_failure(self: &Arc<Self>, endpoint: Endpoint) -> crate::summarize::Recover {
+        let (sidecar, endpoint) = (self.clone(), Arc::new(Mutex::new(endpoint)));
+        Box::new(move |timed_out, answered| {
+            let (sidecar, endpoint) = (sidecar.clone(), endpoint.clone());
+            Box::pin(async move {
+                let recovered = tauri::async_runtime::spawn_blocking(move || {
+                    let mut endpoint = lock(&endpoint);
+                    endpoint.asked_again &= !answered;
+                    sidecar.recover(&mut endpoint, timed_out)
+                });
+                // A panic in `recover`, or the runtime shutting down: nothing to ask again.
+                recovered.await.unwrap_or(Err(Failure::Stopped))
+            })
+        })
     }
 }
 
@@ -1104,10 +1144,76 @@ pub(crate) mod tests {
         Some(command)
     }
 
+    /// A canned `/v1/chat/completions` answer, `timings` as llama-server sends them.
+    fn completion(finish: &str) -> String {
+        serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": crate::summarize::tests::SUMMARY },
+                "finish_reason": finish,
+            }],
+            "usage": { "prompt_tokens": 100_000, "completion_tokens": 40 },
+            "timings": {
+                "prompt_n": 120, "prompt_ms": 300.5, "prompt_per_second": 399.3,
+                "predicted_n": 40, "predicted_ms": 800.25, "predicted_per_second": 49.9,
+            },
+        })
+        .to_string()
+    }
+
+    /// The fake's answer to a chat request, noted in `ASKED` first.
+    /// `None`: it hangs up without an answer.
+    fn chat(behave: &str, port: u16) -> Option<(&'static str, String)> {
+        let before = fs::read_to_string(ASKED).map_or(0, |s| s.lines().count());
+        let first = before == 0;
+        let mut asked = fs::OpenOptions::new();
+        let mut asked = asked.create(true).append(true).open(ASKED).unwrap();
+        // One write: `writeln!` takes several, and a test that counts this line may kill this
+        // server between them, leaving the next server's line on the same one.
+        let _ = asked.write_all(format!("{behave} {port}\n").as_bytes());
+        Some(match behave {
+            "dies-once" if first => std::process::abort(),
+            "drops-once" if first => return None,
+            "drops-1-and-3" if before == 0 || before == 2 => return None,
+            "stalls" => loop {
+                thread::park();
+            },
+            "stalls-once" if first => loop {
+                thread::park();
+            },
+            "http-500" => ("500 Internal Server Error", r#"{"error":"boom"}"#.into()),
+            // The pinned llama-server's own answer to an input over its `-c`.
+            "context-400" => (
+                "400 Bad Request",
+                serde_json::json!({ "error": {
+                    "code": 400,
+                    "message": "request (20000 tokens) exceeds the available context size (16384 tokens), try increasing it",
+                    "type": "exceed_context_size_error",
+                    "n_prompt_tokens": 20000,
+                    "n_ctx": 16384,
+                }})
+                .to_string(),
+            ),
+            "length" => ("200 OK", completion("length")),
+            _ => ("200 OK", completion("stop")),
+        })
+    }
+
+    /// The chat requests a fake in `models` was sent, one line each: its `behave` and port.
+    pub(crate) fn asked(models: &Path) -> usize {
+        fs::read_to_string(models.join(ASKED)).map_or(0, |s| s.lines().count())
+    }
+
+    /// Where the fake notes its chat requests, in its working folder (the models folder).
+    const ASKED: &str = "asked.log";
+
     /// A fake llama-server, `behave` first among its arguments: `ready` listens and serves
-    /// `/health` with the key from `LLAMA_API_KEY` (never one found in its arguments) and `/die`,
-    /// which aborts; `slow` says it listens after 3 s; `gpu-dies` dies loading unless on the CPU;
-    /// `silent` never says it listens. It names its arguments and its port on stderr.
+    /// `/health` and `/v1/chat/completions` with the key from `LLAMA_API_KEY` (never one found in
+    /// its arguments), and `/die`, which aborts; `slow` says it listens after 3 s; `gpu-dies` dies
+    /// loading unless on the CPU; `silent` never says it listens. Chat requests are noted in
+    /// `ASKED` and answered `completion("stop")`, except: `dies-once` aborts on the first one in
+    /// its folder and `drops-once` hangs up on it (`drops-1-and-3` on the first and the third), `stalls` never answers and `stalls-once` not the
+    /// first one, `http-500` answers 500, `context-400` refuses an input over its context and
+    /// `length` stops at the length limit. It names its arguments and its port on stderr.
     #[test]
     #[ignore = "run by the sidecar tests as a fake llama-server"]
     fn fake_server() {
@@ -1135,29 +1241,56 @@ pub(crate) mod tests {
         eprintln!("srv          main: listening on http://127.0.0.1:{port}");
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
-            let mut head = Vec::new();
-            let mut buf = [0; 1024];
-            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-                match stream.read(&mut buf) {
-                    Ok(n) if n > 0 => head.extend_from_slice(&buf[..n]),
-                    _ => break,
+            let mut data = Vec::new();
+            let mut buf = [0; 4096];
+            let read = |data: &mut Vec<u8>, stream: &mut TcpStream, buf: &mut [u8]| {
+                match stream.read(buf) {
+                    Ok(n) if n > 0 => data.extend_from_slice(&buf[..n]),
+                    _ => return false,
+                }
+                true
+            };
+            let head_end = loop {
+                if let Some(at) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break at + 4;
+                }
+                if !read(&mut data, &mut stream, &mut buf) {
+                    break data.len();
+                }
+            };
+            // reqwest sends header names in lowercase.
+            let head = String::from_utf8_lossy(&data[..head_end]).to_ascii_lowercase();
+            let length = head.lines().find_map(|l| {
+                let value = l.strip_prefix("content-length:")?;
+                value.trim().parse::<usize>().ok()
+            });
+            while data.len() < head_end + length.unwrap_or(0) {
+                if !read(&mut data, &mut stream, &mut buf) {
+                    break;
                 }
             }
-            let head = String::from_utf8_lossy(&head);
-            if head.starts_with("GET /die") {
+            if head.starts_with("get /die") {
                 std::process::abort();
             }
             let ours = !key.is_empty()
-                && head.contains(&format!("Authorization: Bearer {key}"))
+                && head.contains(&format!("authorization: bearer {key}"))
                 && !args.iter().any(|a| a.contains(&key));
-            let status = if head.starts_with("GET /health") && ours {
-                "200 OK"
+            let (status, body) = if !ours {
+                ("401 Unauthorized", String::new())
+            } else if head.starts_with("get /health") {
+                ("200 OK", String::new())
+            } else if head.starts_with("post /v1/chat/completions") {
+                let Some(answer) = chat(behave, port) else {
+                    continue;
+                };
+                answer
             } else {
-                "401 Unauthorized"
+                ("404 Not Found", String::new())
             };
             let _ = write!(
                 stream,
-                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
             );
         }
     }
@@ -1418,6 +1551,13 @@ pub(crate) mod tests {
                 .starts_with("요약이 길이 제한에서 끊겼습니다")
         );
         assert!(Failure::GlossaryTooLong.message().contains("용어집"));
+        // Deterministic: the same input fails again, so another way out, not a plain retry.
+        let truncated = Failure::Truncated.message();
+        assert!(
+            truncated.contains("용어집을 줄이거나 다른 연결로 다시 실행")
+                && truncated.ends_with(SEE_LOG),
+            "{truncated}"
+        );
     }
 
     // The lifecycle with processes: this test binary as the supervisor and as llama-server.
@@ -1683,5 +1823,39 @@ pub(crate) mod tests {
                 .then_some(()))
             .is_some()
         );
+    }
+
+    /// ENG3: an aborted summary's late `recover` whose spawn returns after the next summary's start
+    /// sends only its own server away; the newer one serves on. (Before `adopt` it also retired the
+    /// live one, and tripped the double-start assertion.) The interleaving is played by handing
+    /// `adopt` such a server, as `launch` does once its spawn returns.
+    #[test]
+    fn a_server_spawned_for_a_stopped_generation_never_displaces_a_newer_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = fake(tmp.path(), "supervisor", fake_llama("ready"), LIMITS.reap);
+        let stale = f.sidecar.generation();
+        f.sidecar.stop("녹음 시작");
+        let live = f
+            .sidecar
+            .start(f.sidecar.generation(), Device::Gpu)
+            .unwrap();
+        let pid = f.pid();
+
+        let mut supervisor = f.sidecar.command(Device::Gpu, "stale-key").spawn().unwrap();
+        let late = Server {
+            stdin: supervisor.stdin.take(),
+            supervisor,
+            seen: Arc::default(),
+            device: Device::Gpu,
+            since: Instant::now(),
+        };
+        assert!(!f.sidecar.adopt(late, stale));
+        assert_eq!(f.pid(), pid);
+        let health = get(port(&live.base_url), "/health", &live.key).unwrap();
+        assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+        let late_gone = || (f.sidecar.stopping.load(Ordering::SeqCst) == 0).then_some(());
+        assert!(wait_for(Duration::from_secs(10), late_gone).is_some());
+        f.sidecar.stop("테스트");
+        assert!(gone(port(&live.base_url)));
     }
 }

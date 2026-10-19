@@ -35,6 +35,8 @@ import {
 } from "@/components/ui/dropdown-menu";
 import {
   archiveMeeting,
+  BUILTIN,
+  connectionLabel,
   exportMarkdown,
   getMeeting,
   getSettings,
@@ -513,7 +515,14 @@ export default function Meeting({
         startOf(meta.created_at),
         meta.duration_ms > 0 && lengthText(meta.duration_ms),
         settings?.recorder_name && `녹음 ${settings.recorder_name}`,
-        c && reviewable && !meta.no_speech && (meta.summarize_local ? `이 PC에서 ${c}${ro(c)} 요약함` : `${c}${ro(c)} 보내 요약함`),
+        c &&
+          reviewable &&
+          !meta.no_speech &&
+          (c === BUILTIN
+            ? `${connectionLabel(c)}에서 요약함`
+            : meta.summarize_local
+              ? `이 PC에서 ${c}${ro(c)} 요약함`
+              : `${c}${ro(c)} 보내 요약함`),
         meta.status === "sent" && meta.sent && (
           <>
             <Check aria-hidden className="size-3.5 text-ok-line" />

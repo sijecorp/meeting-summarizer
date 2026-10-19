@@ -17,6 +17,8 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import {
+  BUILTIN,
+  connectionLabel,
   deleteMeeting,
   SCHEMA_VERSION,
   setSummarizeLocal,
@@ -327,15 +329,17 @@ export function RouteNotice({ id, status, center }: { id: string; status?: Statu
 
   if (!route) return error ? <Banner kind="error">{error}</Banner> : null;
   const c = route.connection;
+  // The built-in route is this PC itself: "이 PC에서", not "이 PC의 이 PC로".
+  const local = c && (c.name === BUILTIN ? `${connectionLabel(c.name)}에서` : `이 PC의 ${c.name}${ro(c.name)}`);
   const text = route.locked
     ? status === "summarizing" && c
       ? c.is_local
-        ? `이 PC의 ${c.name}${ro(c.name)} 요약하고 있습니다`
+        ? `${local} 요약하고 있습니다`
         : `전사본을 ${c.name}(${host(c.base_url)})${ro(c.name)} 보내 요약하고 있습니다`
       : ""
     : c
       ? c.is_local
-        ? `이 PC의 ${c.name}${ro(c.name)} 요약합니다. 전사본은 밖으로 나가지 않습니다`
+        ? `${local} 요약합니다. 전사본은 밖으로 나가지 않습니다`
         : `요약할 때 전사본이 ${c.name}(${host(c.base_url)})${ro(c.name)} 전송됩니다`
       : route.local
         ? "로컬 LLM 연결이 없습니다"

@@ -7,6 +7,29 @@ use std::sync::Mutex;
 
 const KEYRING_SERVICE: &str = "com.sije.meeting-summarizer";
 const GLOSSARY_MAX: usize = 100;
+/// The built-in route's connection name (plan 5.4): `meta.llm_connection` and `list_connections`,
+/// never a saved connection's. The screens call it `BUILTIN_LABEL`, which no saved one may use
+/// either (d6).
+pub const BUILTIN: &str = "builtin";
+pub const BUILTIN_LABEL: &str = "이 PC";
+
+/// A name only the built-in route may have (d6). A saved connection named so is left out of every
+/// route until renamed; there is no migration.
+pub fn reserved(name: &str) -> bool {
+    matches!(name.trim(), BUILTIN | BUILTIN_LABEL)
+}
+
+/// The built-in route as a connection (plan 5.4, 5.6): the sidecar gives its address at run time.
+pub fn builtin() -> LlmConnection {
+    LlmConnection {
+        name: BUILTIN.into(),
+        base_url: String::new(),
+        model: crate::transcribe::model::SUMMARY.file.into(),
+        context_tokens: crate::sidecar::CONTEXT_TOKENS,
+        is_local: true,
+        timeout_secs: crate::sidecar::TIMEOUT_SECS,
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -82,6 +105,25 @@ impl Default for Settings {
     }
 }
 
+impl Settings {
+    /// Every connection a summary can take (plan 5.4): the saved ones less any with a reserved
+    /// name, then the built-in one. `llm_connections` (and so `get_settings`/`save_settings`) never
+    /// holds it: the settings screen would save it back and every save would be refused.
+    pub fn connections(&self) -> Vec<LlmConnection> {
+        let saved = self.llm_connections.iter().filter(|c| !reserved(&c.name));
+        saved.cloned().chain([builtin()]).collect()
+    }
+
+    /// The saved connection `default_llm` names. `None` is the built-in route (plan 5.4): no
+    /// default, a name no saved connection has, or a reserved one. The route and the model
+    /// download's scope both ask this one.
+    pub fn default_connection(&self) -> Option<&LlmConnection> {
+        let name = self.default_llm.as_deref()?;
+        let named = |c: &&LlmConnection| c.name == name && !reserved(&c.name);
+        self.llm_connections.iter().find(named)
+    }
+}
+
 fn fill_timeouts(settings: &mut Settings) {
     for c in &mut settings.llm_connections {
         if c.timeout_secs == 0 {
@@ -121,6 +163,21 @@ pub struct LoadedSettings {
     pub settings: Settings,
     /// settings.json came from a newer app: show it, refuse to save (STO-05).
     pub read_only: bool,
+    /// Saved connections with a reserved name (d6): out of every route, and 저장 refuses them
+    /// until they are renamed. The settings screen asks for that (stage 6).
+    pub rename: Vec<String>,
+}
+
+impl LoadedSettings {
+    fn new(settings: Settings, read_only: bool) -> Self {
+        let rename = settings.llm_connections.iter().map(|c| &c.name);
+        let rename = rename.filter(|n| reserved(n)).cloned().collect();
+        Self {
+            settings,
+            read_only,
+            rename,
+        }
+    }
 }
 
 pub struct SettingsStore {
@@ -140,10 +197,7 @@ impl SettingsStore {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(LoadedSettings {
-                    settings: Settings::default(),
-                    read_only: false,
-                });
+                return Ok(LoadedSettings::new(Settings::default(), false));
             }
             Err(e) => return Err(format!("settings.json을 읽을 수 없습니다: {e}")),
         };
@@ -155,17 +209,11 @@ impl SettingsStore {
         let parsed = serde_json::from_value::<Settings>(value);
         if version > SCHEMA_VERSION.into() {
             // Newer fields may not fit this version's types; fall back to defaults, still read-only.
-            return Ok(LoadedSettings {
-                settings: parsed.unwrap_or_default(),
-                read_only: true,
-            });
+            return Ok(LoadedSettings::new(parsed.unwrap_or_default(), true));
         }
         let mut settings = parsed.map_err(|e| format!("settings.json이 손상됐습니다: {e}"))?;
         fill_timeouts(&mut settings);
-        Ok(LoadedSettings {
-            settings,
-            read_only: false,
-        })
+        Ok(LoadedSettings::new(settings, false))
     }
 
     pub fn save(&self, mut settings: Settings) -> Result<(), String> {
@@ -179,6 +227,18 @@ impl SettingsStore {
             .is_some_and(|v| v > SCHEMA_VERSION.into())
         {
             return Err(NEWER_VERSION.to_string());
+        }
+        // d6: here and not in `validate`, so the app's own writes (`patch`) still work while a
+        // connection saved before the update keeps such a name.
+        if let Some(c) = settings.llm_connections.iter().find(|c| reserved(&c.name)) {
+            return Err(format!(
+                "'{}'은(는) 이 PC 요약이 쓰는 이름이라 연결 이름으로 쓸 수 없습니다. 이름을 바꿔 주세요",
+                c.name.trim()
+            ));
+        }
+        // One spelling for the built-in default: `builtin`, or a name nothing has, is stored `None`.
+        if settings.default_connection().is_none() {
+            settings.default_llm = None;
         }
         // `gpu_failed` belongs to the queue (architecture 5.4) and `summary_gpu_failed` to the
         // sidecar: a save from the settings screen keeps the stored values, and switching the
@@ -501,6 +561,62 @@ mod tests {
         let loaded = store.load().unwrap().settings;
         assert_eq!(loaded.last_channel.as_deref(), Some("#회의록"));
         assert_eq!(loaded.recorder_name, "홍길동");
+    }
+
+    /// d6: the built-in route's names are refused on save; one saved before the update stays in
+    /// the file, is flagged for renaming, never hides the built-in route, and the app's own writes
+    /// go on.
+    #[test]
+    fn reserved_names_are_refused_and_never_shadow_the_builtin_route() {
+        let (_tmp, store) = store();
+        for name in ["builtin", "이 PC", " 이 PC "] {
+            let settings = Settings {
+                llm_connections: vec![connection(name, false)],
+                ..Settings::default()
+            };
+            let err = store.save(settings).unwrap_err();
+            assert!(err.contains("이름을 바꿔 주세요"), "{err}");
+        }
+        assert!(!store.path.exists());
+
+        let file = r#"{"schema_version": 1, "llm_connections": [
+            {"name": "builtin", "base_url": "https://api.example.com/v1", "model": "m", "context_tokens": 8000, "is_local": false},
+            {"name": "내 Ollama", "base_url": "http://localhost:11434/v1", "model": "m", "context_tokens": 8000, "is_local": true}]}"#;
+        fs::write(&store.path, file).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.rename, ["builtin"]);
+        store.mark_gpu_failed().unwrap();
+        let connections = store.load().unwrap().settings.connections();
+        let names: Vec<_> = connections.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["내 Ollama", "builtin"]);
+        let builtin = &connections[1];
+        assert!(builtin.is_local && builtin.base_url.is_empty());
+        // ENG6, plan 5.6: the built-in route's limits are the plan's, not a saved connection's.
+        assert_eq!(
+            (builtin.timeout_secs, builtin.context_tokens),
+            (1_800, 16_384)
+        );
+    }
+
+    /// Plan 5.4: one spelling for "this PC is the default": no name, `builtin`, a name nothing
+    /// has, all stored `None`; a saved connection's name stays.
+    #[test]
+    fn a_default_that_names_no_saved_connection_is_stored_as_none() {
+        let (_tmp, store) = store();
+        let with = |default: &str| Settings {
+            llm_connections: vec![connection("내 Ollama", true)],
+            default_llm: Some(default.into()),
+            ..Settings::default()
+        };
+        for builtin in ["builtin", "지운 연결"] {
+            assert_eq!(with(builtin).default_connection(), None);
+            store.save(with(builtin)).unwrap();
+            assert_eq!(store.load().unwrap().settings.default_llm, None);
+        }
+        store.save(with("내 Ollama")).unwrap();
+        let saved = store.load().unwrap().settings;
+        assert_eq!(saved.default_llm.as_deref(), Some("내 Ollama"));
+        assert_eq!(saved.default_connection().map(|c| c.is_local), Some(true));
     }
 
     #[test]

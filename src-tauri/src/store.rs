@@ -72,6 +72,20 @@ pub struct Meta {
     pub error: Option<String>,
     #[serde(default)]
     pub sent: Option<Sent>,
+    /// Why a meeting with a transcript waits in `transcribed` or `paused` instead of summarizing
+    /// (plan 5.4). Written by the queue, gone once its summary starts or its connection is changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<Wait>,
+}
+
+/// Plan 5.4, ENG15: the meeting's route does not resolve yet.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Wait {
+    /// The built-in route needs the summary model. Whether it is downloading is `model_status`'s.
+    SummaryModel,
+    /// The connection it was pinned to is gone. It is never sent elsewhere unasked.
+    ConnectionDeleted,
 }
 
 impl Meta {
@@ -303,6 +317,7 @@ impl Store {
             no_speech: false,
             error: None,
             sent: None,
+            wait: None,
         };
         // create_dir (not _all) fails on an id collision instead of reusing a folder.
         fs::create_dir(self.dir_for(&id)?).map_err(|e| format!("회의 폴더 생성 실패: {e}"))?;
@@ -417,14 +432,23 @@ impl Store {
         })
     }
 
-    /// SUM-06 "요약 다시 실행" with the connection the recorder picked. The caller queues it.
+    /// SUM-06 "요약 다시 실행" with the connection the recorder picked, and ENG15's change of
+    /// connection for a meeting waiting with its transcript (`transcribed`, or `paused` after it).
+    /// The caller queues it.
     pub fn retry_summary(&self, id: &str, connection: &LlmConnection) -> Result<Meta, String> {
+        let transcript = self.dir_for(id)?.join("transcript.json");
         self.update(id, |meta| {
-            if meta.status != Status::SummarizeFailed {
-                return Err("요약에 실패한 회의가 아닙니다".into());
+            let waiting = match meta.status {
+                Status::SummarizeFailed | Status::Transcribed => true,
+                Status::Paused => transcript.exists(),
+                _ => false,
+            };
+            if !waiting {
+                return Err("요약을 기다리거나 요약에 실패한 회의가 아닙니다".into());
             }
             meta.llm_connection = Some(connection.name.clone());
             meta.summarize_local = connection.is_local;
+            meta.wait = None;
             Ok(())
         })
     }
@@ -936,6 +960,27 @@ mod tests {
         );
         let review = put(&store, Review).id;
         assert!(store.retry_summary(&review, &local).is_err());
+
+        // ENG15: a meeting waiting with its transcript takes another connection, and the reason
+        // it waited goes.
+        let waiting = Meta {
+            wait: Some(Wait::ConnectionDeleted),
+            llm_connection: Some("지운 연결".into()),
+            ..put(&store, Transcribed)
+        };
+        store.write(&waiting).unwrap();
+        let meta = store.retry_summary(&waiting.id, &local).unwrap();
+        assert_eq!(
+            (meta.llm_connection.as_deref(), meta.wait),
+            (Some("내 Ollama"), None)
+        );
+        // `paused` only once it has a transcript: before that it still needs transcribing.
+        let paused = put(&store, Paused).id;
+        assert!(store.retry_summary(&paused, &local).is_err());
+        fs::write(store.dir.join(&paused).join("transcript.json"), "{}").unwrap();
+        assert!(store.retry_summary(&paused, &local).is_ok());
+        let recorded = put(&store, Recorded).id;
+        assert!(store.retry_summary(&recorded, &local).is_err());
     }
 
     #[test]

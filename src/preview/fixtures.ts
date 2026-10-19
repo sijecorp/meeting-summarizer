@@ -3,8 +3,11 @@ import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import type * as ipc from "@/lib/ipc";
 import {
+  BUILTIN,
+  connectionLabel,
   SCHEMA_VERSION,
   type AudioDevices,
+  type ConnectionItem,
   type Level,
   type LlmConnection,
   type MeetingItem,
@@ -243,11 +246,12 @@ function modelState(installed: boolean, received = 0): ModelState {
   };
 }
 
-/** Like `scoped` in commands.rs: `all` has the summary model while the built-in LLM is the default. */
+/** Like `scoped` in commands.rs: `all` has the summary model while the built-in LLM is the default
+ * (`defaultConnection`). */
 function scoped(scope: unknown) {
   const [whisper, vad, summary] = models.files;
   if (scope === "summary") return [summary];
-  return scope === "transcription" || settings.default_llm !== null ? [whisper, vad] : [whisper, vad, summary];
+  return scope === "transcription" || defaultConnection() ? [whisper, vad] : [whisper, vad, summary];
 }
 
 /** `downloading`: the running download still has the file to fetch. */
@@ -499,14 +503,63 @@ const summaryStarted = (meta: Meta) =>
     meta.status,
   );
 
+/** Names only the built-in route may have (d6, `settings::reserved`). */
+const reserved = (name: string) => [BUILTIN, "이 PC"].includes(name.trim());
+
+/** The built-in route as `Settings::connections` has it (settings.rs `builtin`). */
+const BUILTIN_CONNECTION: LlmConnection = {
+  name: BUILTIN,
+  base_url: "",
+  model: SUMMARY_MODEL.file,
+  context_tokens: 16_384,
+  is_local: true,
+  timeout_secs: 1_800,
+};
+
+/** `Settings::default_connection`: `undefined` is the built-in route. */
+const defaultConnection = () =>
+  settings.llm_connections.find((c) => c.name === settings.default_llm && !reserved(c.name));
+
+/** The summary model is in: the built-in route can summarize. */
+const builtinReady = () => models.files.some((f) => f.file === SUMMARY_MODEL.file && f.installed);
+
+/** `summarize::route`: the pin; for "로컬로 요약" a local default, else this PC once its model is
+ * in, else the first saved local one; else the default, this PC when none is saved. No route (a
+ * pin that is gone, this PC without its model) is `null`: the meeting waits. */
 function route(meta: Meta): LlmConnection | null {
-  const all = settings.llm_connections;
-  const named = (name: string | null) => all.find((c) => c.name === name);
-  if (meta.llm_connection) return named(meta.llm_connection) ?? null;
-  const fallback = named(settings.default_llm);
-  if (meta.summarize_local) return (fallback?.is_local ? fallback : all.find((c) => c.is_local)) ?? null;
-  return fallback ?? all[0] ?? null;
+  const all = [...settings.llm_connections.filter((c) => !reserved(c.name)), BUILTIN_CONNECTION];
+  const usable = (c?: LlmConnection) => (c && (c.name !== BUILTIN || builtinReady()) ? c : undefined);
+  if (meta.llm_connection) return usable(all.find((c) => c.name === meta.llm_connection)) ?? null;
+  const fallback = defaultConnection() ?? BUILTIN_CONNECTION;
+  if (meta.summarize_local)
+    return (
+      usable(fallback.is_local ? fallback : undefined) ??
+      usable(BUILTIN_CONNECTION) ??
+      all.find((c) => c.is_local && c.name !== BUILTIN) ??
+      null
+    );
+  return usable(fallback) ?? null;
 }
+
+/** `Settings::connections` as `list_connections` gives it. */
+const connections = (): ConnectionItem[] => [
+  ...settings.llm_connections
+    .filter((c) => !reserved(c.name))
+    .map((c) => ({
+      name: c.name,
+      label: c.name,
+      host: URL.canParse(c.base_url) ? new URL(c.base_url).host : c.base_url,
+      is_local: c.is_local,
+      builtin: false,
+    })),
+  { name: BUILTIN, label: connectionLabel(BUILTIN), host: "", is_local: true, builtin: true },
+];
+
+const loaded = () => ({
+  settings: clone(settings),
+  read_only: false,
+  rename: settings.llm_connections.map((c) => c.name).filter(reserved),
+});
 
 function summaryRoute(meta: Meta): SummaryRoute {
   const sentNothing =
@@ -514,7 +567,7 @@ function summaryRoute(meta: Meta): SummaryRoute {
   return {
     connection: sentNothing ? null : route(meta),
     local: meta.summarize_local,
-    local_available: settings.llm_connections.some((c) => c.is_local),
+    local_available: builtinReady() || settings.llm_connections.some((c) => c.is_local && !reserved(c.name)),
     locked: summaryStarted(meta),
   };
 }
@@ -587,6 +640,7 @@ type Commands = {
   save_summary: typeof ipc.saveSummary;
   archive_meeting: typeof ipc.archiveMeeting;
   retry_summary: typeof ipc.retrySummary;
+  list_connections: typeof ipc.listConnections;
   export_markdown: typeof ipc.exportMarkdown;
   slack_length: typeof ipc.slackLength;
   send_to_slack: typeof ipc.sendToSlack;
@@ -610,13 +664,13 @@ type Handlers = {
 };
 
 const handlers: Handlers = {
-  get_settings: () => ({ settings: clone(settings), read_only: false }),
+  get_settings: loaded,
   save_settings: (a) => {
     settings = clone(a.value as Settings);
   },
   reset_settings: () => {
     settings = fullSettings();
-    return { settings: clone(settings), read_only: false };
+    return loaded();
   },
   set_secret: (a) => {
     secrets.add(`${a.kind}:${a.name}`);
@@ -683,7 +737,7 @@ const handlers: Handlers = {
   summary_route: (a) => summaryRoute(find(a.id).meta),
   set_summarize_local: (a) => {
     const m = find(a.id);
-    if (a.local && !settings.llm_connections.some((c) => c.is_local)) throw "로컬 LLM 연결이 없습니다";
+    if (a.local && !summaryRoute(m.meta).local_available) throw "로컬 LLM 연결이 없습니다";
     if (summaryStarted(m.meta)) throw "요약이 이미 시작돼 바꿀 수 없습니다";
     m.meta.summarize_local = a.local as boolean;
     return summaryRoute(m.meta);
@@ -702,13 +756,17 @@ const handlers: Handlers = {
   },
   retry_summary: (a) => {
     const m = find(a.id);
-    const connection = settings.llm_connections.find((c) => c.name === a.connection);
+    const saved = settings.llm_connections.filter((c) => !reserved(c.name));
+    const connection = [...saved, BUILTIN_CONNECTION].find((c) => c.name === a.connection);
     if (m.meta.status !== "summarize_failed") throw "요약에 실패한 회의가 아닙니다";
-    if (!connection) throw `LLM 연결 '${a.connection}'을(를) 찾을 수 없습니다`;
+    if (!connection) throw `LLM 연결 '${a.connection}'을(를) 찾을 수 없습니다. 다른 연결을 골라 주세요`;
+    if (connection.name === BUILTIN && !builtinReady())
+      throw "이 PC 요약 모델이 아직 없습니다. 설정 → 요약(LLM)에서 요약 모델을 먼저 받아 주세요";
     Object.assign(m.meta, { llm_connection: connection.name, summarize_local: connection.is_local });
     enqueue(m);
     return clone(m.meta);
   },
+  list_connections: connections,
   export_markdown: (a) => `/Users/hong/Documents/${find(a.id).meta.title || a.id}.md`,
 
   slack_length: (a) => {

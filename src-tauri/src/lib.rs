@@ -380,6 +380,7 @@ pub fn run() {
             commands::save_summary,
             commands::archive_meeting,
             commands::retry_summary,
+            commands::list_connections,
             commands::export_markdown,
             commands::slack_length,
             commands::send_to_slack,

@@ -56,7 +56,15 @@ export type Meta = {
   no_speech: boolean;
   error: string | null;
   sent: { channel: string; at: string; edit_count: number } | null;
+  /** Why a meeting with its transcript waits in `transcribed` or `paused` instead of summarizing
+   * (plan 5.4). Absent once its summary starts or its connection is changed. */
+  wait?: Wait;
 };
+
+/** `summary_model`: the built-in route needs the summary model (`modelStatus("summary")` tells
+ * whether it is downloading). `connection_deleted`: the connection it was pinned to is gone; it is
+ * never sent elsewhere unasked (`retrySummary` picks another). */
+export type Wait = "summary_model" | "connection_deleted";
 
 /** A listed meeting. `interrupted`: left in `recording` by a crash, offered as 처리 계속 / 삭제 (STO-03). */
 export type MeetingItem = Meta & { interrupted: boolean };
@@ -95,7 +103,20 @@ export type Settings = {
   glossary: string[];
 };
 
-export type LoadedSettings = { settings: Settings; read_only: boolean };
+/** `rename`: saved connections whose name the built-in route reserves (`builtin`, "이 PC"): out of
+ * every route, and `saveSettings` refuses them until they are renamed. */
+export type LoadedSettings = { settings: Settings; read_only: boolean; rename: string[] };
+
+/** The built-in route's connection name, in `Meta.llm_connection` and `listConnections`. */
+export const BUILTIN = "builtin";
+/** A connection's name as the screens show it: "이 PC" for the built-in route, never `builtin`. */
+export const connectionLabel = (name: string) => (name === BUILTIN ? "이 PC" : name);
+
+/** A connection a screen may offer (plan 5.4): the saved ones, then the built-in route, labelled
+ * "이 PC". `host`: where it sends a transcript (SUM-07), empty for the built-in route. No secret. */
+export type ConnectionItem = { name: string; label: string; host: string; is_local: boolean; builtin: boolean };
+/** `getSettings` never holds the built-in route; screens that pick a connection read this. */
+export const listConnections = () => invoke<ConnectionItem[]>("list_connections");
 
 export type SecretKind = "llm" | "slack";
 
@@ -163,7 +184,8 @@ export const saveSummary = (id: string, title: string, body: string) =>
   invoke<Meta>("save_summary", { id, title, body });
 /** REV-03 "전송 안 함": `review` → `archived`. */
 export const archiveMeeting = (id: string) => invoke<Meta>("archive_meeting", { id });
-/** SUM-06 "요약 다시 실행" after `summarize_failed`, with the connection picked by name: queues it. */
+/** SUM-06 "요약 다시 실행" after `summarize_failed`, or another connection for a meeting waiting
+ * with its transcript (`transcribed`, `paused`), picked by `listConnections` name: queues it. */
 export const retrySummary = (id: string, connection: string) =>
   invoke<Meta>("retry_summary", { id, connection });
 /** REV-05: summary and transcript as one `.md` file, through a save dialog. The saved path, or null
