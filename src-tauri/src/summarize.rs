@@ -17,7 +17,7 @@ use std::time::Duration;
 
 /// Architecture 6.1. The whole answer has the connection's `timeout_secs`.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// The answer room of a partial summary, and the most a final summary gets (6.3).
+/// The answer room of a partial summary (`part_tokens`), and the most a final summary gets (6.3).
 const PART_TOKENS: u64 = 1500;
 const FINAL_TOKENS: u64 = 4000;
 /// What a reasoning model may spend thinking. It counts against `max_completion_tokens`, so the
@@ -34,7 +34,7 @@ const SYSTEM: &str = "\
 너는 회의록 작성자다. 한국어 회의 전사본을 읽고, 회의에 없던 사람이 읽을 요약을 쓴다.
 출력은 아래 Markdown 형식만 쓴다.
 
-# {회의 제목: 20자 이내}
+# {회의 제목: 날짜 없이 20자 이내}
 ## 결정사항
 - ...
 ## 액션 아이템
@@ -45,9 +45,11 @@ const SYSTEM: &str = "\
 - ...
 
 규칙:
+- 한국어로만 쓰고 한자나 다른 언어를 섞지 않는다. 이름, 제품명, 영어 용어는 전사본이나 용어집 표기대로 쓴다.
 - 전사본에는 말한 사람 표시가 없다. 전사본에 명시되지 않은 담당자나 기한은 \"미정\"으로 쓴다. 추정하지 않는다.
+- 날짜는 회의에서 말한 표현만 쓰고, 회의에서 말하지 않은 연도는 붙이지 않는다.
 - 해당 내용이 없는 섹션은 \"- 없음\"으로 쓴다.
-- 결정사항에는 회의에서 정한 것만 쓴다. 기각된 제안과 \"~하지 않기로\" 한 것은 결정사항이 아니다. 필요하면 주요 논의에 쓴다.
+- 결정사항에는 합의한 결과만 쓴다. 기각되거나 미룬 제안과 \"~하지 않기로\" 한 것은 결정사항에 쓰지 않는다. 기각된 것과 \"~하지 않기로\" 한 것은 필요하면 주요 논의에, 미룬 것과 결론이 나지 않은 것은 미해결 질문에 쓴다.
 - 회의 중에 결정이 바뀌었으면 마지막 상태만 결정사항에 쓴다.
 - 전사 오류로 보이는 단어는 문맥상 확실할 때만 고친다.";
 
@@ -619,6 +621,13 @@ fn engine_failure(failure: Failure) -> Failure {
     })
 }
 
+/// A partial summary's answer room: `PART_TOKENS`, or a third of the budget when that is less, so a
+/// 4,096-token context still holds the prompt, a glossary and a partial summary to merge. From a
+/// 5,000-token context up it is `PART_TOKENS`.
+fn part_tokens(budget: u64) -> u64 {
+    PART_TOKENS.min(budget / 3)
+}
+
 async fn parts(
     llm: &mut Llm<'_>,
     glossary: &[String],
@@ -631,6 +640,7 @@ async fn parts(
     }
     let context = u64::from(llm.connection.context_tokens);
     let budget = context * 9 / 10;
+    let part = part_tokens(budget);
     let input = |user: &str| tokens(chars(&system) + chars(user));
     let within = |user: &str| input(user) <= context * 6 / 10;
     let last = |user: &str| FINAL_TOKENS.min(budget.saturating_sub(input(user)));
@@ -648,9 +658,9 @@ async fn parts(
         on_step(1, 1);
         return Ok(summary);
     }
-    let (part_room, merge_room) = (room(PART, PART_TOKENS), room(MERGE, PART_TOKENS));
+    let (part_room, merge_room) = (room(PART, part), room(MERGE, part));
     // A request must hold one partial summary at its full length, or merging can never fit.
-    if merge_room < PART_TOKENS as usize {
+    if merge_room < part as usize {
         return Err(Failure::TooSmall);
     }
     let pieces = lines.iter().flat_map(|l| cut(l, part_room)).collect();
@@ -661,8 +671,8 @@ async fn parts(
     let (mut done, mut known) = (0, parts.len() as u32 + 1);
     on_step(done, known);
     let mut summaries = Vec::new();
-    for (i, part) in parts.iter().enumerate() {
-        let summary = llm.ask(&system, &message(PART, part), PART_TOKENS).await;
+    for (i, piece) in parts.iter().enumerate() {
+        let summary = llm.ask(&system, &message(PART, piece), part).await;
         summaries.push(summary.map_err(|e| e.at(i + 1, parts.len()))?);
         done += 1;
         on_step(done, known);
@@ -671,7 +681,7 @@ async fn parts(
         let merged = message(MERGE, &summaries.join(SEPARATOR));
         // Within 60%, or one request holds them all: another pass would only hand the final
         // merge a single summary of them.
-        if within(&merged) || input(&merged) + PART_TOKENS <= budget {
+        if within(&merged) || input(&merged) + part <= budget {
             let summary = llm.ask(&system, &merged, last(&merged)).await?;
             on_step(known, known);
             return Ok(summary);
@@ -695,7 +705,7 @@ async fn parts(
             }
             n += 1;
             let merged = message(MERGE, &group.join(SEPARATOR));
-            let summary = llm.ask(&system, &merged, PART_TOKENS).await;
+            let summary = llm.ask(&system, &merged, part).await;
             summaries.push(summary.map_err(|e| e.at(n, merging))?);
             done += 1;
             on_step(done, known);
@@ -890,7 +900,7 @@ pub(crate) mod tests {
         let requests = stub.requests.lock().unwrap();
         assert!(!requests[0].head.contains("authorization"));
         let system = requests[0].body["messages"][0]["content"].as_str().unwrap();
-        assert!(!system.contains("용어집"));
+        assert!(!system.contains("용어집의 표기를 따른다"));
     }
 
     #[test]
@@ -1504,7 +1514,8 @@ pub(crate) mod tests {
     /// Partials over 60% that one request can still hold go straight to the final merge.
     #[test]
     fn partials_one_request_can_hold_are_merged_at_once() {
-        let stub = partials(1600);
+        // Two of them with the prompt just over 60% of the context: about 100 characters over.
+        let stub = partials((6000 * 6 / 10 - chars(SYSTEM) - chars(MERGE)) / 2 + 50);
         assert_eq!(run(&small(&stub), None, &talk(20)).unwrap(), SUMMARY);
         let requests = stub.requests.lock().unwrap();
         let merges: Vec<&Request> = requests
@@ -1555,6 +1566,72 @@ pub(crate) mod tests {
         assert_eq!(run(&tiny, None, &transcript), Err(Failure::TooSmall));
         assert_eq!(stub.connections.load(Ordering::SeqCst), 0);
         assert!(Failure::TooSmall.message().contains("컨텍스트 토큰"));
+    }
+
+    /// Review: a 4,096-token connection with a short glossary still summarizes a long meeting in
+    /// parts, its partial summaries given a third of the budget; from 5,000 tokens up nothing
+    /// changes.
+    #[test]
+    fn a_small_context_with_a_glossary_still_goes_in_parts() {
+        for (context, part) in [(4096, 1228), (5000, 1500), (8192, 1500), (16_384, 1500)] {
+            assert_eq!(part_tokens(context * 9 / 10), part, "{context}");
+        }
+        let stub = serve(|r| {
+            Some(completion(if user(r).starts_with(PART) {
+                "## 결정사항\n- 부분 요약"
+            } else {
+                SUMMARY
+            }))
+        });
+        let glossary = [
+            "누리패스",
+            "김민수",
+            "박지현",
+            "대시보드",
+            "온보딩 문서",
+            "결제 모듈",
+            "회귀 테스트",
+            "릴리스 노트",
+            "QA 팀",
+            "영업팀",
+            "보안 점검",
+            "이중 인증",
+        ]
+        .map(String::from);
+        assert!((60..80).contains(&chars(&glossary.join(", "))));
+        let small = LlmConnection {
+            context_tokens: 4096,
+            ..connection(&stub.url, "l", true)
+        };
+        let summary = block_on(summarize(
+            &small,
+            None,
+            &glossary,
+            &talk(60),
+            |_, _| {},
+            None,
+        ));
+        assert_eq!(summary.unwrap().0, SUMMARY);
+        let requests = stub.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .filter(|r| user(r).starts_with(PART))
+                .count()
+                > 2
+        );
+        assert!(requests.iter().any(|r| user(r).starts_with(MERGE)));
+        for r in requests.iter() {
+            let input = chars(r.body["messages"][0]["content"].as_str().unwrap()) + chars(user(r));
+            let answer = r.body["max_tokens"].as_u64().unwrap();
+            assert!(
+                tokens(input) + answer <= 4096 * 9 / 10,
+                "{input} + {answer}"
+            );
+            if user(r).starts_with(PART) {
+                assert_eq!(answer, 1228);
+            }
+        }
     }
 
     #[test]

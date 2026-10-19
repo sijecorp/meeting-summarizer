@@ -74,14 +74,14 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
 ### 요약 평가
 
-`src-tauri/tests/fixtures`의 전사본을 실제 LLM으로 요약해 채점한다(아키텍처 12.3). 이 PC 요약 엔진으로 돌리려면 사이드카와 요약 모델 파일(`Qwen3.5-4B-Q4_K_M.gguf`)이 있어야 한다. 아래 경로는 앱이 받아 둔 모델이다.
+`src-tauri/tests/fixtures`의 전사본을 실제 LLM으로 요약해 채점한다(아키텍처 12.3). 이 PC 요약 엔진으로 돌리려면 사이드카와 요약 모델 파일(`Qwen3-4B-Instruct-2507-Q4_K_M.gguf`)이 있어야 한다. 아래 경로는 앱이 받아 둔 모델이다.
 
 ```sh
-SUMMARY_EVAL_BUILTIN=1 SUMMARY_EVAL_MODEL_PATH="$HOME/Library/Application Support/com.sije.meeting-summarizer/models/Qwen3.5-4B-Q4_K_M.gguf" cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --exact summarize::tests::summary_eval --nocapture
+SUMMARY_EVAL_BUILTIN=1 SUMMARY_EVAL_MODEL_PATH="$HOME/Library/Application Support/com.sije.meeting-summarizer/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf" cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --exact summarize::tests::summary_eval --nocapture
 ```
 
 ```powershell
-$env:SUMMARY_EVAL_BUILTIN = "1"; $env:SUMMARY_EVAL_MODEL_PATH = "$env:LOCALAPPDATA\com.sije.meeting-summarizer\models\Qwen3.5-4B-Q4_K_M.gguf"; cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --exact summarize::tests::summary_eval --nocapture
+$env:SUMMARY_EVAL_BUILTIN = "1"; $env:SUMMARY_EVAL_MODEL_PATH = "$env:LOCALAPPDATA\com.sije.meeting-summarizer\models\Qwen3-4B-Instruct-2507-Q4_K_M.gguf"; cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --exact summarize::tests::summary_eval --nocapture
 Remove-Item Env:SUMMARY_EVAL_BUILTIN, Env:SUMMARY_EVAL_MODEL_PATH
 ```
 

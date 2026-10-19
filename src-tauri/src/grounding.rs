@@ -263,7 +263,7 @@ type Date = (Option<u32>, u32);
 /// not judged.
 fn dated(due: &str, heard: &Heard) -> bool {
     let due = squash(due);
-    // Qwen3.5-4B writes the prompt's word too: "(기한: 금요일)".
+    // Small models write the prompt's word too: "(기한: 금요일)" (Qwen3.5-4B did).
     let due = due.strip_prefix("기한:").unwrap_or(&due);
     let due = ["까지는", "까지", "에"]
         .iter()

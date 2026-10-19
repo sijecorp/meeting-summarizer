@@ -90,7 +90,7 @@ const MODEL_FILES: Record<string, { file: string; size: number }> = {
   "medium-q5_0": { file: "ggml-medium-q5_0.bin", size: 539_212_467 },
 };
 const VAD = { file: "ggml-silero-v6.2.0.bin", size: 885_098 };
-const SUMMARY_MODEL = { file: "Qwen3.5-4B-Q4_K_M.gguf", size: 2_740_937_888 };
+const SUMMARY_MODEL = { file: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf", size: 2_497_281_120 };
 
 const DEVICES: AudioDevices = {
   inputs: [

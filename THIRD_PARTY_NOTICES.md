@@ -10,7 +10,7 @@ Meetily: no code from it is included, so it is not listed. Handy: only the macOS
 | llama.cpp (ggml) | `ggml-org/llama.cpp` v0.7.0 (commit 620d222, `scripts/llama.cpp.rev`) | MIT, plus the vendored code listed in its section | compiled into the bundled `llama-server` sidecar |
 | Whisper model weights (OpenAI) | `ggerganov/whisper.cpp` ggml files at commit 5359861, downloaded at first run | MIT | downloaded, not bundled |
 | Silero VAD | `ggml-org/whisper-vad` `ggml-silero-v6.2.0.bin` at commit 9ffd54a, downloaded at first run | MIT | downloaded, not bundled |
-| Qwen3.5-4B model weights (Alibaba Cloud) | `unsloth/Qwen3.5-4B-GGUF` `Qwen3.5-4B-Q4_K_M.gguf` at commit e87f176, downloaded at first run | Apache-2.0 | downloaded, not bundled |
+| Qwen3-4B-Instruct-2507 model weights (Alibaba Cloud) | `unsloth/Qwen3-4B-Instruct-2507-GGUF` `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` at commit a06e946, downloaded at first run | Apache-2.0 | downloaded, not bundled |
 | Vulkan Loader (`vulkan-1.dll`) | `KhronosGroup/Vulkan-Loader`, from the Vulkan SDK | Apache-2.0 | bundled with the Windows installer, next to the exe |
 | Handy | `cjpais/Handy` `build.rs` at 5197faf (macOS link fix in `src-tauri/build.rs`) | MIT | build script only |
 | Pretendard | pretendard 1.3.9 | SIL OFL 1.1 | bundled in the frontend |
@@ -158,12 +158,12 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-## Qwen3.5-4B model weights, Alibaba Cloud (Apache-2.0)
+## Qwen3-4B-Instruct-2507 model weights, Alibaba Cloud (Apache-2.0)
 
-Source: https://huggingface.co/Qwen/Qwen3.5-4B, as the Q4_K_M GGUF file of https://huggingface.co/unsloth/Qwen3.5-4B-GGUF (commit e87f176479d0855a907a41277aca2f8ee7a09523). The model's `LICENSE` is the Apache License, Version 2.0, the same text as in the Vulkan Loader section below, with this copyright line:
+Source: https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507 (commit cdbee75f17c01a7cc42f958dc650907174af0554), as the Q4_K_M GGUF file of https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF (commit a06e946bb6b655725eafa393f4a9745d460374c9). The model's `LICENSE` is the Apache License, Version 2.0, the same text as in the Vulkan Loader section below, with this copyright line:
 
 ```
-Copyright 2026 Alibaba Cloud
+Copyright 2024 Alibaba Cloud
 ```
 
 ## Vulkan Loader (Apache-2.0)

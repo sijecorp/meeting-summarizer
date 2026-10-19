@@ -56,7 +56,7 @@ const VULKAN_ERRORS: [&str; 4] = [
 /// How long the sidecar waits (plan 5.3). Tests pass shorter ones.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
-    /// For the "listening" line: the first load of the 2.7 GB model.
+    /// For the "listening" line: the first load of the 2.5 GB model.
     pub ready: Duration,
     /// For a supervisor told to stop, before the pid fallback (ENG4).
     pub reap: Duration,
@@ -182,7 +182,7 @@ impl Run {
         damaged: impl FnOnce() -> bool,
     ) -> Result<(), Failure> {
         self.blamed |= fault && self.device == Device::Gpu;
-        // A model that will not load may be damaged; hashing 2.7 GB takes seconds, so once, and
+        // A model that will not load may be damaged; hashing 2.5 GB takes seconds, so once, and
         // never for the memory killer.
         if starting && !end.oom && !std::mem::replace(&mut self.hashed, true) && damaged() {
             return Err(Failure::ModelDamaged);
@@ -248,9 +248,12 @@ fn server_path(exe: &Path, debug: bool, var: Option<OsString>) -> PathBuf {
 }
 
 /// llama-server's arguments (plan 5.3). `--port 0`: the OS picks a free port, and llama-server
-/// names it in its listening line (ENG7). `--reasoning off`: Qwen3.5 thinks by default; the plan's
-/// `--chat-template-kwargs` form is deprecated at the pinned commit (stage 1), as is `--no-webui`
-/// for `--no-ui`. `-ngl 0` alone still
+/// names it in its listening line (ENG7). `--reasoning off`: kept for a model whose template can
+/// think (Qwen3.5 did by default); Qwen3-4B-Instruct-2507 has no thinking and answers the same with
+/// it. The plan's `--chat-template-kwargs` form is deprecated at the pinned commit (stage 1), as is
+/// `--no-webui` for `--no-ui`. `-ctk q8_0 -ctv q8_0`: a KV cache of half the size (Qwen3-4B's is
+/// 2.25 GiB in f16 at 16,384 tokens), with no measured loss (D7); a quantized V cache needs flash
+/// attention, which the default `--flash-attn auto` then turns on. `-ngl 0` alone still
 /// lets large operations go to the GPU backend, hence `--device none --no-op-offload`. The key is
 /// not here: every user of the PC can read arguments.
 fn server_args(device: Device, context: u32) -> Vec<String> {
@@ -270,6 +273,10 @@ fn server_args(device: Device, context: u32) -> Vec<String> {
         "--no-slots",
         "--reasoning",
         "off",
+        "-ctk",
+        "q8_0",
+        "-ctv",
+        "q8_0",
     ];
     match device {
         Device::Gpu => args.extend(["-ngl", "99"]),
@@ -1455,7 +1462,7 @@ pub(crate) mod tests {
             Some(8080)
         );
         assert_eq!(
-            listening("srv  load_model: loading model 'Qwen3.5-4B-Q4_K_M.gguf'"),
+            listening("srv  load_model: loading model 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf'"),
             None
         );
         assert_eq!(listening("listening on unix:///tmp/x.sock"), None);
@@ -1609,11 +1616,13 @@ pub(crate) mod tests {
         let health = get(port, "/health", &endpoint.key).unwrap();
         assert!(health.starts_with("HTTP/1.1 200"), "{health}");
         let log = f.log(LOG);
-        assert!(
-            log.starts_with("--- -m Qwen3.5-4B-Q4_K_M.gguf -c 16384 --host 127.0.0.1 --port 0")
+        let head = format!(
+            "--- -m {} -c 16384 --host 127.0.0.1 --port 0",
+            model::SUMMARY.file
         );
+        assert!(log.starts_with(&head), "{log}");
         assert!(
-            log.contains("--reasoning off") && log.contains("-ngl 99"),
+            log.contains("--reasoning off -ctk q8_0 -ctv q8_0") && log.contains("-ngl 99"),
             "{log}"
         );
         assert!(!log.contains(&endpoint.key));

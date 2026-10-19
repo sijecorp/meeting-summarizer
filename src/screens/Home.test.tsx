@@ -179,7 +179,7 @@ test("the setup line's 모델 받기 downloads with progress and checks the file
   // While it runs, the item shows progress instead of the button.
   expect(screen.queryByRole("button", { name: "모델 받기" })).toBeNull();
   // The percent is the whole chain's: Whisper, VAD, then the summary model (E3).
-  const all_total = 874_188_075 + 885_098 + 2_740_937_888;
+  const all_total = 874_188_075 + 885_098 + 2_497_281_120;
   await act(() =>
     emit("model://download", {
       file: WHISPER,
@@ -189,13 +189,13 @@ test("the setup line's 모델 받기 downloads with progress and checks the file
       all_total,
     }),
   );
-  expect(await screen.findByText("모델 받는 중 14%")).toBeTruthy();
+  expect(await screen.findByText("모델 받는 중 15%")).toBeTruthy();
   await act(() =>
     emit("model://download", {
-      file: "Qwen3.5-4B-Q4_K_M.gguf",
-      received: 1_370_468_944,
-      total: 2_740_937_888,
-      all_received: 874_188_075 + 885_098 + 1_370_468_944,
+      file: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+      received: 1_248_640_560,
+      total: 2_497_281_120,
+      all_received: 874_188_075 + 885_098 + 1_248_640_560,
       all_total,
     }),
   );
@@ -237,7 +237,7 @@ test("a failed download says so and 다시 받기 tries again; each link opens i
 });
 
 test("with only the summary model missing, the item's settings link opens the 요약(LLM) tab", async () => {
-  const summary = { file: "Qwen3.5-4B-Q4_K_M.gguf", size: 2_740_937_888, installed: false, received: 0, downloading: false };
+  const summary = { file: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf", size: 2_497_281_120, installed: false, received: 0, downloading: false };
   mock((cmd, args) => {
     if (cmd === "model_status") {
       const transcription = models(true);

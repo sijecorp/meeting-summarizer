@@ -76,13 +76,14 @@ pub const VAD: ModelFile = ModelFile {
     size: 885_098,
     sha256: "2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987",
 };
-/// The built-in summary model (plan 5.2), checked on Hugging Face on 2026-10-16.
+/// The built-in summary model (plan 5.2, D7): Qwen3-4B-Instruct-2507, checked on Hugging Face on
+/// 2026-10-19. It replaced Qwen3.5-4B, which often failed long meetings by repeating itself.
 pub const SUMMARY: ModelFile = ModelFile {
-    repo: "unsloth/Qwen3.5-4B-GGUF",
-    revision: "e87f176479d0855a907a41277aca2f8ee7a09523",
-    file: "Qwen3.5-4B-Q4_K_M.gguf",
-    size: 2_740_937_888,
-    sha256: "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+    repo: "unsloth/Qwen3-4B-Instruct-2507-GGUF",
+    revision: "a06e946bb6b655725eafa393f4a9745d460374c9",
+    file: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+    size: 2_497_281_120,
+    sha256: "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597",
 };
 /// D12: give up on a connection after 10 s, and on a download that sends nothing for 30 s.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1212,7 +1213,7 @@ mod tests {
         );
         assert_eq!(
             room(&SUMMARY, 0, 0).unwrap_err(),
-            "요약 모델을 받으려면 디스크에 3.8 GB가 더 필요합니다"
+            "요약 모델을 받으려면 디스크에 3.5 GB가 더 필요합니다"
         );
         // A complete `.part` only waits for its hash check.
         assert!(room(&SUMMARY, SUMMARY.size, 0).is_ok());
@@ -1246,7 +1247,7 @@ mod tests {
 
     /// Plan 5.2: a reinstall keeps the same `models` folder, so a model file already there counts
     /// as installed and is not fetched again. One path for every row, the summary model included:
-    /// a small file stands in for its 2.7 GB.
+    /// a small file stands in for its 2.5 GB.
     #[test]
     fn a_reinstall_reuses_a_model_in_place() {
         let tmp = tempfile::tempdir().unwrap();
