@@ -30,12 +30,14 @@ import {
   listAudioDevices,
   modelDownload,
   modelDownloadFailure,
+  modelDownloadScope,
   modelFileFilter,
   modelStatus,
   NEWER_VERSION,
   onMicTestLevel,
   onModelDownload,
   openLogDir,
+  reserved,
   resetSettings,
   saveSettings,
   sendTestMessage,
@@ -50,12 +52,13 @@ import {
   type LoadedSettings,
   type ModelDownload,
   type ModelFileState,
+  type ModelScope,
   type ModelState,
   type SecretKind,
   type Settings as SettingsData,
 } from "@/lib/ipc";
 import { dur, ease, spring } from "@/lib/motion";
-import { cn } from "@/lib/utils";
+import { cn, josa } from "@/lib/utils";
 
 export type SettingsTab = "general" | "audio" | "transcription" | "llm" | "slack";
 
@@ -66,7 +69,7 @@ const TABS: { value: SettingsTab; label: string; about: string }[] = [
   {
     value: "llm",
     label: "요약(LLM)",
-    about: "전사본을 요약할 LLM 연결입니다. 클라우드 연결은 전사본을 그 주소로 보냅니다.",
+    about: "기본은 이 PC에서 요약합니다. 다른 연결을 더할 수 있고, 클라우드 연결은 전사본을 그 주소로 보냅니다.",
   },
   { value: "slack", label: "Slack", about: "요약을 보낼 채널의 웹훅입니다. URL은 OS 키체인에만 저장합니다." },
 ];
@@ -83,8 +86,10 @@ const MODELS = [
   { value: "large-v3-turbo", label: "원본: large-v3-turbo (1.6GB)" },
   { value: "medium-q5_0", label: "가벼움: medium q5_0 (539MB)" },
 ];
-// `model_status` lists the Whisper model, then the VAD model.
+// `model_status` lists the Whisper model, then the VAD model; `summary` the summary model alone.
 const MODEL_FILES = ["전사 모델", "음성 구간 감지(VAD) 모델"];
+const SUMMARY_FILES = ["요약 모델"];
+type Scope = Exclude<ModelScope, "all">;
 // One decimal below 10 MB, for the 0.9 MB VAD file.
 const mb = (bytes: number) => (bytes < 1e7 ? (bytes / 1e6).toFixed(1) : Math.round(bytes / 1e6));
 
@@ -113,13 +118,13 @@ const secretRefs = (s: SettingsData): SecretRef[] => [
 ];
 const keyOf = ({ kind, name }: SecretRef) => `${kind}:${name}`;
 
-/** The settings as 저장 writes them: the name trimmed, and the local default only with a local
- * connection (its switch hides without one, so it cannot stay on unseen). */
-const asSaved = (s: SettingsData): SettingsData => ({
-  ...s,
-  recorder_name: s.recorder_name.trim(),
-  summarize_local_by_default: s.summarize_local_by_default && s.llm_connections.some((c) => c.is_local),
-});
+/** A saved connection can summarize on this PC; one under a reserved name is in no route (d6). */
+const savedLocal = (s: SettingsData, rename: string[]) =>
+  s.llm_connections.some((c) => c.is_local && !rename.includes(c.name));
+
+/** The settings as 저장 writes them: the name trimmed. Rust turns the local default off while nothing
+ * local can summarize (SUM-08) and answers with what it stored. */
+const asSaved = (s: SettingsData): SettingsData => ({ ...s, recorder_name: s.recorder_name.trim() });
 
 // What the save bar counts: each field as 저장 would write it, and each connection or webhook
 // added, removed or edited once however many of its fields changed.
@@ -203,12 +208,25 @@ export default function Settings({
   // Each time 저장 reports an error, even the same one again: its banner is said and shown anew.
   const [reported, setReported] = useState(0);
   const [models, setModels] = useState<ModelState | null>(null);
+  // The 요약(LLM) tab's summary model (plan 5.8), read when that tab opens: null until then.
+  const [summary, setSummary] = useState<ModelState | null>(null);
+  const summaryRead = useRef(false);
   const [received, setReceived] = useState<Record<string, ModelDownload>>({});
   const [modelBusy, setModelBusy] = useState<"download" | "import" | null>(null);
   // Both shown in the 전사 tab, not the shared banner. A status read that works clears its own
   // error but never a download's or import's, which lasts until the next try.
   const [statusError, setStatusError] = useState("");
-  const [modelError, setModelError] = useState(modelDownloadFailure);
+  // A failure stays on the tab whose files the download was started for (ipc.ts keeps the scope).
+  const [modelError, setModelError] = useState(() =>
+    modelDownloadScope() === "summary" ? "" : modelDownloadFailure(),
+  );
+  // The same two for the summary model, shown in the 요약(LLM) tab.
+  const [summaryStatusError, setSummaryStatusError] = useState("");
+  const [summaryError, setSummaryError] = useState(() =>
+    modelDownloadScope() === "summary" ? modelDownloadFailure() : "",
+  );
+  // Saved connections under a name this PC's route reserves (d6): listed, to be renamed.
+  const [rename, setRename] = useState<string[]>([]);
   // The audio and Slack checks, by "mic", "system" or the webhook's `keyOf`. Never part of the
   // draft. `on`: the device or typed URL it ran with; no `outcome` while it runs.
   const [checks, setChecks] = useState<Record<string, { on: string | null; outcome?: Outcome }>>({});
@@ -222,10 +240,11 @@ export default function Settings({
   // The bar the revert dialog came from is gone once it reverts.
   const reverted = useRef(false);
 
-  const show = async ({ settings, read_only }: LoadedSettings) => {
+  const show = async ({ settings, read_only, rename }: LoadedSettings) => {
     setDraft(settings);
     setPersisted(settings);
     setReadOnly(read_only);
+    setRename(rename ?? []);
     setGlossary(settings.glossary.join("\n"));
     setError("");
     const saved = await Promise.all(
@@ -244,13 +263,27 @@ export default function Settings({
       (e) => setStatusError(String(e)),
     );
 
-  // The download lives in ipc.ts, so this also picks up one started before the screen opened.
+  const readSummary = () => {
+    summaryRead.current = true;
+    return modelStatus("summary").then(
+      (state) => {
+        setSummary(state);
+        setSummaryStatusError("");
+      },
+      (e) => setSummaryStatusError(String(e)),
+    );
+  };
+  const errorOf = (scope: Scope) => (scope === "summary" ? setSummaryError : setModelError);
+
+  // The download lives in ipc.ts, so this also picks up one started before the screen opened. Its
+  // failure goes to the tab of its scope: the summary model's, else the 전사 tab (Home's `all`).
   const follow = (running: Promise<void>) => {
     setModelBusy("download");
     running.then(() => {
       setModelBusy(null);
-      setModelError(modelDownloadFailure());
+      errorOf(modelDownloadScope() === "summary" ? "summary" : "transcription")(modelDownloadFailure());
       readModels();
+      if (summaryRead.current) readSummary();
     });
   };
 
@@ -258,7 +291,16 @@ export default function Settings({
     getSettings()
       .then(show)
       .catch((e) => setError(String(e)));
-    const unlisten = onModelDownload((d) => setReceived((all) => ({ ...all, [d.file]: d })));
+    // A file sending progress is in the download's chain, whatever the last status read said.
+    const fetching = (d: ModelDownload) => (state: ModelState | null) =>
+      state?.files.some((f) => f.file === d.file && !f.downloading)
+        ? { ...state, files: state.files.map((f) => (f.file === d.file ? { ...f, downloading: true } : f)) }
+        : state;
+    const unlisten = onModelDownload((d) => {
+      setReceived((all) => ({ ...all, [d.file]: d }));
+      setModels(fetching(d));
+      setSummary(fetching(d));
+    });
     unlisten.catch((e) => setStatusError(`다운로드 진행률을 받지 못했습니다: ${e}`));
     // 25 times a second, straight to the DOM: no React state (design-system 5).
     const unlistenLevel = onMicTestLevel((level) => {
@@ -276,6 +318,7 @@ export default function Settings({
   // Read each time the tab opens, like the audio devices.
   useEffect(() => {
     if (tab === "transcription") readModels();
+    if (tab === "llm") readSummary();
   }, [tab]);
 
   // Listed again each time the tab opens, so a headset plugged in meanwhile shows up.
@@ -373,14 +416,13 @@ export default function Settings({
           : "";
 
   // A new entry opens, ready for its address and key. It never becomes the default (plan 5.4):
-  // "선택 안 함" is this PC, and a cloud connection added must not take its place.
+  // no default is this PC, and a cloud connection added must not take its place.
   const addLlm = (keyboard: boolean) => {
     const name = newLlm.trim();
-    const problem = nameProblem(
-      name,
-      draft.llm_connections.map((c) => c.name),
-      keyHolders("llm", persisted.llm_connections),
-    );
+    // d6: Rust's words, as 저장 would refuse it.
+    const problem = reserved(name)
+      ? `'${name}'은(는) 이 PC 요약이 쓰는 이름이라 연결 이름으로 쓸 수 없습니다. 이름을 바꿔 주세요`
+      : nameProblem(name, draft.llm_connections.map((c) => c.name), keyHolders("llm", persisted.llm_connections));
     if (problem) return setNameError({ kind: "llm", text: problem });
     edit({
       llm_connections: [
@@ -424,7 +466,19 @@ export default function Settings({
   };
 
   const glossaryCount = terms(glossary).length;
-  const hasLocal = draft.llm_connections.some((c) => c.is_local);
+  // The summary model is in (plan 5.4), as the 요약(LLM) tab read it.
+  const builtinReady = !!summary?.files[0]?.installed;
+  // The connections a default may name: not one under a reserved name (d6).
+  const usable = draft.llm_connections.filter((c) => !rename.includes(c.name));
+  // No default, or one gone: this PC summarizes (`Settings::default_connection`).
+  const defaultConnection = usable.find((c) => c.name === draft.default_llm);
+  const builtinDefault = !defaultConnection;
+  // SUM-08: a new meeting's "로컬로 요약" changes its route only with a cloud default and something
+  // local to use, or with this PC as the default while its model is missing and a saved local
+  // connection can stand in (plan 5.4, as `toggle_matters`).
+  const localDefaultMatters = defaultConnection
+    ? !defaultConnection.is_local && (builtinReady || savedLocal(draft, rename))
+    : !builtinReady && savedLocal(draft, rename);
 
   // Every typed key counts, even blanks (저장 clears them), and so does a key the keychain still
   // has to delete: only 저장 finishes either.
@@ -482,15 +536,17 @@ export default function Settings({
     // The form and the bar are locked until this ends, so a second 저장 cannot interleave with it.
     setSaving(changes);
     try {
+      let stored: SettingsData;
       try {
-        await saveSettings(value);
+        stored = (await saveSettings(value)) ?? value;
       } catch (e) {
         // settings.json still lists the removed entries and not the new ones, so the keychain
         // stays as it is and the typed keys stay in the draft.
         return report(String(e));
       }
-      setDraft(value);
-      setPersisted(value);
+      // As Rust stored it: its own fields and the local default it may have turned off.
+      setDraft(stored);
+      setPersisted(stored);
       // The model may have changed.
       readModels();
       const problems: string[] = [];
@@ -551,43 +607,48 @@ export default function Settings({
 
   // Download and import act on the saved model and address: `model_status` and the backend read
   // settings.json. So an unsaved change blocks both until 저장, rather than acting on the old one.
-  const unsaved =
-    draft.model !== persisted.model || draft.model_base_url !== persisted.model_base_url;
-  const downloading = modelBusy === "download" || !!models?.downloading;
-  // While it runs, only 취소 and the progress show.
-  const idle = !modelBusy && !models?.downloading && !unsaved;
-  const missing = !!models?.files.some((f) => !f.installed);
-  // A download started on Home may be past this tab's files: then nothing here to cancel.
-  const cancellable = downloading && !!models?.files.some((f) => f.downloading || !f.installed);
-  const fileState = (f: ModelFileState) => {
-    const d = received[f.file];
-    if (f.installed) return "설치됨";
-    if (modelBusy === "download" && d) {
-      return `받는 중 ${Math.floor((d.received / d.total) * 100)}% (${mb(d.received)}/${mb(d.total)}MB)`;
-    }
-    return f.received ? `없음 · ${mb(f.received)}/${mb(f.size)}MB 받아 둠` : "없음";
-  };
+  // The summary model needs only the address.
+  const addressUnsaved = draft.model_base_url !== persisted.model_base_url;
+  const unsaved = draft.model !== persisted.model || addressUnsaved;
+  // What the engine will use (`queue::first_device`): the saved backend, automatic on the CPU once
+  // the summary engine's GPU failed.
+  const device = `${
+    persisted.backend === "auto" && persisted.summary_gpu_failed
+      ? "CPU (GPU에서 멈춘 적이 있어 CPU로 요약합니다)"
+      : (BACKENDS.find((b) => b.value === persisted.backend)?.label ?? persisted.backend)
+  } · 전사 탭에서 바꾸기`;
 
-  const startDownload = () => {
+  const startDownload = (scope: Scope) => {
     setReceived({});
-    setModelError("");
-    follow(startModelDownload("transcription"));
+    errorOf(scope)("");
+    follow(startModelDownload(scope));
+    // Which of the tab's files the download fetches, for 취소.
+    (scope === "summary" ? readSummary : readModels)();
   };
 
   // ONB-02: a model file got some other way (a colleague, a USB stick).
-  const importFile = () =>
-    open({ filters: [modelFileFilter("transcription")] })
+  const importFile = (scope: Scope) =>
+    open({ filters: [modelFileFilter(scope)] })
       .then((path) => {
         if (!path) return;
         setModelBusy("import");
-        return importModel(path, "transcription")
-          .then(setModels)
+        return importModel(path, scope)
+          .then(scope === "summary" ? setSummary : setModels)
           .finally(() => setModelBusy(null));
       })
       .then(
-        () => setModelError(""),
-        (e) => setModelError(String(e)),
+        () => errorOf(scope)(""),
+        (e) => errorOf(scope)(String(e)),
       );
+
+  const cancel = (scope: Scope) =>
+    cancelModelDownload(scope).then(
+      (done) => {
+        // Nothing of the tab's was left: the list was stale.
+        if (!done) (scope === "summary" ? readSummary : readModels)();
+      },
+      (e) => errorOf(scope)(String(e)),
+    );
 
   // The checks act on what the tab shows, saved or not, and leave the draft alone.
   const run = (key: string, on: string | null, check: () => Promise<Outcome>) => {
@@ -800,69 +861,19 @@ export default function Settings({
                   onChange={(model) => edit({ model })}
                 />
               </Row>
-              <div className="space-y-4 px-5 py-4">
-                {models && (
-                  <ul className="space-y-3">
-                    {models.files.map((f, i) => {
-                      const d = received[f.file];
-                      return (
-                        <li key={f.file} className="space-y-2">
-                          <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-                            <span>
-                              {MODEL_FILES[i]} <span className="text-caption text-ink-2">{f.file}</span>
-                            </span>
-                            <span className="flex items-center gap-1.5 text-label tabular-nums">
-                              {f.installed && <Check aria-hidden className="size-4 text-ok-line" />}
-                              {fileState(f)}
-                            </span>
-                          </div>
-                          {modelBusy === "download" && d && !f.installed && (
-                            <ProgressBar
-                              aria-label={`${MODEL_FILES[i]} 받는 중`}
-                              value={Math.floor((d.received / d.total) * 100)}
-                            />
-                          )}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                )}
-                {/* Import stays offered when the status cannot be read (ONB-02). */}
-                {(missing || downloading || modelBusy || statusError) && (
-                  <div className="flex flex-wrap gap-2">
-                    {missing && !downloading && (
-                      <Button size="sm" disabled={!idle} onClick={startDownload}>
-                        <Download aria-hidden />
-                        다운로드
-                      </Button>
-                    )}
-                    {cancellable && (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() =>
-                          cancelModelDownload("transcription").then(
-                            (done) => {
-                              // Nothing of the tab's was left: the list was stale.
-                              if (!done) readModels();
-                            },
-                            (e) => setModelError(String(e)),
-                          )
-                        }
-                      >
-                        취소
-                      </Button>
-                    )}
-                    {!downloading && (
-                      <Button size="sm" variant="ghost" disabled={!idle} onClick={importFile}>
-                        <FolderOpen aria-hidden />
-                        {modelBusy === "import" ? "가져오는 중" : "직접 가져오기"}
-                      </Button>
-                    )}
-                  </div>
-                )}
+              <ModelFiles
+                labels={MODEL_FILES}
+                models={models}
+                received={received}
+                busy={modelBusy}
+                blocked={unsaved}
+                unreadable={!!statusError}
+                onDownload={() => startDownload("transcription")}
+                onCancel={() => cancel("transcription")}
+                onImport={() => importFile("transcription")}
+              >
                 {unsaved && <p className={HELP}>바꾼 모델과 주소는 저장한 뒤에 받거나 가져올 수 있습니다</p>}
-              </div>
+              </ModelFiles>
               <Row label="모델 다운로드 주소" help="사내 미러가 있으면 바꿉니다">
                 <Input
                   className={CONTROL}
@@ -907,152 +918,217 @@ export default function Settings({
           </Section>
 
           <Section tab="llm" open={tab}>
-            <List moves={llmMoves} move={move}>
-              {draft.llm_connections.map((c, i) => (
-                <Entry
-                  key={c.name}
-                  label={[c.name, c.is_local ? "로컬" : "클라우드", host(c.base_url), draft.default_llm === c.name && "기본 LLM"]
-                    .filter(Boolean)
-                    .join(", ")}
-                  open={expanded.llm === c.name}
-                  moves={llmMoves}
-                  instant={instant}
-                  onToggle={(keyboard) => toggle("llm", c.name, keyboard)}
-                  head={
-                    <>
-                      <span className="min-w-0 flex-1">
-                        <span className="flex items-baseline gap-2">
-                          <span className="truncate font-medium">{c.name}</span>
-                          {draft.default_llm === c.name && <span className="shrink-0 text-label text-brand">기본</span>}
-                        </span>
-                        <span className={cn(HELP, "block truncate")}>{c.base_url ? host(c.base_url) : "주소 없음"}</span>
-                      </span>
-                      {/* In words, not a color (NFR-09). */}
-                      <span className="shrink-0 rounded-full bg-sunken px-2 py-0.5 text-caption text-ink-2">
-                        {c.is_local ? "로컬" : "클라우드"}
-                      </span>
-                    </>
-                  }
+            {summaryStatusError && <Banner kind="error">{summaryStatusError}</Banner>}
+            {summaryError && <Banner kind="error">{summaryError}</Banner>}
+            {/* Plan 5.8: the built-in route first, as the default it usually is. */}
+            <div className="space-y-2">
+              <h3 className="flex items-baseline gap-2 px-5 font-medium">
+                이 PC에서 요약{" "}
+                {builtinDefault && <span className="text-label text-brand">기본</span>}
+              </h3>
+              <fieldset disabled={locked} className={GROUP}>
+                <ModelFiles
+                  labels={SUMMARY_FILES}
+                  models={summary}
+                  received={received}
+                  busy={modelBusy}
+                  blocked={addressUnsaved}
+                  unreadable={!!summaryStatusError}
+                  onDownload={() => startDownload("summary")}
+                  onCancel={() => cancel("summary")}
+                  onImport={() => importFile("summary")}
                 >
-                  <fieldset disabled={locked} className="grid min-w-0 gap-4 px-5 pt-1 pb-5 sm:grid-cols-2">
-                    <Field label="Base URL" className="sm:col-span-2">
-                      <Input
-                        value={c.base_url}
-                        placeholder="https://api.example.com/v1"
-                        onChange={(e) => editLlm(i, { base_url: e.target.value })}
-                      />
-                    </Field>
-                    {/* SUM-07 */}
-                    {!c.is_local && (
-                      <p className={cn(HELP, "-mt-2 sm:col-span-2")}>요약할 때 전사본 전문이 이 주소로 전송됩니다</p>
-                    )}
-                    <Field label="모델">
-                      <Input value={c.model} onChange={(e) => editLlm(i, { model: e.target.value })} />
-                    </Field>
-                    <SecretField label="API 키" {...secretProps("llm", c.name)} />
-                    <Field label="컨텍스트 토큰">
-                      <Input
-                        type="number"
-                        min={1}
-                        step={1}
-                        required
-                        aria-invalid={!isPositiveInt(c.context_tokens)}
-                        value={c.context_tokens || ""}
-                        onChange={(e) => editLlm(i, { context_tokens: Number(e.target.value) })}
-                      />
-                    </Field>
-                    <Field label="응답 시간 제한(초)">
-                      <Input
-                        type="number"
-                        min={1}
-                        step={1}
-                        required
-                        aria-invalid={!isPositiveInt(c.timeout_secs)}
-                        value={c.timeout_secs || ""}
-                        onChange={(e) => editLlm(i, { timeout_secs: Number(e.target.value) })}
-                      />
-                    </Field>
-                    <label className="flex w-fit items-center gap-3 sm:col-span-2">
-                      <Switch
-                        checked={c.is_local}
-                        onCheckedChange={(isLocal) => {
-                          // Keep a custom timeout; swap only the defaults (300 cloud / 900 local).
-                          const usesDefault = c.timeout_secs === (c.is_local ? localTimeout : cloudTimeout);
-                          editLlm(i, {
-                            is_local: isLocal,
-                            timeout_secs: usesDefault ? (isLocal ? localTimeout : cloudTimeout) : c.timeout_secs,
-                          });
-                        }}
-                      />
-                      이 PC에서 도는 로컬 LLM (Ollama, LM Studio)
-                    </label>
-                    {/* 9.3: a server running a smaller context cuts the input without a word. */}
-                    {c.is_local && (
-                      <p className={cn(HELP, "-mt-2 sm:col-span-2")}>
-                        Ollama는 OLLAMA_CONTEXT_LENGTH, LM Studio는 모델을 불러올 때 Context Length를 위
-                        컨텍스트 토큰 이상으로 맞춰 주세요
-                      </p>
-                    )}
-                    <div className="flex justify-end sm:col-span-2">
-                      <RemoveButton
-                        label="연결 삭제"
-                        title={`${c.name} 연결을 삭제할까요?`}
-                        description="저장하면 키체인의 API 키도 함께 지웁니다."
-                        onConfirm={(keyboard) => remove("llm", c.name, keyboard)}
-                        focusAfter={() => newLlmField.current?.focus()}
-                      />
-                    </div>
-                  </fieldset>
-                </Entry>
-              ))}
-              <AddRow
-                field={newLlmField}
-                label="새 LLM 연결 이름"
-                placeholder="새 연결 이름 (예: 회사 클라우드)"
-                action="연결 추가"
-                value={newLlm}
-                error={nameError?.kind === "llm" ? nameError.text : ""}
-                locked={locked}
-                moves={llmMoves}
-                move={move}
-                onChange={(v) => {
-                  setNewLlm(v);
-                  setNameError(null);
-                }}
-                onAdd={addLlm}
-              />
-            </List>
-            {draft.llm_connections.length > 0 && (
-              // Below the list, so it moves with the list's rows.
-              <motion.fieldset
-                layout="position"
-                layoutDependency={llmMoves}
-                transition={move}
-                disabled={locked}
-                className={GROUP}
-              >
-                <Row label="기본 LLM" help="새 회의를 이 연결로 요약합니다">
-                  <Pick
-                    disabled={locked}
-                    value={draft.default_llm ?? NO_DEFAULT}
-                    options={[
-                      { value: NO_DEFAULT, label: "선택 안 함" },
-                      ...draft.llm_connections.map((c) => ({ value: c.name, label: c.name })),
-                    ]}
-                    onChange={(v) => edit({ default_llm: v === NO_DEFAULT ? null : v })}
+                  {addressUnsaved && (
+                    <p className={HELP}>바꾼 다운로드 주소는 저장한 뒤에 받거나 가져올 수 있습니다</p>
+                  )}
+                </ModelFiles>
+                {/* One device setting for both (plan 5.3): read here, changed in the 전사 tab. */}
+                <Row label="처리 장치" help="전사 탭의 전사 백엔드를 함께 씁니다">
+                  {/* Named by what it shows, not by the row's label (WCAG 2.5.3). */}
+                  <Button
+                    variant="link"
+                    size="sm"
+                    className="px-0"
+                    aria-label={device}
+                    onClick={(e) => pick("transcription", e.detail === 0)}
+                  >
+                    {device}
+                  </Button>
+                </Row>
+              </fieldset>
+              {/* D7: q8_0 KV cache, at most about 5.1 GB. */}
+              <p className={cn(HELP, "px-5")}>요약하는 동안 메모리를 약 5GB 씁니다</p>
+            </div>
+
+            <div className="space-y-2">
+              <h3 className="px-5 font-medium">다른 연결</h3>
+              <List moves={llmMoves} move={move}>
+                {draft.llm_connections.map((c, i) => (
+                  <Entry
+                    key={c.name}
+                    label={[
+                      c.name,
+                      rename.includes(c.name) && "이름을 바꿔 주세요",
+                      c.is_local ? "로컬" : "클라우드",
+                      host(c.base_url),
+                      !builtinDefault && draft.default_llm === c.name && "기본 LLM",
+                    ]
+                      .filter(Boolean)
+                      .join(", ")}
+                    open={expanded.llm === c.name}
+                    moves={llmMoves}
+                    instant={instant}
+                    onToggle={(keyboard) => toggle("llm", c.name, keyboard)}
+                    head={
+                      <>
+                        <span className="min-w-0 flex-1">
+                          <span className="flex items-baseline gap-2">
+                            <span className="truncate font-medium">{c.name}</span>
+                            {!builtinDefault && draft.default_llm === c.name && (
+                              <span className="shrink-0 text-label text-brand">기본</span>
+                            )}
+                          </span>
+                          {rename.includes(c.name) ? (
+                            <span className={cn(HELP, "flex items-center gap-1.5")}>
+                              <TriangleAlert aria-hidden className="size-4 shrink-0 text-warn-line" />
+                              이름을 바꿔 주세요
+                            </span>
+                          ) : (
+                            <span className={cn(HELP, "block truncate")}>{c.base_url ? host(c.base_url) : "주소 없음"}</span>
+                          )}
+                        </span>
+                        {/* In words, not a color (NFR-09). */}
+                        <span className="shrink-0 rounded-full bg-sunken px-2 py-0.5 text-caption text-ink-2">
+                          {c.is_local ? "로컬" : "클라우드"}
+                        </span>
+                      </>
+                    }
+                  >
+                    <fieldset disabled={locked} className="grid min-w-0 gap-4 px-5 pt-1 pb-5 sm:grid-cols-2">
+                      {/* d6: no migration. A name keys its keychain entry, so it is renamed by adding
+                          it again; until then no route uses it and 저장 is refused. */}
+                      {rename.includes(c.name) && (
+                        <p className={cn(HELP, "sm:col-span-2")}>
+                          {`'${c.name}'${josa(c.name, "은", "는")} 이 PC 요약이 쓰는 이름이라 이 연결로는 요약하지 않고, 이 연결이 있는 동안 설정을 저장할 수 없습니다. 삭제한 뒤 다른 이름으로 다시 추가해 주세요`}
+                        </p>
+                      )}
+                      <Field label="Base URL" className="sm:col-span-2">
+                        <Input
+                          value={c.base_url}
+                          placeholder="https://api.example.com/v1"
+                          onChange={(e) => editLlm(i, { base_url: e.target.value })}
+                        />
+                      </Field>
+                      {/* SUM-07 */}
+                      {!c.is_local && (
+                        <p className={cn(HELP, "-mt-2 sm:col-span-2")}>요약할 때 전사본 전문이 이 주소로 전송됩니다</p>
+                      )}
+                      <Field label="모델">
+                        <Input value={c.model} onChange={(e) => editLlm(i, { model: e.target.value })} />
+                      </Field>
+                      <SecretField label="API 키" {...secretProps("llm", c.name)} />
+                      <Field label="컨텍스트 토큰">
+                        <Input
+                          type="number"
+                          min={1}
+                          step={1}
+                          required
+                          aria-invalid={!isPositiveInt(c.context_tokens)}
+                          value={c.context_tokens || ""}
+                          onChange={(e) => editLlm(i, { context_tokens: Number(e.target.value) })}
+                        />
+                      </Field>
+                      <Field label="응답 시간 제한(초)">
+                        <Input
+                          type="number"
+                          min={1}
+                          step={1}
+                          required
+                          aria-invalid={!isPositiveInt(c.timeout_secs)}
+                          value={c.timeout_secs || ""}
+                          onChange={(e) => editLlm(i, { timeout_secs: Number(e.target.value) })}
+                        />
+                      </Field>
+                      <label className="flex w-fit items-center gap-3 sm:col-span-2">
+                        <Switch
+                          checked={c.is_local}
+                          onCheckedChange={(isLocal) => {
+                            // Keep a custom timeout; swap only the defaults (300 cloud / 900 local).
+                            const usesDefault = c.timeout_secs === (c.is_local ? localTimeout : cloudTimeout);
+                            editLlm(i, {
+                              is_local: isLocal,
+                              timeout_secs: usesDefault ? (isLocal ? localTimeout : cloudTimeout) : c.timeout_secs,
+                            });
+                          }}
+                        />
+                        이 PC에서 도는 로컬 LLM (Ollama, LM Studio)
+                      </label>
+                      {/* 9.3: a server running a smaller context cuts the input without a word. */}
+                      {c.is_local && (
+                        <p className={cn(HELP, "-mt-2 sm:col-span-2")}>
+                          Ollama는 OLLAMA_CONTEXT_LENGTH, LM Studio는 모델을 불러올 때 Context Length를 위
+                          컨텍스트 토큰 이상으로 맞춰 주세요
+                        </p>
+                      )}
+                      <div className="flex justify-end sm:col-span-2">
+                        <RemoveButton
+                          label="연결 삭제"
+                          title={`${c.name} 연결을 삭제할까요?`}
+                          description="저장하면 키체인의 API 키도 함께 지웁니다."
+                          onConfirm={(keyboard) => remove("llm", c.name, keyboard)}
+                          focusAfter={() => newLlmField.current?.focus()}
+                        />
+                      </div>
+                    </fieldset>
+                  </Entry>
+                ))}
+                <AddRow
+                  field={newLlmField}
+                  label="새 LLM 연결 이름"
+                  placeholder="새 연결 이름 (예: 회사 클라우드)"
+                  action="연결 추가"
+                  value={newLlm}
+                  error={nameError?.kind === "llm" ? nameError.text : ""}
+                  locked={locked}
+                  moves={llmMoves}
+                  move={move}
+                  onChange={(v) => {
+                    setNewLlm(v);
+                    setNameError(null);
+                  }}
+                  onAdd={addLlm}
+                />
+              </List>
+            </div>
+            {/* Below the list, so it moves with the list's rows. Always there: this PC is a choice. */}
+            <motion.fieldset
+              layout="position"
+              layoutDependency={llmMoves}
+              transition={move}
+              disabled={locked}
+              className={GROUP}
+            >
+              <Row label="기본 LLM" help="새 회의를 이 연결로 요약합니다">
+                <Pick
+                  disabled={locked}
+                  value={builtinDefault ? NO_DEFAULT : draft.default_llm!}
+                  options={[
+                    { value: NO_DEFAULT, label: "이 PC" },
+                    ...usable.map((c) => ({ value: c.name, label: c.name })),
+                  ]}
+                  onChange={(v) => edit({ default_llm: v === NO_DEFAULT ? null : v })}
+                />
+              </Row>
+              {/* SUM-08: each new meeting's "로컬로 요약" starts here, offered where it changes a route. */}
+              {localDefaultMatters && (
+                <Row label="새 회의를 기본으로 로컬에서 요약" help="회의마다 요약 전에 바꿀 수 있습니다">
+                  <Switch
+                    checked={draft.summarize_local_by_default}
+                    onCheckedChange={(v) => edit({ summarize_local_by_default: v })}
                   />
                 </Row>
-                {/* SUM-08: each new meeting's "로컬로 요약" starts here. */}
-                {hasLocal && (
-                  <Row label="새 회의를 기본으로 로컬에서 요약" help="회의마다 요약 전에 바꿀 수 있습니다">
-                    <Switch
-                      checked={draft.summarize_local_by_default}
-                      onCheckedChange={(v) => edit({ summarize_local_by_default: v })}
-                    />
-                  </Row>
-                )}
-              </motion.fieldset>
-            )}
+              )}
+            </motion.fieldset>
           </Section>
 
           <Section tab="slack" open={tab}>
@@ -1172,6 +1248,103 @@ export default function Settings({
           barSlot,
         )}
     </Page>
+  );
+}
+
+/** A tab's model files (ONB-01, ONB-02): each one's state and its bar while it downloads, then
+ * 다운로드, 취소 and 직접 가져오기. The 전사 tab's and the summary model's (plan 5.8). */
+function ModelFiles({
+  labels,
+  models,
+  received,
+  busy,
+  blocked,
+  unreadable,
+  onDownload,
+  onCancel,
+  onImport,
+  children,
+}: {
+  /** Each file's name, in `model_status`'s order. */
+  labels: string[];
+  models: ModelState | null;
+  /** The last `model://download` of each file. */
+  received: Record<string, ModelDownload>;
+  /** This screen's download or import: the download itself is the app's one (ipc.ts). */
+  busy: "download" | "import" | null;
+  /** An unsaved change it depends on: download and import wait for 저장. */
+  blocked: boolean;
+  /** The status could not be read: import stays offered (ONB-02). */
+  unreadable: boolean;
+  onDownload: () => void;
+  onCancel: () => void;
+  onImport: () => void;
+  /** Under the buttons: why they wait. */
+  children?: ReactNode;
+}) {
+  const downloading = busy === "download" || !!models?.downloading;
+  // While it runs, only 취소 and the progress show.
+  const idle = !busy && !models?.downloading && !blocked;
+  const missing = !!models?.files.some((f) => !f.installed);
+  // Only while the download still has one of these files to fetch: one for another tab's files, or
+  // started on Home and past these, has nothing here to cancel.
+  const cancellable = downloading && !!models?.files.some((f) => f.downloading);
+  const fileState = (f: ModelFileState) => {
+    const d = received[f.file];
+    if (f.installed) return "설치됨";
+    if (busy === "download" && d) {
+      return `받는 중 ${Math.floor((d.received / d.total) * 100)}% (${mb(d.received)}/${mb(d.total)}MB)`;
+    }
+    return f.received ? `없음 · ${mb(f.received)}/${mb(f.size)}MB 받아 둠` : "없음";
+  };
+  return (
+    <div className="space-y-4 px-5 py-4">
+      {models && (
+        <ul className="space-y-3">
+          {models.files.map((f, i) => {
+            const d = received[f.file];
+            return (
+              <li key={f.file} className="space-y-2">
+                <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+                  <span>
+                    {labels[i]} <span className="text-caption text-ink-2">{f.file}</span>
+                  </span>
+                  <span className="flex items-center gap-1.5 text-label tabular-nums">
+                    {f.installed && <Check aria-hidden className="size-4 text-ok-line" />}
+                    {fileState(f)}
+                  </span>
+                </div>
+                {busy === "download" && d && !f.installed && (
+                  <ProgressBar aria-label={`${labels[i]} 받는 중`} value={Math.floor((d.received / d.total) * 100)} />
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {(missing || downloading || busy || unreadable) && (
+        <div className="flex flex-wrap gap-2">
+          {missing && !downloading && (
+            <Button size="sm" disabled={!idle} onClick={onDownload}>
+              <Download aria-hidden />
+              다운로드
+            </Button>
+          )}
+          {cancellable && (
+            <Button size="sm" variant="outline" onClick={onCancel}>
+              취소
+            </Button>
+          )}
+          {!downloading && (
+            <Button size="sm" variant="ghost" disabled={!idle} onClick={onImport}>
+              <FolderOpen aria-hidden />
+              {busy === "import" ? "가져오는 중" : "직접 가져오기"}
+            </Button>
+          )}
+        </div>
+      )}
+      {children}
+    </div>
   );
 }
 

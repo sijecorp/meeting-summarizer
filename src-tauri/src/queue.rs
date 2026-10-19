@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, Runtime, Wry};
 
 /// Meetings processed at once: two (TRN-01, user decision 2026-10-14), one once the summary model
@@ -65,6 +65,9 @@ pub struct Progress {
     pub eta_secs: Option<u64>,
     /// 1-based place in line while waiting; `None` while running.
     pub position: Option<u32>,
+    /// Unix seconds since the built-in engine began starting for this summary, until it is ready
+    /// or fails (plan 5.3, up to 120 s): the screens count "요약 엔진 준비 중 · N초" from it.
+    pub engine_since: Option<u64>,
 }
 
 /// `transcribe://gpu-failed`: the GPU crashed twice on one chunk, so automatic mode now uses the
@@ -689,6 +692,7 @@ impl<R: Runtime> Queue<R> {
                 percent: 0,
                 eta_secs: None,
                 position: None,
+                engine_since: None,
             },
         );
         self.publish_positions(&mut inner);
@@ -1188,6 +1192,7 @@ impl<R: Runtime> Queue<R> {
                 percent: 0,
                 eta_secs: None,
                 position: None,
+                engine_since: None,
             };
         });
     }
@@ -1268,7 +1273,13 @@ impl<R: Runtime> Queue<R> {
         let (key, recover) = match generation {
             Some(generation) => {
                 let device = first_device(settings.backend, settings.summary_gpu_failed);
-                let endpoint = match self.sidecar.start(generation, device) {
+                let since = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs());
+                self.set_progress(id, |p| p.engine_since = since.ok());
+                let started = self.sidecar.start(generation, device);
+                self.set_progress(id, |p| p.engine_since = None);
+                let endpoint = match started {
                     Ok(endpoint) => endpoint,
                     Err(failure) => return self.engine_end(id, failure),
                 };
@@ -2803,6 +2814,28 @@ mod tests {
             assert!(f.engine_log().contains("--device none"));
             // Plan 5.3: no idle engine once it is done.
             f.engine_gone();
+        }
+
+        /// Plan 5.3, DX6: while the engine starts, the meeting's progress says since when, so the
+        /// screens show "요약 엔진 준비 중 · N초" instead of a summary stuck at 0/0; ready, it is gone.
+        #[test]
+        fn a_builtin_summary_says_while_its_engine_starts() {
+            let _model = summary_model();
+            let f = fixture(SPEECH, Backend::Auto);
+            f.install_summary();
+            let id = f.transcribed(false, None);
+            f.queue().enqueue_pending();
+            f.wait("review", || f.status(&id) == Status::Review);
+            let events = f.events.lock().unwrap();
+            let mine: Vec<_> = events.iter().filter(|e| e["id"] == id.as_str()).collect();
+            let set = mine.iter().position(|e| e["engine_since"].is_u64());
+            let set = set.expect("an event while the engine starts");
+            assert_eq!(mine[set]["status"], "summarizing");
+            let cleared = mine[set + 1..]
+                .iter()
+                .position(|e| e["engine_since"].is_null());
+            assert_eq!(mine[set + 1 + cleared.unwrap()]["status"], "summarizing");
+            assert!(mine.last().unwrap()["engine_since"].is_null());
         }
 
         /// ENG2: a meeting with only its summary left starts without the Whisper model, a cloud

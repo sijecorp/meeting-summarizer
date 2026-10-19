@@ -5,8 +5,9 @@ import { AnimatePresence, motion, useIsPresent, useReducedMotion } from "motion/
 import {
   Banner,
   DeleteDialog,
+  EngineStarting,
+  engineStarting,
   hhmm,
-  host,
   lengthText,
   mmss,
   phase,
@@ -14,6 +15,7 @@ import {
   ro,
   RouteNotice,
   SelectField,
+  useSummaryModel,
 } from "@/components/common";
 import {
   AlertDialog,
@@ -41,6 +43,7 @@ import {
   getMeeting,
   getSettings,
   getTranscript,
+  listConnections,
   NEWER_VERSION,
   onSlackFinished,
   resumeMeeting,
@@ -51,6 +54,7 @@ import {
   SLACK_MAX,
   slackLength,
   STATUS_LABEL,
+  type ConnectionItem,
   type MeetingDetail,
   type MeetingItem,
   type Progress,
@@ -161,6 +165,8 @@ export default function Meeting({
   const reduce = useReducedMotion();
   const [detail, setDetail] = useState<MeetingDetail | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
+  // What 요약 다시 실행 and a waiting meeting may pick: the saved connections and this PC (plan 5.4).
+  const [connections, setConnections] = useState<ConnectionItem[] | null>(null);
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   // `title` and `body` hold the meeting's text: read once it has a summary.
@@ -323,6 +329,7 @@ export default function Meeting({
       },
       (e) => setError(`설정을 읽지 못했습니다: ${e}`),
     );
+    listConnections().then(setConnections, (e) => setError(`LLM 연결 목록을 읽지 못했습니다: ${e}`));
   }, []);
 
   // Counted by Rust from the very text a send builds, a moment after typing stops.
@@ -483,24 +490,35 @@ export default function Meeting({
   const canSend = editable && !!channel && over === 0 && !inFlight;
   const transcribeFailed = meta?.status === "transcribe_failed" && now === null && !newer;
   const summaryFailed = meta?.status === "summarize_failed" && now === null && !newer;
-  // Stopped after transcribing, with no place in line: no LLM connection.
+  // Stopped after transcribing, with no place in line: its route does not resolve yet.
   const stopped = meta?.status === "transcribed" && now === null && !newer;
+  // Plan 5.4, ENG15: waiting with its transcript for the summary model or for a connection to
+  // replace a deleted one. Not in line, so another connection can be picked.
+  const waits =
+    !newer &&
+    !!meta?.wait &&
+    (meta.status === "transcribed" || meta.status === "paused") &&
+    now !== "running" &&
+    progress?.position == null;
   // Events come before the meeting is read again: a summary's first one can meet a transcribing meta.
   const writing = now === "running" && (progress?.status === "summarizing" || meta?.status === "summarizing");
   const requests = progress?.status === "summarizing" && progress.chunks > 1 ? progress : null;
   const hasTranscript =
     !!meta && (TRANSCRIBED.includes(meta.status) || (meta.status === "paused" && !!meta.llm_connection));
   const text = loaded && !meta?.no_speech;
-  const connections = settings?.llm_connections ?? null;
-  // The meeting's own connection first if it still exists, then the default, then the first.
-  const names = connections?.map((c) => c.name) ?? [];
-  const connection =
-    chosen || ([meta?.llm_connection, settings?.default_llm].find((n) => n && names.includes(n)) ?? names[0] ?? "");
-  const hint = stopped
-    ? "LLM 연결을 추가하면 요약합니다"
-    : summaryFailed && connections?.length === 0
-      ? "LLM 연결을 추가하면 요약을 다시 실행할 수 있습니다"
-      : "";
+  // This PC is offered once its summary model is in (plan 5.2); until then it shows why not.
+  const summaryModel = useSummaryModel(summaryFailed || waits);
+  const builtinNote = !summaryModel?.installed
+    ? summaryModel?.downloading
+      ? " (요약 모델 받는 중)"
+      : summaryModel && " (요약 모델 없음)"
+    : "";
+  // SUM-06, plan 5.4: the failed or pinned connection while it can run, else a local default, else
+  // this PC, else nothing picked. A summary never moves to the cloud unasked.
+  const offered = (name?: string | null) =>
+    connections?.find((c) => c.name === name && (!c.builtin || !!summaryModel?.installed));
+  const localDefault = offered(settings?.default_llm)?.is_local ? settings?.default_llm : null;
+  const connection = chosen || ([meta?.llm_connection, localDefault, BUILTIN].find(offered) ?? "");
   // REV-01: the prompt writes "미정" for an owner or a date nobody named (architecture 6.2).
   const undecided = body
     .split("\n")
@@ -793,16 +811,22 @@ export default function Meeting({
           </>
         )}
 
-        {detail && meta && !reviewable && !newer && (now || transcribeFailed || summaryFailed || stopped) && (
+        {detail && meta && !reviewable && !newer && (now || transcribeFailed || summaryFailed || stopped || waits) && (
           <>
             <div className="space-y-4">
               <Steps meta={meta} progress={progress} failed={transcribeFailed || summaryFailed} />
-              <RouteNotice id={id} status={meta.status} />
+              {/* Why a waiting meeting waits, the summary model's state with it (DX6). */}
+              <RouteNotice
+                id={id}
+                status={meta.status}
+                wait={waits ? meta.wait : undefined}
+                pinned={meta.llm_connection}
+                onSetup={() => onSetup("llm")}
+              />
             </div>
             {/* Hidden once a retry has it back in line. */}
             {now === null && meta.error && <Banner kind="error">{meta.error}</Banner>}
-            {hint && <p>{hint}</p>}
-            {(transcribeFailed || summaryFailed || stopped) && (
+            {(transcribeFailed || summaryFailed || waits) && (
               <div className="flex flex-wrap items-end gap-2">
                 {transcribeFailed && (
                   <Button variant="outline" onClick={() => queued(resumeMeeting(id))}>
@@ -810,28 +834,38 @@ export default function Meeting({
                     다시 시도
                   </Button>
                 )}
-                {summaryFailed && !!connections?.length && (
+                {(summaryFailed || waits) && !!connections?.length && (
                   <>
                     <div className="min-w-56">
                       <SelectField
                         label="요약할 LLM 연결"
                         value={connection}
-                        // SUM-07: where each one would send the transcript.
+                        placeholder="연결을 골라 주세요"
+                        // SUM-07: where each one would send the transcript. This PC is named once.
                         options={connections.map((c) => ({
                           value: c.name,
-                          label: `${c.name} (${c.is_local ? "이 PC" : `${host(c.base_url)}로 전송`})`,
+                          label: c.builtin
+                            ? `${c.label}${builtinNote || ""}`
+                            : `${c.label} (${c.is_local ? "이 PC" : `${c.host}로 전송`})`,
+                          disabled: c.builtin && !summaryModel?.installed,
                         }))}
                         onChange={setChosen}
                       />
                     </div>
-                    <Button variant="outline" onClick={() => queued(retrySummary(id, connection))}>
+                    {/* Rust refuses a pick that cannot run yet; its words show above. */}
+                    <Button
+                      variant="outline"
+                      disabled={!connection}
+                      onClick={() => queued(retrySummary(id, connection))}
+                    >
                       <RotateCcw aria-hidden />
-                      요약 다시 실행
+                      {summaryFailed ? "요약 다시 실행" : "이 연결로 요약"}
                     </Button>
                   </>
                 )}
-                {/* A missing or refused key (6.4) is fixed there too. */}
-                {(stopped || summaryFailed) && (
+                {/* A missing or refused key (6.4) is fixed there too, and a connection to replace a
+                    deleted one is added there. The missing summary model has the notice's link. */}
+                {(summaryFailed || (waits && meta.wait === "connection_deleted")) && (
                   <Button variant="outline" onClick={() => onSetup("llm")}>
                     요약(LLM) 설정
                   </Button>
@@ -842,9 +876,13 @@ export default function Meeting({
               <div className="space-y-4 pt-2">
                 {writing && (
                   <p className="text-label text-ink-2 tabular-nums">
-                    {["요약을 쓰고 있어요", requests && `${Math.min(requests.chunk + 1, requests.chunks)}/${requests.chunks}`]
-                      .filter(Boolean)
-                      .join(" · ")}
+                    {engineStarting(progress) ? (
+                      <EngineStarting since={progress.engine_since} />
+                    ) : (
+                      ["요약을 쓰고 있어요", requests && `${Math.min(requests.chunk + 1, requests.chunks)}/${requests.chunks}`]
+                        .filter(Boolean)
+                        .join(" · ")
+                    )}
                   </p>
                 )}
                 <Skeleton writing={writing} />

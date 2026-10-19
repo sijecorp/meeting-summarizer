@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, expect, test } from "vitest";
-import type { Level, RecordingState, Warning } from "../lib/ipc";
+import type { Level, LlmConnection, ModelFileState, RecordingState, SummaryRoute, Warning } from "../lib/ipc";
 import Recording from "./Recording";
 
 // No clearMocks(): the screen unlistens asynchronously after unmount (see App.test.tsx).
@@ -65,23 +65,58 @@ test("a dismissed warning stays hidden until it is sent again", async () => {
   expect(screen.getByText(mic.message)).toBeTruthy();
 });
 
-// SUM-07: shown while recording, before anything is sent.
-test("tells where this meeting's summary will go", async () => {
+const GGUF = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
+// `settings::builtin`, as `summary_route` names it.
+const thisPc: LlmConnection = {
+  name: "builtin",
+  base_url: "",
+  model: GGUF,
+  context_tokens: 16_384,
+  is_local: true,
+  timeout_secs: 1_800,
+};
+
+// SUM-07: shown while recording, before anything is sent. With this PC as the default and no route
+// yet, the summary model in one of three states (plan 5.2, DX6).
+test("tells where this meeting's summary will go, and what the summary model still needs", async () => {
   const asked: unknown[] = [];
+  let route: SummaryRoute = { connection: null, local: false, local_available: false, locked: false, toggle_matters: false };
+  let summary: ModelFileState = { file: GGUF, size: 2_497_281_120, installed: false, received: 0, downloading: false };
   mockIPC(
     (cmd, args) => {
       if (cmd === "recording_state") return state;
       if (cmd === "summary_route") {
         asked.push(args);
-        return { connection: null, local: false, local_available: false, locked: false };
+        return route;
       }
+      if (cmd === "model_status") return { files: [summary], downloading: summary.downloading };
     },
     { shouldMockEvents: true },
   );
-  render(<Recording stopping={false} onHome={() => {}} onStop={() => {}} />);
+  let opened = 0;
+  const recording = () => render(<Recording stopping={false} onHome={() => {}} onStop={() => {}} onSetup={() => opened++} />);
 
-  expect(await screen.findByText("LLM 연결이 없어 전사까지만 합니다")).toBeTruthy();
+  const missing = recording();
+  expect(await screen.findByText("설정 → 요약(LLM)에서 요약 모델을 받아 주세요")).toBeTruthy();
   expect(asked).toEqual([{ id: state.id }]);
+  fireEvent.click(screen.getByRole("button", { name: "요약(LLM) 설정" }));
+  expect(opened).toBe(1);
+  missing.unmount();
+
+  summary = { ...summary, received: 1_248_640_560, downloading: true };
+  const downloading = recording();
+  expect(await screen.findByText("요약 모델 받는 중 50% · 다 받으면 자동으로 요약합니다")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "요약(LLM) 설정" })).toBeNull();
+  const progress = { file: GGUF, received: 1_872_960_840, total: 2_497_281_120, all_received: 0, all_total: 0 };
+  await act(() => emit("model://download", progress));
+  expect(await screen.findByText("요약 모델 받는 중 75% · 다 받으면 자동으로 요약합니다")).toBeTruthy();
+  downloading.unmount();
+
+  route = { ...route, connection: thisPc, local_available: true };
+  recording();
+  expect(await screen.findByText("이 PC에서 요약합니다. 전사본은 밖으로 나가지 않습니다")).toBeTruthy();
+  // This PC is the default, its model in: "로컬로 요약" would change nothing.
+  expect(screen.queryByRole("switch", { name: "로컬로 요약" })).toBeNull();
 });
 
 // Design-system 6.3: leaving for Home keeps recording; only the stop button (or ⌘.) stops it.

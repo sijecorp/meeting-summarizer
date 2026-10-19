@@ -187,6 +187,10 @@ pub struct SummaryRoute {
     pub local_available: bool,
     /// Summarizing has started: the route no longer changes.
     pub locked: bool,
+    /// Flipping "로컬로 요약" changes where this meeting's summary goes, or whether it waits: only
+    /// then is the toggle worth offering (plan 5.4). Not with a local default, nor with this PC
+    /// as the default and its model in.
+    pub toggle_matters: bool,
 }
 
 impl SummaryRoute {
@@ -205,6 +209,13 @@ impl SummaryRoute {
             local: meta.summarize_local,
             local_available: local_available(settings, builtin_ready),
             locked: meta.summary_started(),
+            toggle_matters: {
+                let flipped = Meta {
+                    summarize_local: !meta.summarize_local,
+                    ..meta.clone()
+                };
+                route(settings, &flipped, builtin_ready) != route(settings, meta, builtin_ready)
+            },
         }
     }
 }
@@ -1377,6 +1388,40 @@ pub(crate) mod tests {
         assert!(!local_available(&s, false) && local_available(&s, true));
     }
 
+    /// Plan 5.4: "로컬로 요약" is offered only where flipping it changes the route.
+    #[test]
+    fn the_local_toggle_matters_only_where_it_changes_the_route() {
+        let ollama = connection("u", "ollama", true);
+        let cloud = connection("u", "cloud", false);
+        let matters = |s: &Settings, ready: bool| {
+            let off = SummaryRoute::of(s, &meta(None, false), ready).toggle_matters;
+            let on = SummaryRoute::of(s, &meta(None, true), ready).toggle_matters;
+            assert_eq!(off, on, "the same either way");
+            off
+        };
+        // This PC as the default, its model in: this PC either way.
+        assert!(!matters(&settings(vec![ollama.clone()], None), true));
+        // This PC without its model and a saved local one: on goes there, off waits.
+        assert!(matters(&settings(vec![ollama.clone()], None), false));
+        // Without either, it waits either way.
+        assert!(!matters(&settings(vec![], None), false));
+        // A cloud default.
+        assert!(matters(
+            &settings(vec![cloud.clone(), ollama.clone()], Some("cloud")),
+            true
+        ));
+        // A saved local default.
+        assert!(!matters(
+            &settings(vec![cloud.clone(), ollama.clone()], Some("ollama")),
+            false
+        ));
+        // A default whose name is gone is this PC.
+        assert!(!matters(&settings(vec![cloud], Some("gone")), true));
+        // Pinned: the toggle changes nothing.
+        let s = settings(vec![ollama], Some("ollama"));
+        assert!(!SummaryRoute::of(&s, &meta(Some("ollama"), false), true).toggle_matters);
+    }
+
     #[test]
     fn summary_route_tells_where_and_whether_it_can_still_change() {
         let s = settings(
@@ -1407,6 +1452,8 @@ pub(crate) mod tests {
             (none.connection, none.local, none.local_available),
             (None, true, false)
         );
+        // A cloud default: the toggle sends it to this PC or a local connection instead.
+        assert!(route.toggle_matters);
         let ready = SummaryRoute::of(&settings(vec![], None), &meta(None, true), true);
         assert_eq!(
             (ready.connection.map(|c| c.name), ready.local_available),

@@ -3,7 +3,17 @@ import { emit } from "@tauri-apps/api/event";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { hhmm } from "../components/common";
-import type { LlmConnection, LoadedSettings, MeetingDetail, Meta, Progress, Segment, Settings } from "../lib/ipc";
+import type {
+  ConnectionItem,
+  LlmConnection,
+  LoadedSettings,
+  MeetingDetail,
+  Meta,
+  ModelFileState,
+  Progress,
+  Segment,
+  Settings,
+} from "../lib/ipc";
 import Meeting from "./Meeting";
 import { parseDoc } from "./MeetingParts";
 import lines from "../../src-tauri/tests/fixtures/summary-lines.json";
@@ -1056,8 +1066,28 @@ test("the summary arrives in place once ready, as a document to edit", async () 
   expect(await sendButton("#회의록으로 보내기")).toBeTruthy();
 });
 
-// SUM-06: the meeting's own connection is gone, so the default is offered first; another can be
-// picked. Each says where it sends the transcript (SUM-07).
+// What `list_connections` offers: the saved connections, then this PC (plan 5.4).
+const item = (name: string, is_local = false, host = "api.example.com"): ConnectionItem => ({
+  name,
+  label: name,
+  host,
+  is_local,
+  builtin: false,
+});
+const THIS_PC: ConnectionItem = { name: "builtin", label: "이 PC", host: "", is_local: true, builtin: true };
+const GGUF = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
+const summaryModel = (patch: Partial<ModelFileState> = {}) => ({
+  files: [{ file: GGUF, size: 2_497_281_120, installed: false, received: 0, downloading: false, ...patch }],
+  downloading: !!patch.downloading,
+});
+const picker = () => screen.findByRole("combobox", { name: "요약할 LLM 연결" });
+const choose = async (option: string) => {
+  fireEvent.keyDown(await picker(), { key: "Enter" });
+  fireEvent.click(await screen.findByRole("option", { name: option }));
+};
+
+// SUM-06: the meeting's own connection is gone, so a local default is offered first; another can
+// be picked. Each says where it sends the transcript (SUM-07), this PC by its name alone.
 test("요약 다시 실행 queues the failed summary with the picked connection", async () => {
   const error = "LLM 응답 시간 초과입니다. 연결을 확인하고 다시 실행해 주세요";
   const failed = meta({ status: "summarize_failed", error, llm_connection: "지운 연결" });
@@ -1065,14 +1095,16 @@ test("요약 다시 실행 queues the failed summary with the picked connection"
     if (cmd === "get_settings") {
       return settings({ llm_connections: [connection("회사 클라우드"), connection("로컬")], default_llm: "로컬" });
     }
+    if (cmd === "list_connections") return [item("회사 클라우드"), item("로컬", true), THIS_PC];
     if (cmd === "retry_summary") return { ...failed, llm_connection: "회사 클라우드" };
   });
   render(<Meeting id={id} {...props} />);
 
   expect(await screen.findByText(error)).toBeTruthy();
-  const select = await screen.findByRole("combobox", { name: "요약할 LLM 연결" });
+  const select = await picker();
   await waitFor(() => expect(select.textContent).toBe("로컬 (이 PC)"));
   fireEvent.keyDown(select, { key: "Enter" });
+  expect(await screen.findByRole("option", { name: "이 PC (요약 모델 없음)" })).toBeTruthy();
   fireEvent.click(await screen.findByRole("option", { name: "회사 클라우드 (api.example.com로 전송)" }));
   await waitFor(() => expect(select.textContent).toBe("회사 클라우드 (api.example.com로 전송)"));
   // A key problem is fixed in settings, so that stays in reach too.
@@ -1084,30 +1116,121 @@ test("요약 다시 실행 queues the failed summary with the picked connection"
   );
 });
 
-test("without a connection, the hint opens the 요약(LLM) tab", async () => {
-  const opened: string[] = [];
-  const detail = { meta: meta({ status: "transcribed", llm_connection: null }), summary: "" };
-  mock(detail, (cmd) => (cmd === "get_transcript" ? [] : undefined));
-  const onSetup = (tab: string) => opened.push(tab);
-  // Read as `transcribed` while the last transcribing event is still here: summarizing comes next.
-  const between = render(<Meeting id={id} {...props} onSetup={onSetup} progress={progress({ status: "transcribing" })} />);
-  const steps = await screen.findByRole("list", { name: "처리 단계" });
-  expect(screen.queryByText("LLM 연결을 추가하면 요약합니다")).toBeNull();
-  // Still at 전사, as the event says, not at 요약 with no mark.
-  expect(within(steps).getAllByRole("listitem").find((li) => li.getAttribute("aria-current"))?.textContent).toBe(
-    "전사",
-  );
-  between.unmount();
+// Plan 5.4: a failed summary on this PC is offered on this PC again once its model is in, never
+// moved to the cloud default unasked; without the model nothing is picked for the recorder.
+test("a failed summary on this PC offers this PC once its model is in, and nothing without it", async () => {
+  const refused = "이 PC 요약 모델이 아직 없습니다. 설정 → 요약(LLM)에서 요약 모델을 먼저 받아 주세요";
+  const failed = meta({ status: "summarize_failed", error: "요약이 길이 제한에서 끊겼습니다", llm_connection: "builtin" });
+  let installed = true;
+  const calls = mock({ meta: failed, summary: "" }, (cmd) => {
+    if (cmd === "get_settings") return settings({ llm_connections: [connection("회사 클라우드")], default_llm: "회사 클라우드" });
+    if (cmd === "list_connections") return [item("회사 클라우드"), THIS_PC];
+    if (cmd === "model_status") return summaryModel({ installed });
+    if (cmd === "retry_summary") throw refused;
+  });
+  const ready = render(<Meeting id={id} {...props} />);
 
-  const first = render(<Meeting id={id} {...props} onSetup={onSetup} />);
-  expect(await screen.findByText("LLM 연결을 추가하면 요약합니다")).toBeTruthy();
+  await waitFor(async () => expect((await picker()).textContent).toBe("이 PC"));
+  fireEvent.click(screen.getByRole("button", { name: "요약 다시 실행" }));
+  // Rust has the last word (the model may have gone meanwhile), and its words show.
+  expect(await screen.findByText(refused)).toBeTruthy();
+  expect(calls.find((c) => c.cmd === "retry_summary")?.args).toEqual({ id, connection: "builtin" });
+  ready.unmount();
+
+  installed = false;
+  render(<Meeting id={id} {...props} />);
+  await waitFor(async () => expect((await picker()).textContent).toBe("연결을 골라 주세요"));
+  expect((screen.getByRole("button", { name: "요약 다시 실행" }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.keyDown(await picker(), { key: "Enter" });
+  const thisPc = await screen.findByRole("option", { name: "이 PC (요약 모델 없음)" });
+  expect(thisPc.getAttribute("aria-disabled")).toBe("true");
+});
+
+// Plan 5.2, DX6, ENG15: waiting for the summary model, the document says how far it is or where to
+// get it, and another connection can be picked instead; then the notice follows the new route.
+test("a meeting waiting for the summary model says so, and can take another connection", async () => {
+  const opened: string[] = [];
+  let model = summaryModel({ received: 999_000_000, downloading: true });
+  const waiting = meta({ status: "transcribed", llm_connection: null, wait: "summary_model" });
+  const waitingRoute = { connection: null, local: false, local_available: false, locked: false, toggle_matters: false };
+  let route: unknown = waitingRoute;
+  const calls = mock({ meta: waiting, summary: "" }, (cmd) => {
+    if (cmd === "get_settings") return settings({ llm_connections: [connection("회사 클라우드")] });
+    if (cmd === "list_connections") return [item("회사 클라우드"), THIS_PC];
+    if (cmd === "summary_route") return route;
+    if (cmd === "model_status") return model;
+    if (cmd === "get_transcript") return [];
+    if (cmd === "retry_summary") {
+      route = { ...waitingRoute, connection: connection("회사 클라우드"), locked: true };
+      return { ...waiting, llm_connection: "회사 클라우드", wait: undefined };
+    }
+  });
+  const downloading = render(<Meeting id={id} {...props} onSetup={(tab) => opened.push(tab)} />);
+
+  const notice = "요약 모델 받는 중 40% · 다 받으면 자동으로 요약합니다";
+  expect(await screen.findByText(notice)).toBeTruthy();
+  // Nothing to set up while it downloads, and this PC is not offered before its model is in.
+  expect(screen.queryByRole("button", { name: "요약(LLM) 설정" })).toBeNull();
+  await waitFor(async () => expect((await picker()).textContent).toBe("연결을 골라 주세요"));
+  expect((screen.getByRole("button", { name: "이 연결로 요약" }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.keyDown(await picker(), { key: "Enter" });
+  expect((await screen.findByRole("option", { name: "이 PC (요약 모델 받는 중)" })).getAttribute("aria-disabled")).toBe(
+    "true",
+  );
+  fireEvent.click(await screen.findByRole("option", { name: "회사 클라우드 (api.example.com로 전송)" }));
+  fireEvent.click(screen.getByRole("button", { name: "이 연결로 요약" }));
+  await waitFor(() =>
+    expect(calls.find((c) => c.cmd === "retry_summary")?.args).toEqual({ id, connection: "회사 클라우드" }),
+  );
+  // Same status, new pin: the route is read again and no longer waits for the model.
+  await waitFor(() => expect(screen.queryByText(notice)).toBeNull());
+  downloading.unmount();
+
+  model = summaryModel();
+  route = waitingRoute;
+  render(<Meeting id={id} {...props} onSetup={(tab) => opened.push(tab)} />);
+  expect(await screen.findByText("설정 → 요약(LLM)에서 요약 모델을 받아 주세요")).toBeTruthy();
+  // One way there, beside the words.
   fireEvent.click(screen.getByRole("button", { name: "요약(LLM) 설정" }));
   expect(opened).toEqual(["llm"]);
-  first.unmount();
+  expect(screen.getByRole("button", { name: "이 연결로 요약" })).toBeTruthy();
+});
 
-  // A failed summary whose connections were all removed.
-  detail.meta = meta({ status: "summarize_failed" });
-  render(<Meeting id={id} {...props} onSetup={onSetup} />);
-  expect(await screen.findByText("LLM 연결을 추가하면 요약을 다시 실행할 수 있습니다")).toBeTruthy();
-  expect(screen.queryByRole("button", { name: "요약 다시 실행" })).toBeNull();
+// ENG15: pinned to a connection since deleted, it waits and asks for another; never sent elsewhere
+// by itself. Rust checks the pick and its refusal shows. Paused, it is out of line all the same.
+test("a meeting whose connection was deleted asks for another, and a refused pick says why", async () => {
+  const refused = "LLM 연결 '회사 클라우드'을(를) 찾을 수 없습니다. 다른 연결을 골라 주세요";
+  const waiting = meta({ status: "paused", llm_connection: "지운 연결", wait: "connection_deleted" });
+  const calls = mock({ meta: waiting, summary: "" }, (cmd) => {
+    if (cmd === "get_settings") return settings({ llm_connections: [connection("회사 클라우드")], default_llm: "회사 클라우드" });
+    if (cmd === "list_connections") return [item("회사 클라우드"), THIS_PC];
+    if (cmd === "summary_route") return { connection: null, local: false, local_available: false, locked: true, toggle_matters: false };
+    if (cmd === "model_status") return summaryModel({ installed: true });
+    if (cmd === "get_transcript") return [];
+    if (cmd === "retry_summary") throw refused;
+  });
+  render(<Meeting id={id} {...props} />);
+
+  expect(await screen.findByText("이 회의에 정한 연결이 삭제됐습니다. 다른 연결을 골라 주세요")).toBeTruthy();
+  // Another connection may still have to be added.
+  expect(screen.getByRole("button", { name: "요약(LLM) 설정" })).toBeTruthy();
+  expect(screen.queryByText(/대기 중/)).toBeNull();
+  // Not the cloud default: this PC, its model in, until another is picked.
+  await waitFor(async () => expect((await picker()).textContent).toBe("이 PC"));
+  await choose("회사 클라우드 (api.example.com로 전송)");
+  fireEvent.click(screen.getByRole("button", { name: "이 연결로 요약" }));
+  expect(await screen.findByText(refused)).toBeTruthy();
+  expect(calls.find((c) => c.cmd === "retry_summary")?.args).toEqual({ id, connection: "회사 클라우드" });
+});
+
+// Plan 5.3: while the engine loads, the document says so with its seconds, not a stuck 0/0.
+test("a summary on this PC says while its engine starts", async () => {
+  mock({ meta: meta({ status: "summarizing", title: "", llm_connection: "builtin" }), summary: "" });
+  const since = Math.floor(Date.now() / 1000) - 5;
+  const { rerender } = render(<Meeting id={id} {...props} progress={progress({ engine_since: since })} />);
+
+  expect(await screen.findByText(/^요약 엔진 준비 중 · [5-7]초$/)).toBeTruthy();
+  expect(screen.queryByText("요약을 쓰고 있어요")).toBeNull();
+  rerender(<Meeting id={id} {...props} progress={progress({ engine_since: null })} />);
+  expect(await screen.findByText("요약을 쓰고 있어요")).toBeTruthy();
 });

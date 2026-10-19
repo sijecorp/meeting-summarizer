@@ -58,6 +58,7 @@ export default function Recording({
   stopping,
   onHome,
   onStop,
+  onSetup,
 }: {
   /** The recording meeting's `created_at`, when the list has it. */
   startedAt?: string;
@@ -65,6 +66,8 @@ export default function Recording({
   stopping: boolean;
   onHome: () => void;
   onStop: () => void;
+  /** Opens the 요약(LLM) tab, where the summary model downloads. */
+  onSetup?: () => void;
 }) {
   // The recording's meeting id; null when none is running, undefined until asked.
   const [id, setId] = useState<string | null>();
@@ -164,7 +167,7 @@ export default function Recording({
               </div>
             </div>
             <div className="flex w-full max-w-doc flex-col items-center gap-3">
-              <RouteNotice id={id} center />
+              <RouteNotice id={id} center onSetup={onSetup} />
               {heardSystem && (
                 <p className="text-sm text-ink-2">
                   스피커 소리가 마이크에 다시 녹음되면 전사가 부정확해질 수 있습니다. 헤드폰을 쓰는 것을

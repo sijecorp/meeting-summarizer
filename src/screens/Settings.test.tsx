@@ -259,7 +259,7 @@ test("adding a connection never changes the default LLM", async () => {
     target: { value: "회사 클라우드" },
   });
   fireEvent.click(screen.getByRole("button", { name: "연결 추가" }));
-  expect(screen.getByRole("combobox", { name: "기본 LLM" }).textContent).toBe("선택 안 함");
+  expect(screen.getByRole("combobox", { name: "기본 LLM" }).textContent).toBe("이 PC");
 
   fireEvent.click(screen.getByRole("button", { name: "저장" }));
   const saved = () => calls.filter((c) => c.cmd === "save_settings").map((c) => c.args.value);
@@ -484,38 +484,26 @@ test("the unreadable-settings screen offers 로그 폴더 열기 too", async () 
 });
 
 // SUM-07 for each cloud address; SUM-08's default for new meetings needs a local connection.
-test("요약(LLM) tab: where a transcript goes, and the local default only with a local connection", async () => {
+test("요약(LLM) tab: where a transcript goes, and how a local server is set up", async () => {
   const calls: Call[] = [];
   mockIPC((cmd, args) => {
     calls.push({ cmd, args: args as Call["args"] });
-    if (cmd === "get_settings") {
-      return { ...loaded, settings: { ...loaded.settings, summarize_local_by_default: true } };
-    }
+    if (cmd === "get_settings") return loaded;
     if (cmd === "has_secret") return true;
   });
   render(<Settings tab="llm" onHome={() => {}} />);
-  const localDefault = () => screen.queryByRole("switch", { name: "새 회의를 기본으로 로컬에서 요약" });
   const saved = () => calls.filter((c) => c.cmd === "save_settings").map((c) => c.args.value);
 
   await expand("회사 클라우드");
   expect(screen.getByText("요약할 때 전사본 전문이 이 주소로 전송됩니다")).toBeTruthy();
   expect(screen.queryByText(/OLLAMA_CONTEXT_LENGTH/)).toBeNull();
-  expect(localDefault()).toBeNull();
-  // Hidden, so it cannot stay on. (The bar comes with an edit.)
-  fireEvent.change(screen.getByRole("textbox", { name: "모델" }), { target: { value: "m2" } });
-  fireEvent.click(screen.getByRole("button", { name: "저장" }));
-  await waitFor(() => expect(saved()).toMatchObject([{ summarize_local_by_default: false }]));
 
   fireEvent.click(screen.getByRole("switch", { name: "이 PC에서 도는 로컬 LLM (Ollama, LM Studio)" }));
   expect(screen.queryByText("요약할 때 전사본 전문이 이 주소로 전송됩니다")).toBeNull();
   expect(screen.getByText(/OLLAMA_CONTEXT_LENGTH/)).toBeTruthy();
-  fireEvent.click(localDefault()!);
   fireEvent.click(screen.getByRole("button", { name: "저장" }));
-  await waitFor(() => expect(saved()).toHaveLength(2));
-  expect(saved()[1]).toMatchObject({
-    summarize_local_by_default: true,
-    llm_connections: [{ name: "회사 클라우드", is_local: true }],
-  });
+  await waitFor(() => expect(saved()).toHaveLength(1));
+  expect(saved()[0]).toMatchObject({ llm_connections: [{ name: "회사 클라우드", is_local: true }] });
 });
 
 const WHISPER = "ggml-large-v3-turbo-q8_0.bin";
@@ -530,14 +518,17 @@ const models = (whisper: Partial<ModelFileState> = {}): ModelState => ({
 
 test("전사 tab: file states, download progress from events, and a quiet cancel", async () => {
   const calls: Call[] = [];
+  // Like `Models::state`: a file the running download still has to fetch says so.
+  let running = false;
   mockIPC(
     (cmd, args) => {
       calls.push({ cmd, args: args as Call["args"] });
       if (cmd === "get_settings") return loaded;
       if (cmd === "has_secret") return true;
-      if (cmd === "model_status") return models({ received: 437_094_037 });
+      if (cmd === "model_status") return { ...models({ received: 437_094_037, downloading: running }), downloading: running };
       if (cmd === "download_models") {
-        return new Promise((_, reject) => (release = () => reject("모델 다운로드를 취소했습니다")));
+        running = true;
+        return new Promise((_, reject) => (release = () => ((running = false), reject("모델 다운로드를 취소했습니다"))));
       }
       if (cmd === "cancel_model_download") {
         release();
@@ -648,15 +639,17 @@ test("an unsaved model address blocks download and import until saved", async ()
 // failure while the screen was closed shows on the next visit.
 test("reopened mid-download, the tab follows the same download and later shows its failure", async () => {
   let fail = (_: string) => {};
+  let running = false;
   mockIPC(
     (cmd) => {
       if (cmd === "get_settings") return loaded;
       if (cmd === "has_secret") return true;
-      if (cmd === "model_status") return models();
+      if (cmd === "model_status") return { ...models({ downloading: running }), downloading: running };
       if (cmd === "download_models") {
+        running = true;
         return new Promise((resolve, reject) => {
-          release = () => resolve(undefined);
-          fail = reject;
+          release = () => ((running = false), resolve(undefined));
+          fail = (e) => ((running = false), reject(e));
         });
       }
     },
@@ -727,6 +720,272 @@ test("once a cancel stopped the download, a later answer cannot turn its end int
   release();
   await running;
   expect(modelDownloadFailure()).toBe("");
+});
+
+const GGUF = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
+const summaryModel = (patch: Partial<ModelFileState> = {}): ModelState => ({
+  files: [{ file: GGUF, size: 2_497_281_120, installed: false, received: 0, downloading: false, ...patch }],
+  downloading: false,
+});
+const thisPcDefault = { ...loaded, settings: { ...loaded.settings, default_llm: null } };
+
+// Plan 5.8: this PC first, its model got here as the 전사 tab gets its own, then the other connections.
+test("요약(LLM) tab: this PC's summary model downloads here, beside the device and the memory it takes", async () => {
+  const calls: Call[] = [];
+  let running = false;
+  mockIPC(
+    (cmd, args) => {
+      calls.push({ cmd, args: args as Call["args"] });
+      if (cmd === "get_settings") return thisPcDefault;
+      if (cmd === "has_secret") return true;
+      if (cmd === "model_status") {
+        const state = (args as Call["args"]).scope === "summary" ? summaryModel({ downloading: running }) : models();
+        return { ...state, downloading: running };
+      }
+      if (cmd === "download_models") {
+        running = true;
+        return new Promise((_, reject) => (release = () => ((running = false), reject("모델 다운로드를 취소했습니다"))));
+      }
+      if (cmd === "cancel_model_download") {
+        release();
+        return "stopped";
+      }
+    },
+    { shouldMockEvents: true },
+  );
+  render(<Settings tab="llm" onHome={() => {}} />);
+
+  expect(await screen.findByText(GGUF)).toBeTruthy();
+  expect(screen.getByRole("heading", { level: 3, name: "이 PC에서 요약 기본" })).toBeTruthy();
+  expect(screen.getByRole("heading", { level: 3, name: "다른 연결" })).toBeTruthy();
+  expect(screen.getByText("요약하는 동안 메모리를 약 5GB 씁니다")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "다운로드" }));
+  const progress = { file: GGUF, received: 1_248_640_560, total: 2_497_281_120, all_received: 0, all_total: 0 };
+  await act(() => emit("model://download", progress));
+  expect(await screen.findByText("받는 중 50% (1249/2497MB)")).toBeTruthy();
+  expect(screen.getByRole("progressbar", { name: "요약 모델 받는 중" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "직접 가져오기" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "취소" }));
+  await waitFor(() =>
+    expect((screen.getByRole("button", { name: "다운로드" }) as HTMLButtonElement).disabled).toBe(false),
+  );
+  const scopes = calls.filter((c) => c.cmd.includes("model")).map((c) => [c.cmd, c.args.scope]);
+  expect(scopes).toEqual(
+    expect.arrayContaining([
+      ["model_status", "summary"],
+      ["download_models", "summary"],
+      ["cancel_model_download", "summary"],
+    ]),
+  );
+  expect(screen.queryByRole("alert")).toBeNull();
+
+  // One device setting for both: read here, changed in the 전사 tab.
+  fireEvent.click(screen.getByRole("button", { name: "자동 · 전사 탭에서 바꾸기" }));
+  expect(screen.getByRole("button", { name: "전사" }).getAttribute("aria-current")).toBe("page");
+});
+
+test("the summary model's 직접 가져오기 picks a .gguf for the summary scope", async () => {
+  const calls: Call[] = [];
+  const path = `/Users/me/Downloads/${GGUF}`;
+  mockIPC((cmd, args) => {
+    calls.push({ cmd, args: args as Call["args"] });
+    if (cmd === "get_settings") return thisPcDefault;
+    if (cmd === "has_secret") return true;
+    if (cmd === "model_status") return summaryModel();
+    if (cmd === "plugin:dialog|open") return path;
+    if (cmd === "import_model") return summaryModel({ installed: true });
+  });
+  render(<Settings tab="llm" onHome={() => {}} />);
+
+  expect(await screen.findByText("없음")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "직접 가져오기" }));
+  expect(await screen.findByText("설치됨")).toBeTruthy();
+  expect(calls.find((c) => c.cmd === "import_model")?.args).toEqual({ path, scope: "summary" });
+  expect(calls.find((c) => c.cmd === "plugin:dialog|open")?.args).toMatchObject({
+    options: { filters: [{ extensions: ["gguf"] }] },
+  });
+});
+
+// Plan 5.4: "이 PC" is the default as null, offered with or without saved connections.
+test("the default LLM offers 이 PC, saved as no default", async () => {
+  const calls: Call[] = [];
+  mockIPC((cmd, args) => {
+    calls.push({ cmd, args: args as Call["args"] });
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "has_secret") return true;
+  });
+  render(<Settings tab="llm" onHome={() => {}} />);
+  const select = await screen.findByRole("combobox", { name: "기본 LLM" });
+  expect(select.textContent).toBe("회사 클라우드");
+  // The default is the cloud one: this PC's group says nothing of 기본.
+  expect(screen.getByRole("heading", { level: 3, name: "이 PC에서 요약" })).toBeTruthy();
+
+  fireEvent.keyDown(select, { key: "Enter" });
+  fireEvent.click(await screen.findByRole("option", { name: "이 PC" }));
+  expect(screen.getByRole("heading", { level: 3, name: "이 PC에서 요약 기본" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "저장" }));
+  const saved = () => calls.filter((c) => c.cmd === "save_settings").map((c) => c.args.value);
+  await waitFor(() => expect(saved()).toMatchObject([{ default_llm: null }]));
+  cleanup();
+
+  mockIPC((cmd) => {
+    if (cmd === "get_settings") return { ...thisPcDefault, settings: { ...thisPcDefault.settings, llm_connections: [] } };
+  });
+  render(<Settings tab="llm" onHome={() => {}} />);
+  expect((await screen.findByRole("combobox", { name: "기본 LLM" })).textContent).toBe("이 PC");
+});
+
+// SUM-08, plan 5.4: the switch shows only where a new meeting's "로컬로 요약" changes its route.
+test("the local default switch shows only where it changes a new meeting's route", async () => {
+  const cloud = loaded.settings.llm_connections[0];
+  const ollama = { ...cloud, name: "Ollama", base_url: "http://localhost:11434/v1", is_local: true };
+  const cases: [string, typeof loaded.settings.llm_connections, string | null, boolean, boolean][] = [
+    ["cloud default, summary model in", [cloud], cloud.name, true, true],
+    ["cloud default, nothing local", [cloud], cloud.name, false, false],
+    ["this PC, its model in", [cloud, ollama], null, true, false],
+    ["this PC without its model, a saved Ollama", [cloud, ollama], null, false, true],
+    ["a saved local default", [cloud, ollama], "Ollama", false, false],
+  ];
+  for (const [name, llm_connections, default_llm, installed, shown] of cases) {
+    mockIPC((cmd) => {
+      if (cmd === "get_settings") return { ...loaded, settings: { ...loaded.settings, llm_connections, default_llm } };
+      if (cmd === "has_secret") return true;
+      if (cmd === "model_status") return summaryModel({ installed });
+    });
+    render(<Settings tab="llm" onHome={() => {}} />);
+    expect(await screen.findByText(installed ? "설치됨" : "없음")).toBeTruthy();
+    const local = screen.queryByRole("switch", { name: "새 회의를 기본으로 로컬에서 요약" });
+    expect([name, !!local]).toEqual([name, shown]);
+    cleanup();
+  }
+});
+
+// SUM-08: Rust turns the local default off while nothing local can summarize; the screen then
+// holds what was stored, so nothing reads as unsaved.
+test("저장 shows the settings as Rust stored them", async () => {
+  const calls: Call[] = [];
+  const on = { ...loaded, settings: { ...loaded.settings, summarize_local_by_default: true } };
+  mockIPC((cmd, args) => {
+    calls.push({ cmd, args: args as Call["args"] });
+    if (cmd === "get_settings") return on;
+    if (cmd === "has_secret") return true;
+    if (cmd === "model_status") return summaryModel({ installed: true });
+    if (cmd === "save_settings") {
+      return { ...(args as Call["args"]).value as object, summarize_local_by_default: false };
+    }
+  });
+  render(<Settings tab="llm" onHome={() => {}} />);
+  const local = await screen.findByRole("switch", { name: "새 회의를 기본으로 로컬에서 요약" });
+  expect(local.getAttribute("aria-checked")).toBe("true");
+
+  fireEvent.click(screen.getByRole("button", { name: "일반" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "녹음자 이름" }), { target: { value: "김철수" } });
+  fireEvent.click(screen.getByRole("button", { name: "저장" }));
+  expect(await screen.findByText("저장했습니다")).toBeTruthy();
+  // Sent as the screen had it: the rule is Rust's.
+  expect(calls.find((c) => c.cmd === "save_settings")?.args.value).toMatchObject({ summarize_local_by_default: true });
+  fireEvent.click(screen.getByRole("button", { name: "요약(LLM)" }));
+  expect(screen.getByRole("switch", { name: "새 회의를 기본으로 로컬에서 요약" }).getAttribute("aria-checked")).toBe(
+    "false",
+  );
+});
+
+// d6: Rust's words, before the name is even added.
+test("a connection cannot be added under a name this PC reserves", async () => {
+  mockIPC((cmd) => {
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "has_secret") return true;
+  });
+  render(<Settings tab="llm" onHome={() => {}} />);
+  const field = await screen.findByRole("textbox", { name: "새 LLM 연결 이름" });
+  for (const [typed, name] of [[" 이 PC ", "이 PC"], ["builtin", "builtin"]]) {
+    fireEvent.change(field, { target: { value: typed } });
+    fireEvent.click(screen.getByRole("button", { name: "연결 추가" }));
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      `'${name}'은(는) 이 PC 요약이 쓰는 이름이라 연결 이름으로 쓸 수 없습니다. 이름을 바꿔 주세요`,
+    );
+  }
+  expect(screen.queryByRole("button", { name: /^builtin,/ })).toBeNull();
+  expect(screen.queryByRole("button", { name: "저장" })).toBeNull();
+});
+
+// The download is the app's one; each tab offers 취소 only for its own files in it, and a failure
+// shows on the tab it was started for.
+test("each tab cancels only its own files, and a summary download's failure stays in its tab", async () => {
+  let running: "summary" | null = null;
+  let fail = (_: string) => {};
+  mockIPC(
+    (cmd, args) => {
+      if (cmd === "get_settings") return loaded;
+      if (cmd === "has_secret") return true;
+      if (cmd === "model_status") {
+        if ((args as Call["args"]).scope === "summary") {
+          return { ...summaryModel({ downloading: running === "summary" }), downloading: !!running };
+        }
+        return { ...models(), downloading: !!running };
+      }
+      if (cmd === "download_models") {
+        running = "summary";
+        return new Promise((_, reject) => (fail = reject));
+      }
+    },
+    { shouldMockEvents: true },
+  );
+  render(<Settings tab="llm" onHome={() => {}} />);
+  fireEvent.click(await screen.findByRole("button", { name: "다운로드" }));
+  // Read again once started: this tab's file is in the download.
+  expect(await screen.findByRole("button", { name: "취소" })).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "전사" }));
+  expect(await screen.findByText(WHISPER)).toBeTruthy();
+  // The 전사 tab's files are not in it: nothing to cancel there, and nothing to start meanwhile.
+  expect(screen.queryByRole("button", { name: "취소" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "다운로드" })).toBeNull();
+
+  running = null;
+  await act(async () => fail("huggingface.co에 연결할 수 없습니다"));
+  await waitFor(() => expect(screen.getByRole("button", { name: "다운로드" })).toBeTruthy());
+  expect(screen.queryByRole("alert")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "요약(LLM)" }));
+  expect((await screen.findByRole("alert")).textContent).toMatch(/huggingface\.co에 연결할 수 없습니다/);
+});
+
+// Plan 5.3: the device the engine will actually use, as `queue::first_device` picks it.
+test("the 처리 장치 line says the saved device, the CPU once the summary engine's GPU failed", async () => {
+  for (const [patch, text] of [
+    [{ backend: "gpu" }, "GPU · 전사 탭에서 바꾸기"],
+    [{ backend: "auto", summary_gpu_failed: true }, "CPU (GPU에서 멈춘 적이 있어 CPU로 요약합니다) · 전사 탭에서 바꾸기"],
+    [{ backend: "gpu", summary_gpu_failed: true }, "GPU · 전사 탭에서 바꾸기"],
+  ] as const) {
+    mockIPC((cmd) => {
+      if (cmd === "get_settings") return { ...loaded, settings: { ...loaded.settings, ...patch } };
+      if (cmd === "has_secret") return true;
+    });
+    render(<Settings tab="llm" onHome={() => {}} />);
+    expect(await screen.findByRole("button", { name: text })).toBeTruthy();
+    cleanup();
+  }
+});
+
+// d6: no migration. A saved connection under a reserved name says so on its row, and is never a
+// default to pick: "이 PC" is this PC's alone.
+test("a connection under a reserved name asks to be renamed", async () => {
+  const taken = { ...loaded.settings.llm_connections[0], name: "이 PC", base_url: "http://localhost:11434/v1", is_local: true };
+  mockIPC((cmd) => {
+    if (cmd === "get_settings") {
+      return { ...loaded, rename: ["이 PC"], settings: { ...loaded.settings, llm_connections: [...loaded.settings.llm_connections, taken] } };
+    }
+    if (cmd === "has_secret") return false;
+  });
+  render(<Settings tab="llm" onHome={() => {}} />);
+
+  const row = await screen.findByRole("button", { name: /^이 PC, 이름을 바꿔 주세요/ });
+  expect(within(row).getByText("이름을 바꿔 주세요")).toBeTruthy();
+  fireEvent.click(row);
+  expect(screen.getByText(/이 PC 요약이 쓰는 이름이라.*삭제한 뒤 다른 이름으로 다시 추가해 주세요$/)).toBeTruthy();
+  fireEvent.keyDown(screen.getByRole("combobox", { name: "기본 LLM" }), { key: "Enter" });
+  const options = (await screen.findAllByRole("option")).map((o) => o.textContent);
+  expect(options).toEqual(["이 PC", "회사 클라우드"]);
 });
 
 test("the 전사 tab explains a GPU fallback in automatic mode", async () => {

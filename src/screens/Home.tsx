@@ -6,6 +6,8 @@ import {
   Bars,
   DeleteButton,
   Dots,
+  EngineStarting,
+  engineStarting,
   hhmm,
   Kbd,
   lengthText,
@@ -40,6 +42,8 @@ import type { SettingsTab } from "@/screens/Settings";
 type SetupItem = { text?: string; action: string; tab: SettingsTab };
 
 const FAILED: Status[] = ["transcribe_failed", "summarize_failed"];
+/** Why a meeting with its transcript waits out of line for its route (plan 5.4). */
+const waitOf = (m: MeetingItem) => (m.status === "transcribed" || m.status === "paused" ? m.wait : undefined);
 // A setup line item, after a dot when it is not the first.
 const ITEM = "flex items-center gap-1 not-first:before:mr-1 not-first:before:text-ink-2 not-first:before:content-['·']";
 
@@ -51,12 +55,17 @@ function nameOf(m: MeetingItem) {
   return m.duration_ms ? `${lengthText(m.duration_ms)} 녹음` : "제목 없는 녹음";
 }
 
-/** "지금 할 일" (design-system 6.4): recording, in line, ready for review, failed, or left behind by
- * a crash. A meeting from a newer app version is read-only here, so never. */
+/** "지금 할 일" (design-system 6.4): recording, in line, ready for review, failed, waiting for a
+ * connection to replace a deleted one, or left behind by a crash. A meeting from a newer app
+ * version is read-only here, so never. */
 const needsYou = (m: MeetingItem, p: Progress | undefined) =>
   m.interrupted ||
   (m.schema_version <= SCHEMA_VERSION &&
-    (m.status === "recording" || phase(m, p) !== null || m.status === "review" || FAILED.includes(m.status)));
+    (m.status === "recording" ||
+      phase(m, p) !== null ||
+      m.status === "review" ||
+      FAILED.includes(m.status) ||
+      waitOf(m) === "connection_deleted"));
 
 const sameDay = (a: Date, b: Date) => a.toDateString() === b.toDateString();
 const yesterdayOf = (today: Date) => new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
@@ -83,7 +92,7 @@ function shortDay(d: Date, today: Date) {
  * the row. */
 type State = {
   mark?: ReactNode;
-  text: string;
+  text: ReactNode;
   /** Before `text`, e.g. "전사" before "42% · 약 3분 남음". */
   lead?: string;
   shimmer?: boolean;
@@ -114,7 +123,7 @@ function stateOf(m: MeetingItem, p: Progress | undefined, name: string): State {
     const summarizing = (p?.status === "summarizing" ? p.status : m.status) === "summarizing";
     return {
       mark: summarizing ? undefined : <Bars className="h-3 text-brand" />,
-      text: line?.text ?? STATUS_LABEL[m.status],
+      text: engineStarting(p) ? <EngineStarting since={p.engine_since} /> : (line?.text ?? STATUS_LABEL[m.status]),
       // "전사 42% · 약 3분 남음": the percent alone would not say what it counts.
       lead: p?.status === "transcribing" && p.chunks > 0 ? "전사" : undefined,
       shimmer: summarizing,
@@ -128,6 +137,16 @@ function stateOf(m: MeetingItem, p: Progress | undefined, name: string): State {
     };
   }
   if (now === "waiting") return { mark: <Dots />, text: statusLabel(m, p) };
+  // Plan 5.4, 8: out of line until its route resolves. The summary model comes by itself; a
+  // deleted connection needs another picked in its document.
+  if (waitOf(m) === "connection_deleted") {
+    return {
+      mark: <TriangleAlert aria-hidden className="size-4 text-warn-line" />,
+      text: "요약 대기",
+      note: "이 회의에 정한 연결이 삭제됐습니다",
+    };
+  }
+  if (waitOf(m) === "summary_model") return { text: "요약 대기" };
   if (m.status === "review") {
     return { mark: <span aria-hidden className="size-2 rounded-full bg-brand" />, text: STATUS_LABEL.review };
   }
@@ -324,6 +343,8 @@ export default function Home({
 
   // Recording works without any of these. The model comes first: nothing is transcribed without
   // it, so its item downloads right away (ONB-01); the 전사 tab has cancel, import and the mirror.
+  // Summaries need nothing more (plan 5.8): with this PC as the default the summary model is in that
+  // item (`modelStatus()`), and a saved default, local or cloud, is set up already.
   useEffect(() => {
     checkModel();
     const unlisten = onModelDownload(setReceived);
@@ -332,12 +353,7 @@ export default function Home({
     if (running) follow(running);
     getSettings()
       .then(({ settings }) =>
-        setSetup(
-          [
-            !settings.llm_connections.length && { action: "LLM 연결", tab: "llm" as const },
-            !settings.webhooks.length && { action: "Slack 채널 연결", tab: "slack" as const },
-          ].filter((item) => item !== false),
-        ),
+        setSetup(settings.webhooks.length ? [] : [{ action: "Slack 채널 연결", tab: "slack" }]),
       )
       // The settings screen shows the error and offers starting over.
       .catch(() => setSetup([{ text: "설정 파일을 읽을 수 없습니다", action: "설정 열기", tab: "general" }]));
@@ -457,6 +473,9 @@ export default function Home({
     // 요약 다시 실행 picks a connection (SUM-07), so it opens the meeting's document.
     if (m.status === "summarize_failed") {
       return { label: "요약 다시 실행", run: (e: MouseEvent) => onOpen(m, e.detail === 0), opens: true };
+    }
+    if (waitOf(m) === "connection_deleted") {
+      return { label: "연결 고르기", run: (e: MouseEvent) => onOpen(m, e.detail === 0), opens: true };
     }
     return null;
   };

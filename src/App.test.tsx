@@ -36,6 +36,10 @@ const mock = (handler: (cmd: string, args: Record<string, unknown>) => unknown) 
       const defaults: Record<string, unknown> = {
         get_settings: loaded,
         model_status: models(true),
+        list_connections: [
+          { name: "회사 클라우드", label: "회사 클라우드", host: "api.example.com", is_local: false, builtin: false },
+          { name: "builtin", label: "이 PC", host: "", is_local: true, builtin: true },
+        ],
         queue_state: [],
       };
       return handler(cmd, args as Record<string, unknown>) ?? defaults[cmd];
@@ -142,18 +146,14 @@ test("opens on Home with empty settings; the setup line opens the matching tab",
   render(<App />);
 
   const items = within(await screen.findByRole("list", { name: "남은 설정" }));
-  expect(await items.findByRole("button", { name: "LLM 연결" })).toBeTruthy();
-  expect(items.getByRole("button", { name: "Slack 채널 연결" })).toBeTruthy();
+  expect(await items.findByRole("button", { name: "Slack 채널 연결" })).toBeTruthy();
+  // This PC summarizes with no connection (plan 5.8): its model is the model item's, here installed.
+  expect(items.queryByRole("button", { name: "LLM 연결" })).toBeNull();
   expect(screen.getByRole("heading", { level: 1, name: FIRST })).toBeTruthy();
   // Recording needs no setup: no tour, no gate.
   expect((screen.getByRole("button", { name: "첫 회의 녹음하기" }) as HTMLButtonElement).disabled).toBe(false);
 
-  fireEvent.click(screen.getByRole("button", { name: "LLM 연결" }));
-  expect(await screen.findByRole("textbox", { name: "새 LLM 연결 이름" })).toBeTruthy();
-  expect(screen.getByRole("button", { name: "요약(LLM)" }).getAttribute("aria-current")).toBe("page");
-
-  fireEvent.click(screen.getByRole("button", { name: "홈으로" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Slack 채널 연결" }));
+  fireEvent.click(screen.getByRole("button", { name: "Slack 채널 연결" }));
   expect(await screen.findByRole("textbox", { name: "새 웹훅 이름" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Slack" }).getAttribute("aria-current")).toBe("page");
 });
@@ -419,6 +419,11 @@ test("the dock counts a summary as running, with its requests only past one", as
 
   render(<App />);
   expect(await screen.findByRole("button", { name: "처리 중 1 · a · 요약 중" })).toBeTruthy();
+
+  // Plan 5.3: the built-in engine loading first.
+  const since = Math.floor(Date.now() / 1000);
+  await act(() => emit("meeting://progress", progress("a", { ...summarizing, chunk: 0, chunks: 0, percent: 0, engine_since: since })));
+  expect(await screen.findByRole("button", { name: "처리 중 1 · a · 요약 엔진 준비 중" })).toBeTruthy();
 
   await act(() => emit("meeting://progress", progress("a", { ...summarizing, chunk: 1, chunks: 3, percent: 33 })));
   expect(await screen.findByRole("button", { name: "처리 중 1 · a · 요약 2/3" })).toBeTruthy();

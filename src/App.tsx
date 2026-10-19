@@ -385,7 +385,13 @@ export default function App() {
                 />
               )}
               {screen.name === "recording" && (
-                <Recording startedAt={live?.created_at} stopping={ending} onHome={home} onStop={stop} />
+                <Recording
+                  startedAt={live?.created_at}
+                  stopping={ending}
+                  onHome={home}
+                  onStop={stop}
+                  onSetup={() => go({ name: "settings", tab: "llm" })}
+                />
               )}
               {screen.name === "meeting" && (
                 <Meeting

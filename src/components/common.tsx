@@ -20,6 +20,9 @@ import {
   BUILTIN,
   connectionLabel,
   deleteMeeting,
+  modelDownload,
+  modelStatus,
+  onModelDownload,
   SCHEMA_VERSION,
   setSummarizeLocal,
   STATUS_LABEL,
@@ -29,6 +32,7 @@ import {
   type Segment,
   type Status,
   type SummaryRoute,
+  type Wait,
 } from "@/lib/ipc";
 import { dur, ease } from "@/lib/motion";
 import { josa } from "@/lib/utils";
@@ -134,7 +138,8 @@ export const SHIMMER =
 const RUNNING: Status[] = ["transcribing", "summarizing"];
 // A meeting also waits while it has a place in line: a retried `transcribe_failed` or
 // `summarize_failed` one, and a `transcribed` one waiting for its summary (APP-07). Without a place,
-// `transcribed` is where a meeting stops when there is no LLM connection.
+// `transcribed` is where a meeting stops when its route does not resolve, and so is a `paused` one
+// with a `wait` (plan 5.4): neither is in line.
 const WAITING: Status[] = ["recorded", "paused"];
 
 /** Running, waiting or neither. The dock, Home and the meeting document all ask this, so the dock's
@@ -145,7 +150,7 @@ export function phase(meta: Meta, progress: Progress | undefined) {
   // An event saying it runs wins over the list: between transcribing and summarizing the list can
   // read `transcribed`, and the dock must not drop the meeting for that moment.
   if (RUNNING.includes(meta.status) || (progress && RUNNING.includes(progress.status))) return "running";
-  if (progress?.position != null || WAITING.includes(meta.status)) return "waiting";
+  if (progress?.position != null || (WAITING.includes(meta.status) && !meta.wait)) return "waiting";
   return null;
 }
 
@@ -297,10 +302,88 @@ export const ro = (word: string) => josa(word, "으로", "로");
 /** The host a connection sends to, for SUM-07 notices. */
 export const host = (url: string) => (URL.canParse(url) ? new URL(url).host : url);
 
+/** The built-in engine is starting for this summary (plan 5.3): Home, the dock and the meeting
+ * document say so instead of a summary that looks stuck. */
+export const engineStarting = (p?: Progress): p is Progress & { engine_since: number } =>
+  p?.status === "summarizing" && p.engine_since != null;
+
+/** Plan 5.3, DX6: the built-in engine loads its model before the first request (up to 120 s),
+ * so a summary is not left looking stuck at 0/0. The seconds count here, between events. */
+export function EngineStarting({ since }: { since: number }) {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  return <>{`요약 엔진 준비 중 · ${Math.max(0, Math.floor(now / 1000 - since))}초`}</>;
+}
+
+/** The summary model as the route notices tell it (plan 5.2, DX6), or null until read. Read when
+ * `on`, then followed through `model://download` and the app's one download (ipc.ts). A read that
+ * fails reads as not downloaded: the 요약(LLM) tab says why. */
+export function useSummaryModel(on: boolean) {
+  const [model, setModel] = useState<{ file: string; installed: boolean; downloading: boolean; percent: number } | null>(
+    null,
+  );
+  useEffect(() => {
+    if (!on) return;
+    let live = true;
+    let followed: Promise<void> | null = null;
+    const read = () =>
+      modelStatus("summary").then(
+        (state) => {
+          const f = state?.files?.[0];
+          const percent = f ? Math.floor((f.received / f.size) * 100) : 0;
+          if (live) setModel({ file: f?.file ?? "", installed: !!f?.installed, downloading: !!f?.downloading, percent });
+        },
+        () => live && setModel({ file: "", installed: false, downloading: false, percent: 0 }),
+      );
+    // A download started from another screen later on reads it again, and so does its end. One
+    // running already is in the first read.
+    const follow = (started: boolean) => {
+      const running = modelDownload();
+      if (!running || running === followed) return;
+      followed = running;
+      if (started) read();
+      running.then(read);
+    };
+    read();
+    follow(false);
+    const unlisten = onModelDownload((d) => {
+      follow(true);
+      setModel((m) =>
+        m?.file === d.file ? { ...m, downloading: true, percent: Math.floor((d.received / d.total) * 100) } : m,
+      );
+    });
+    return () => {
+      live = false;
+      unlisten.then((stop) => stop()).catch(() => {});
+    };
+  }, [on]);
+  return model;
+}
+
 /** SUM-07 where the transcript goes for its summary, and SUM-08 "로컬로 요약" until summarizing
  * starts (`locked`). Read again when `status` changes. Once locked it shows only while
- * `summarizing`; then the meeting document's meta line says where the transcript went. */
-export function RouteNotice({ id, status, center }: { id: string; status?: Status; center?: boolean }) {
+ * `summarizing`; then the meeting document's meta line says where the transcript went. With no
+ * route yet, it says why (plan 5.4): `wait`, the meeting's reason when known, else the summary model
+ * in one of three states (DX6), with `onSetup` opening the 요약(LLM) tab. */
+export function RouteNotice({
+  id,
+  status,
+  wait,
+  pinned,
+  center,
+  onSetup,
+}: {
+  id: string;
+  status?: Status;
+  wait?: Wait;
+  /** The meeting's `llm_connection`: a connection picked for it changes the route (ENG15). */
+  pinned?: string | null;
+  center?: boolean;
+  onSetup?: () => void;
+}) {
   const [route, setRoute] = useState<SummaryRoute | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -318,9 +401,16 @@ export function RouteNotice({ id, status, center }: { id: string; status?: Statu
     );
   };
 
+  // A meeting given another connection while it waits keeps its status: its reason and pin change.
   useEffect(() => {
     settle(summaryRoute(id));
-  }, [id, status]);
+  }, [id, status, wait, pinned]);
+
+  const c = route?.connection;
+  // Only the summary model can be missing from a route that is not pinned (`summarize::route`).
+  const waitsForModel =
+    !!route && !c && wait !== "connection_deleted" && (wait === "summary_model" || !route.locked);
+  const model = useSummaryModel(waitsForModel);
 
   const toggle = (local: boolean) => {
     setBusy(true);
@@ -328,22 +418,31 @@ export function RouteNotice({ id, status, center }: { id: string; status?: Statu
   };
 
   if (!route) return error ? <Banner kind="error">{error}</Banner> : null;
-  const c = route.connection;
   // The built-in route is this PC itself: "이 PC에서", not "이 PC의 이 PC로".
   const local = c && (c.name === BUILTIN ? `${connectionLabel(c.name)}에서` : `이 PC의 ${c.name}${ro(c.name)}`);
-  const text = route.locked
-    ? status === "summarizing" && c
-      ? c.is_local
-        ? `${local} 요약하고 있습니다`
-        : `전사본을 ${c.name}(${host(c.base_url)})${ro(c.name)} 보내 요약하고 있습니다`
-      : ""
-    : c
-      ? c.is_local
-        ? `${local} 요약합니다. 전사본은 밖으로 나가지 않습니다`
-        : `요약할 때 전사본이 ${c.name}(${host(c.base_url)})${ro(c.name)} 전송됩니다`
-      : route.local
-        ? "로컬 LLM 연결이 없습니다"
-        : "LLM 연결이 없어 전사까지만 합니다";
+  const missing = waitsForModel && !!model && !model.installed && !model.downloading;
+  const text =
+    wait === "connection_deleted" && !c
+      ? "이 회의에 정한 연결이 삭제됐습니다. 다른 연결을 골라 주세요"
+      : waitsForModel
+        ? !model
+          ? ""
+          : model.installed
+            ? "이 PC에서 요약합니다. 전사본은 밖으로 나가지 않습니다"
+            : model.downloading
+              ? `요약 모델 받는 중 ${model.percent}% · 다 받으면 자동으로 요약합니다`
+              : "설정 → 요약(LLM)에서 요약 모델을 받아 주세요"
+        : route.locked
+          ? status === "summarizing" && c
+            ? c.is_local
+              ? `${local} 요약하고 있습니다`
+              : `전사본을 ${c.name}(${host(c.base_url)})${ro(c.name)} 보내 요약하고 있습니다`
+            : ""
+          : c?.is_local
+            ? `${local} 요약합니다. 전사본은 밖으로 나가지 않습니다`
+            : c
+              ? `요약할 때 전사본이 ${c.name}(${host(c.base_url)})${ro(c.name)} 전송됩니다`
+              : "";
   if (!text) return null;
   return (
     <div className={center ? "flex flex-col items-center gap-2 text-center" : "space-y-2"}>
@@ -351,8 +450,14 @@ export function RouteNotice({ id, status, center }: { id: string; status?: Statu
         <Info aria-hidden className="mt-0.5 size-4 shrink-0" />
         {text}
       </p>
-      {/* Also shown when "로컬로 요약" is on but its connection is gone, so it can be turned off. */}
-      {!route.locked && (route.local_available || route.local) && (
+      {missing && onSetup && (
+        <Button variant="outline" size="sm" onClick={onSetup}>
+          요약(LLM) 설정
+        </Button>
+      )}
+      {/* Only where it changes the route (plan 5.4). Also shown when "로컬로 요약" is on but its
+          connection is gone, so it can be turned off. */}
+      {!route.locked && route.toggle_matters && (route.local_available || route.local) && (
         <label className="flex w-fit items-center gap-2 text-sm">
           <Switch checked={route.local} disabled={busy} onCheckedChange={toggle} />
           로컬로 요약
@@ -407,12 +512,15 @@ export function SelectField({
   label,
   value,
   options,
+  placeholder,
   disabled,
   onChange,
 }: {
   label: string;
+  /** Empty: nothing picked yet, and `placeholder` shows. */
   value: string;
-  options: { value: string; label: string }[];
+  options: { value: string; label: string; disabled?: boolean }[];
+  placeholder?: string;
   disabled?: boolean;
   onChange: (value: string) => void;
 }) {
@@ -421,11 +529,11 @@ export function SelectField({
       <span className="font-medium text-muted-foreground">{label}</span>
       <Select value={value} disabled={disabled} onValueChange={onChange}>
         <SelectTrigger aria-label={label} className="w-full">
-          <SelectValue />
+          <SelectValue placeholder={placeholder} />
         </SelectTrigger>
         <SelectContent>
           {options.map((o) => (
-            <SelectItem key={o.value} value={o.value}>
+            <SelectItem key={o.value} value={o.value} disabled={o.disabled}>
               {o.label}
             </SelectItem>
           ))}

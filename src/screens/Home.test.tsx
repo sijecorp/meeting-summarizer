@@ -162,6 +162,63 @@ test("a summarizing row shows 요약 중; a failed summary shows its error, retr
   expect(screen.queryByRole("button", { name: /^다시 시도/ })).toBeNull();
 });
 
+// Plan 5.3: the built-in engine loads first (up to 120 s); the row counts it instead of 요약 중.
+test("a summary on this PC says while its engine starts", () => {
+  mock();
+  const since = Math.floor(Date.now() / 1000) - 3;
+  home([meeting("a", "summarizing")], [progress("a", { status: "summarizing", engine_since: since })]);
+
+  expect(screen.getByText(/^요약 엔진 준비 중 · [3-5]초$/)).toBeTruthy();
+  expect(screen.queryByText("요약 중")).toBeNull();
+});
+
+// Plan 5.4, 8: out of line until its route resolves, a meeting says 요약 대기. One whose connection
+// was deleted needs the recorder, so it is in 지금 할 일 with the way to pick another.
+test("a meeting waiting for its route says 요약 대기; a deleted connection asks for another", async () => {
+  mock();
+  const opened: string[] = [];
+  render(
+    <Home
+      {...props}
+      meetings={[
+        { ...meeting("모델", "transcribed"), wait: "summary_model" },
+        { ...meeting("삭제", "transcribed"), wait: "connection_deleted" },
+        { ...meeting("멈춤", "paused"), wait: "connection_deleted" },
+      ]}
+      progress={{}}
+      onOpen={(m) => opened.push(m.id)}
+    />,
+  );
+
+  const now = within(screen.getByRole("region", { name: "지금 할 일" }));
+  expect(now.getAllByText("이 회의에 정한 연결이 삭제됐습니다")).toHaveLength(2);
+  expect(now.queryByText("모델")).toBeNull();
+  // Out of line: no 대기 중, and the paused one is no running work.
+  expect(screen.queryByText(/대기 중/)).toBeNull();
+  expect(screen.getAllByText("요약 대기")).toHaveLength(3);
+  fireEvent.click(now.getByRole("button", { name: "연결 고르기 (삭제)" }));
+  fireEvent.click(now.getByRole("button", { name: "연결 고르기 (멈춤)" }));
+  expect(opened).toEqual(["삭제", "멈춤"]);
+  expect(screen.queryByRole("button", { name: /^연결 고르기 \(모델\)/ })).toBeNull();
+});
+
+// Plan 5.8: summarizing needs no connection. With this PC as the default its model is the model
+// item's (in `modelStatus()`), and a saved default, local or cloud, needs nothing.
+test("the setup line never asks for an LLM connection", async () => {
+  for (const settings of [
+    { llm_connections: [], default_llm: null, webhooks: [] },
+    { llm_connections: [{ name: "Ollama", is_local: true }], default_llm: "Ollama", webhooks: [] },
+  ]) {
+    mock((cmd) => (cmd === "get_settings" ? { settings } : undefined));
+    render(<Home {...props} meetings={[]} progress={{}} />);
+    const items = within(await screen.findByRole("list", { name: "남은 설정" }));
+    expect(items.getByRole("button", { name: "Slack 채널 연결" })).toBeTruthy();
+    expect(items.queryByRole("button", { name: "LLM 연결" })).toBeNull();
+    expect(items.queryByRole("button", { name: "모델 받기" })).toBeNull();
+    cleanup();
+  }
+});
+
 // ONB-01: the setup line downloads right away; cancel, import and the mirror stay in the 전사 tab.
 test("the setup line's 모델 받기 downloads with progress and checks the files again", async () => {
   let installed = false;
@@ -226,9 +283,10 @@ test("a failed download says so and 다시 받기 tries again; each link opens i
   fireEvent.click(await items.findByRole("button", { name: "모델 받기" }));
   expect(await items.findByText("모델을 받지 못했습니다")).toBeTruthy();
   fireEvent.click(items.getByRole("button", { name: "전사 설정" }));
-  fireEvent.click(items.getByRole("button", { name: "LLM 연결" }));
+  // No connection is no missing step: this PC summarizes (plan 5.8).
+  expect(items.queryByRole("button", { name: "LLM 연결" })).toBeNull();
   fireEvent.click(items.getByRole("button", { name: "Slack 채널 연결" }));
-  expect(opened).toEqual(["transcription", "llm", "slack"]);
+  expect(opened).toEqual(["transcription", "slack"]);
 
   fireEvent.click(items.getByRole("button", { name: "다시 받기" }));
   expect(await items.findByText("모델 받는 중 0%")).toBeTruthy();

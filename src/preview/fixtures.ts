@@ -5,6 +5,7 @@ import type * as ipc from "@/lib/ipc";
 import {
   BUILTIN,
   connectionLabel,
+  reserved,
   SCHEMA_VERSION,
   type AudioDevices,
   type ConnectionItem,
@@ -19,6 +20,7 @@ import {
   type Settings,
   type Status,
   type SummaryRoute,
+  type Wait,
 } from "@/lib/ipc";
 
 // The dev preview's backend (design-system 7): every command `ipc.ts` calls, over fixtures typed
@@ -29,6 +31,10 @@ export const SCENARIOS = {
   many: "여러 상태",
   recording: "녹음 중",
   setup: "설정 없음",
+  // Plan 5.2-5.4 (DX6): this PC as the default, its summary model in each of three states.
+  summaryDownloading: "요약 모델 받는 중",
+  summaryMissing: "요약 모델 없음",
+  summaryReady: "이 PC 요약",
 } as const;
 export type Scenario = keyof typeof SCENARIOS;
 
@@ -234,13 +240,13 @@ const RUNNING: Status[] = ["transcribing", "summarizing"];
 const isRunning = (p: Progress) => RUNNING.includes(p.status);
 
 /** Every model file, the summary model last; `model_status` shows a scope of them. */
-function modelState(installed: boolean, received = 0): ModelState {
+function modelState(installed: boolean, received = 0, summary = { installed, received: 0 }): ModelState {
   const whisper = MODEL_FILES[settings.model] ?? MODEL_FILES["large-v3-turbo-q8_0"];
   return {
     files: [
       { ...whisper, installed, received, downloading: false },
       { ...VAD, installed, received: 0, downloading: false },
-      { ...SUMMARY_MODEL, installed, received: 0, downloading: false },
+      { ...SUMMARY_MODEL, ...summary, downloading: false },
     ],
     downloading: false,
   };
@@ -394,18 +400,62 @@ export function reset(scenario: Scenario) {
       summarized("1:1 미팅", "archived", at(2, 11, 0), { duration_ms: 28 * 60_000 }),
     ];
   }
-  // Home with its setup line: a meeting stopped after transcribing for want of an LLM connection.
+  // Home with its setup line: a meeting transcribed, waiting for the summary model (plan 5.4).
   if (scenario === "setup") {
     settings = { ...settings, llm_connections: [], default_llm: null, webhooks: [], last_channel: null };
     secrets = new Set();
     // A download stopped part way: 300 MB kept, resumed as the scenario starts (main.tsx).
     models = modelState(false, 300_000_000);
     meetings = [
-      stored("transcribed", at(0, 11, 0), { backend: "cpu", chunks_done: 3 }, { transcript: TRANSCRIPT }),
+      stored(
+        "transcribed",
+        at(0, 11, 0),
+        { backend: "cpu", chunks_done: 3, wait: "summary_model" },
+        { transcript: TRANSCRIPT },
+      ),
       summarized("킥오프 미팅", "sent", at(3, 14, 0), {
         sent: { channel: "#회의록", at: at(3, 14, 50).toISOString(), edit_count: 0 },
       }),
     ];
+  }
+
+  // This PC summarizes by default (`default_llm` null) with a cloud connection beside it. Waiting
+  // meetings show each reason (Home: 요약 대기, 연결 고르기 in 지금 할 일; the picker leaves this PC
+  // out until its model is in). Without the model, a saved Ollama makes "로컬로 요약" matter. Ready:
+  // a summary starts its engine (Home, the dock and its document count), the engine once failed on
+  // the GPU (the 처리 장치 line says CPU), an old connection named "이 PC" asks to be renamed (d6).
+  if (scenario === "summaryDownloading" || scenario === "summaryMissing" || scenario === "summaryReady") {
+    const ready = scenario === "summaryReady";
+    settings = {
+      ...settings,
+      llm_connections: scenario === "summaryMissing" ? [CLOUD, OLLAMA] : [CLOUD],
+      default_llm: null,
+      summary_gpu_failed: ready,
+    };
+    // 900 MB kept: the download (main.tsx starts it for 요약 모델 받는 중) resumes from there.
+    models = modelState(true, 0, { installed: ready, received: ready ? 0 : 900_000_000 });
+    const waiting = (wait: Wait, patch: Partial<MeetingItem>, when: Date) =>
+      stored("transcribed", when, { backend: "gpu", chunks_done: 4, wait, ...patch }, { transcript: TRANSCRIPT });
+    meetings = [
+      waiting("summary_model", {}, at(0, 10, 0)),
+      waiting("connection_deleted", { llm_connection: "지운 연결", duration_ms: 31 * 60_000 }, at(0, 9, 0)),
+      summarized("주간 제품 회의", "sent", at(1, 16, 0), {
+        llm_connection: BUILTIN,
+        summarize_local: true,
+        sent: { channel: "#회의록", at: at(1, 16, 52).toISOString(), edit_count: 2 },
+      }),
+    ];
+    if (ready) {
+      settings.llm_connections = [CLOUD, { ...OLLAMA, name: "이 PC" }];
+      const starting = stored(
+        "summarizing",
+        at(0, 11, 30),
+        { backend: "gpu", chunks_done: 5, llm_connection: BUILTIN, summarize_local: true },
+        { transcript: TRANSCRIPT },
+      );
+      meetings = [starting, ...meetings.slice(1)];
+      line = [progressOf(starting.meta.id, { status: "summarizing", engine_since: Math.floor(Date.now() / 1000) - 4 })];
+    }
   }
 
   timers.push(setInterval(tick, 700), setInterval(levels, 40));
@@ -439,15 +489,29 @@ function advance(p: Progress) {
     m.meta.backend = "gpu";
     if (p.percent === 100) {
       m.transcript = TRANSCRIPT;
-      if (!settings.llm_connections.length) {
-        // No LLM connection: it stops here without a place in line.
+      const to = route(m.meta);
+      if (!to) {
+        // No route yet: it waits here, out of line, saying why (plan 5.4).
         m.meta.status = p.status = "transcribed";
+        m.meta.wait = waitOf(m.meta);
         return finish(p);
       }
-      m.meta.llm_connection = route(m.meta)?.name ?? null;
-      Object.assign(p, { status: "summarizing", chunk: 0, chunks: 3, percent: 0, eta_secs: null });
+      m.meta.llm_connection = to.name;
+      Object.assign(p, {
+        status: "summarizing",
+        chunk: 0,
+        chunks: 3,
+        percent: 0,
+        eta_secs: null,
+        engine_since: engineSince(m.meta),
+      });
     }
   } else {
+    if (p.engine_since != null) {
+      // Plan 5.3: the built-in engine loads its model first, here for 15 s; the screens count.
+      if (Date.now() / 1000 - p.engine_since < 15) return;
+      p.engine_since = null;
+    }
     // Quick, so a summary arriving in its open document is seen within seconds.
     p.percent = Math.min(100, p.percent + 5);
     p.chunk = Math.floor((p.percent / 100) * p.chunks);
@@ -478,9 +542,25 @@ function start(p: Progress) {
       : { status: "transcribing", chunk: 0, chunks: 0, percent: 0 },
     { position: null, eta_secs: null },
   );
-  if (p.status === "summarizing") m.meta.llm_connection ??= route(m.meta)?.name ?? null;
+  if (p.status === "summarizing") {
+    m.meta.llm_connection ??= route(m.meta)?.name ?? null;
+    p.engine_since = engineSince(m.meta);
+  }
   m.meta.status = p.status;
   renumber();
+}
+
+/** The built-in route starts its engine first (plan 5.3). */
+const engineSince = (meta: Meta) => (meta.llm_connection === BUILTIN ? Math.floor(Date.now() / 1000) : null);
+
+/** `enqueue_pending`: a meeting waiting for its route goes in line once it resolves (the summary
+ * model in, settings saved, its connection picked). */
+function enqueuePending() {
+  for (const m of meetings) {
+    if (!m.meta.wait || !route(m.meta)) continue;
+    delete m.meta.wait;
+    enqueue(m);
+  }
 }
 
 /** Waiting entries count from 1 in order; every entry is sent again. */
@@ -503,8 +583,6 @@ const summaryStarted = (meta: Meta) =>
     meta.status,
   );
 
-/** Names only the built-in route may have (d6, `settings::reserved`). */
-const reserved = (name: string) => [BUILTIN, "이 PC"].includes(name.trim());
 
 /** The built-in route as `Settings::connections` has it (settings.rs `builtin`). */
 const BUILTIN_CONNECTION: LlmConnection = {
@@ -541,6 +619,12 @@ function route(meta: Meta): LlmConnection | null {
   return usable(fallback) ?? null;
 }
 
+/** Why a meeting has no route (`summarize::route`'s `Wait`). */
+const waitOf = (meta: Meta): Wait =>
+  meta.llm_connection && !connections().some((c) => c.name === meta.llm_connection)
+    ? "connection_deleted"
+    : "summary_model";
+
 /** `Settings::connections` as `list_connections` gives it. */
 const connections = (): ConnectionItem[] => [
   ...settings.llm_connections
@@ -561,6 +645,9 @@ const loaded = () => ({
   rename: settings.llm_connections.map((c) => c.name).filter(reserved),
 });
 
+/** Where a meeting's summary goes, or why it waits. */
+const routeKey = (meta: Meta) => route(meta)?.name ?? waitOf(meta);
+
 function summaryRoute(meta: Meta): SummaryRoute {
   const sentNothing =
     meta.no_speech || (meta.llm_connection == null && ["review", "sent", "archived"].includes(meta.status));
@@ -569,6 +656,7 @@ function summaryRoute(meta: Meta): SummaryRoute {
     local: meta.summarize_local,
     local_available: builtinReady() || settings.llm_connections.some((c) => c.is_local && !reserved(c.name)),
     locked: summaryStarted(meta),
+    toggle_matters: routeKey({ ...meta, summarize_local: !meta.summarize_local }) !== routeKey(meta),
   };
 }
 
@@ -666,7 +754,14 @@ type Handlers = {
 const handlers: Handlers = {
   get_settings: loaded,
   save_settings: (a) => {
-    settings = clone(a.value as Settings);
+    const value = a.value as Settings;
+    const taken = value.llm_connections.find((c) => reserved(c.name));
+    if (taken) throw `'${taken.name}'은(는) 이 PC 요약이 쓰는 이름이라 연결 이름으로 쓸 수 없습니다. 이름을 바꿔 주세요`;
+    // `local_default_kept`: off while nothing local can summarize.
+    const local = builtinReady() || value.llm_connections.some((c) => c.is_local);
+    settings = clone({ ...value, summarize_local_by_default: value.summarize_local_by_default && local });
+    enqueuePending();
+    return clone(settings);
   },
   reset_settings: () => {
     settings = fullSettings();
@@ -740,6 +835,7 @@ const handlers: Handlers = {
     if (a.local && !summaryRoute(m.meta).local_available) throw "로컬 LLM 연결이 없습니다";
     if (summaryStarted(m.meta)) throw "요약이 이미 시작돼 바꿀 수 없습니다";
     m.meta.summarize_local = a.local as boolean;
+    enqueuePending();
     return summaryRoute(m.meta);
   },
   save_summary: (a) => {
@@ -758,11 +854,13 @@ const handlers: Handlers = {
     const m = find(a.id);
     const saved = settings.llm_connections.filter((c) => !reserved(c.name));
     const connection = [...saved, BUILTIN_CONNECTION].find((c) => c.name === a.connection);
-    if (m.meta.status !== "summarize_failed") throw "요약에 실패한 회의가 아닙니다";
     if (!connection) throw `LLM 연결 '${a.connection}'을(를) 찾을 수 없습니다. 다른 연결을 골라 주세요`;
     if (connection.name === BUILTIN && !builtinReady())
       throw "이 PC 요약 모델이 아직 없습니다. 설정 → 요약(LLM)에서 요약 모델을 먼저 받아 주세요";
+    const waits = m.meta.status === "transcribed" || (m.meta.status === "paused" && !!m.transcript);
+    if (m.meta.status !== "summarize_failed" && !waits) throw "요약을 기다리거나 요약에 실패한 회의가 아닙니다";
     Object.assign(m.meta, { llm_connection: connection.name, summarize_local: connection.is_local });
+    delete m.meta.wait;
     enqueue(m);
     return clone(m.meta);
   },
@@ -854,7 +952,10 @@ const handlers: Handlers = {
           all_received: done,
           all_total: all,
         });
-        if (file.received === file.size) Object.assign(file, { installed: true, received: 0 });
+        if (file.received === file.size) {
+          Object.assign(file, { installed: true, received: 0 });
+          if (file.file === SUMMARY_MODEL.file) enqueuePending();
+        }
       }, 250);
       timers.push(timer);
       downloading = { cancelled: false, done: resolve, chain };
@@ -866,9 +967,13 @@ const handlers: Handlers = {
   },
   import_model: (args) => {
     scoped(args.scope).forEach((f) => Object.assign(f, { installed: true, received: 0 }));
+    enqueuePending();
     return modelStatus(args.scope);
   },
-  "plugin:dialog|open": () => `/Users/hong/Downloads/${models.files[0].file}`,
+  "plugin:dialog|open": (a) => {
+    const gguf = JSON.stringify(a).includes("gguf");
+    return `/Users/hong/Downloads/${gguf ? SUMMARY_MODEL.file : models.files[0].file}`;
+  },
 
   confirm_quit: () => {
     console.info("[미리보기] 종료 확인: 실제 앱이라면 진행 중인 작업을 멈추고 종료합니다");

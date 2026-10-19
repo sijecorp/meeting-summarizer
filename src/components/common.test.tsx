@@ -1,12 +1,13 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import type { LlmConnection, Meta, Progress, SummaryRoute } from "../lib/ipc";
-import { phase, RouteNotice } from "./common";
+import { EngineStarting, phase, RouteNotice } from "./common";
 
 afterEach(() => {
   cleanup();
   clearMocks();
+  vi.useRealTimers();
 });
 
 const cloud: LlmConnection = {
@@ -26,6 +27,7 @@ const route = (patch: Partial<SummaryRoute>): SummaryRoute => ({
   local: false,
   local_available: false,
   locked: false,
+  toggle_matters: true,
   ...patch,
 });
 
@@ -43,9 +45,15 @@ test("says where the summary goes, and offers 로컬로 요약 only with a local
       "이 PC에서 요약합니다. 전사본은 밖으로 나가지 않습니다",
       true,
     ],
-    [route({ connection: null }), "LLM 연결이 없어 전사까지만 합니다", false],
+    // No route: only the summary model can be missing (plan 5.4).
+    [route({ connection: null }), "설정 → 요약(LLM)에서 요약 모델을 받아 주세요", false],
     // Its local connection was removed: the switch stays so it can be turned off.
-    [route({ connection: null, local: true }), "로컬 LLM 연결이 없습니다", true],
+    [route({ connection: null, local: true }), "설정 → 요약(LLM)에서 요약 모델을 받아 주세요", true],
+    // Where flipping it changes nothing (a local default, this PC with its model): no switch.
+    [route({ connection: thisPc, local_available: true, toggle_matters: false }), "이 PC에서 요약합니다. 전사본은 밖으로 나가지 않습니다", false],
+    [route({ connection: ollama, local_available: true, toggle_matters: false }), "이 PC의 Ollama로 요약합니다. 전사본은 밖으로 나가지 않습니다", false],
+    // This PC without its model, a saved Ollama beside it: on goes there, off waits.
+    [route({ connection: null, local_available: true }), "설정 → 요약(LLM)에서 요약 모델을 받아 주세요", true],
   ];
   for (const [r, text, toggle] of cases) {
     mockIPC((cmd) => (cmd === "summary_route" ? r : undefined));
@@ -54,6 +62,34 @@ test("says where the summary goes, and offers 로컬로 요약 only with a local
     expect(!!screen.queryByRole("switch", { name: "로컬로 요약" })).toBe(toggle);
     cleanup();
   }
+});
+
+// Plan 5.4: a waiting meeting's own reason, even once its route is pinned (locked).
+test("says why a pinned meeting waits: its connection deleted, or the summary model", async () => {
+  mockIPC((cmd) => {
+    if (cmd === "summary_route") return route({ connection: null, locked: true });
+    if (cmd === "model_status") {
+      const file = { file: "m.gguf", size: 100, installed: false, received: 20, downloading: true };
+      return { files: [file], downloading: true };
+    }
+  });
+  render(<RouteNotice id="a" wait="connection_deleted" />);
+  expect(await screen.findByText("이 회의에 정한 연결이 삭제됐습니다. 다른 연결을 골라 주세요")).toBeTruthy();
+  cleanup();
+
+  render(<RouteNotice id="a" wait="summary_model" />);
+  expect(await screen.findByText("요약 모델 받는 중 20% · 다 받으면 자동으로 요약합니다")).toBeTruthy();
+  expect(screen.queryByRole("switch")).toBeNull();
+});
+
+// Plan 5.3: counted on screen between events, from when the engine began starting.
+test("요약 엔진 준비 중 counts its seconds", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-10-19T05:00:10Z"));
+  render(<EngineStarting since={Date.parse("2026-10-19T05:00:00Z") / 1000} />);
+  expect(screen.getByText("요약 엔진 준비 중 · 10초")).toBeTruthy();
+  await act(() => vi.advanceTimersByTimeAsync(2_000));
+  expect(screen.getByText("요약 엔진 준비 중 · 12초")).toBeTruthy();
 });
 
 test("the switch sets 로컬로 요약 and shows the route it returns", async () => {
@@ -153,8 +189,13 @@ test("phase: an event saying it runs wins over the list's status", () => {
     position: null,
     ...patch,
   });
-  // No place in line and no event: it stopped for want of an LLM connection.
+  // No place in line and no event: it stopped, waiting for its route.
   expect(phase(meta, undefined)).toBeNull();
+  // A paused one waiting for its route is out of line too (plan 5.4); without a reason it waits.
+  const paused = { ...meta, status: "paused" } as Meta;
+  expect(phase({ ...paused, wait: "connection_deleted" }, undefined)).toBeNull();
+  expect(phase(paused, undefined)).toBe("waiting");
+  expect(phase({ ...paused, wait: "summary_model" }, event({ status: "paused", position: 2 }))).toBe("waiting");
   expect(phase(meta, event({}))).toBe("running");
   expect(phase(meta, event({ status: "summarizing", chunk: 0, chunks: 0, percent: 0 }))).toBe("running");
   // Its last event is the end: nothing runs.

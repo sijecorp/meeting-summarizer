@@ -93,6 +93,9 @@ export type Settings = {
   recorder_name: string;
   backend: Backend;
   gpu_failed: boolean;
+  /** The summary engine's GPU failed and its CPU worked: automatic mode summarizes on the CPU
+   * (plan 5.3). Rust keeps it across saves. */
+  summary_gpu_failed?: boolean;
   model: string;
   model_base_url: string;
   input_device: string | null;
@@ -113,6 +116,8 @@ export type LoadedSettings = { settings: Settings; read_only: boolean; rename: s
 export const BUILTIN = "builtin";
 /** A connection's name as the screens show it: "이 PC" for the built-in route, never `builtin`. */
 export const connectionLabel = (name: string) => (name === BUILTIN ? "이 PC" : name);
+/** `settings::reserved` (d6): names only the built-in route may have. */
+export const reserved = (name: string) => [BUILTIN, connectionLabel(BUILTIN)].includes(name.trim());
 
 /** A connection a screen may offer (plan 5.4): the saved ones, then the built-in route, labelled
  * "이 PC". `host`: where it sends a transcript (SUM-07), empty for the built-in route. No secret. */
@@ -123,7 +128,9 @@ export const listConnections = () => invoke<ConnectionItem[]>("list_connections"
 export type SecretKind = "llm" | "slack";
 
 export const getSettings = () => invoke<LoadedSettings>("get_settings");
-export const saveSettings = (value: Settings) => invoke<void>("save_settings", { value });
+/** Resolves to the settings as stored: the local default is off while nothing local can summarize
+ * (SUM-08), and the fields Rust owns (`gpu_failed`, `last_channel`) are its own. */
+export const saveSettings = (value: Settings) => invoke<Settings>("save_settings", { value });
 /** Backs up an unreadable settings.json and returns the defaults. */
 export const resetSettings = () => invoke<LoadedSettings>("reset_settings");
 
@@ -175,6 +182,9 @@ export type SummaryRoute = {
   local_available: boolean;
   /** Summarizing has started: the route no longer changes. */
   locked: boolean;
+  /** Flipping "로컬로 요약" changes where the summary goes or whether it waits: the toggle is
+   * offered only then. */
+  toggle_matters: boolean;
 };
 export const summaryRoute = (id: string) => invoke<SummaryRoute>("summary_route", { id });
 /** Fails once the route is locked, or when asked for local without a local connection. */
@@ -284,6 +294,9 @@ export type Progress = {
   eta_secs: number | null;
   /** 1-based place in line while waiting; null while running. */
   position: number | null;
+  /** Unix seconds since the built-in engine began starting for this summary, until it is ready or
+   * fails (plan 5.3): "요약 엔진 준비 중 · N초" counts from it. */
+  engine_since?: number | null;
 };
 /** Queued and running meetings, for the first render before progress events arrive. */
 export const queueState = () => invoke<Progress[]>("queue_state");
@@ -322,23 +335,26 @@ export const modelStatus = (scope?: ModelScope) => invoke<ModelState>("model_sta
 // One download for the whole app: it outlives the screen that started it (874 MB takes a while),
 // so Home's setup card and the settings' 전사 tab both follow the same one.
 let download: Promise<void> | null = null;
+// The scope of the running download, or the last one: its failure belongs to the tab of that scope.
+let downloadScope: ModelScope = "all";
 let cancelled = false;
 let failure = "";
 // A cancel answered `stopped` for this download: later answers cannot take it back.
 let stopped = false;
 
 /**
- * ONB-01: starts `download_models` for `scope`, or joins the one running, whatever its scope.
+ * ONB-01: starts `download_models` for `asked`, or joins the one running, whatever its scope.
  * Settles when every file has been tried (one failing does not stop the next), or when it is
  * cancelled. Never rejects: the reasons stay in `modelDownloadFailure()` until the next download
  * or a successful import, so a screen opened later still shows them. A cancel leaves no reason.
  */
-export const startModelDownload = (scope?: ModelScope) => {
+export const startModelDownload = (asked?: ModelScope) => {
   if (!download) {
+    downloadScope = asked ?? "all";
     failure = "";
     // A cancel clicked as the last download settled must not hide this one's failure.
     cancelled = stopped = false;
-    download = invoke<void>("download_models", { scope })
+    download = invoke<void>("download_models", { scope: asked })
       .catch((e) => {
         if (!cancelled) failure = String(e);
       })
@@ -351,6 +367,8 @@ export const startModelDownload = (scope?: ModelScope) => {
 };
 /** The download running, if any. */
 export const modelDownload = () => download;
+/** What the running download, or the last one, was started for. */
+export const modelDownloadScope = () => downloadScope;
 export const modelDownloadFailure = () => failure;
 /** What a cancel did: `stopped` the download and its chain, `dropped` the scope's files still
  * ahead from the chain (the file in flight goes on), or null with nothing of the scope to cancel. */

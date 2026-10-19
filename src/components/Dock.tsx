@@ -1,7 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { Square } from "lucide-react";
 import { AnimatePresence, motion, useTransform } from "motion/react";
-import { clock, hhmm, Kbd, phase, Present, RollingTime, SHORTCUT, sinceStart, useFollow } from "@/components/common";
+import {
+  clock,
+  engineStarting,
+  hhmm,
+  Kbd,
+  phase,
+  Present,
+  RollingTime,
+  SHORTCUT,
+  sinceStart,
+  useFollow,
+} from "@/components/common";
 import { onRecordingLevel, type MeetingItem, type Progress } from "@/lib/ipc";
 import { dur, spring } from "@/lib/motion";
 
@@ -85,7 +96,11 @@ function jobOf(m: MeetingItem, p: Progress | undefined) {
   // says transcribing.
   if ((p?.status === "summarizing" ? p.status : m.status) === "summarizing") {
     const n = p?.status === "summarizing" && p.chunks > 1 ? p : null;
-    const step = n ? `요약 ${Math.min(n.chunk + 1, n.chunks)}/${n.chunks}` : "요약 중";
+    const step = engineStarting(p)
+      ? "요약 엔진 준비 중"
+      : n
+        ? `요약 ${Math.min(n.chunk + 1, n.chunks)}/${n.chunks}`
+        : "요약 중";
     return { name, step, percent: n?.percent ?? null, shown: false, running: true };
   }
   // Until the chunk plan exists, `percent` is the planning's own.

@@ -26,10 +26,18 @@ pub fn save_settings(
     settings: State<'_, SettingsStore>,
     queue: State<'_, Queue>,
     value: Settings,
-) -> Result<(), String> {
-    settings.save(value)?;
+) -> Result<Settings, String> {
+    settings.save(local_default_kept(value, queue.builtin_ready()))?;
     queue.enqueue_pending();
-    Ok(())
+    Ok(settings.load()?.settings)
+}
+
+/// SUM-08: new meetings start with "로컬로 요약" only while something local can summarize them:
+/// the summary model, or a saved local connection (plan 5.4). Else it is stored off, so it never
+/// stays on unseen (the settings screen hides its switch then).
+fn local_default_kept(mut value: Settings, builtin_ready: bool) -> Settings {
+    value.summarize_local_by_default &= summarize::local_available(&value, builtin_ready);
+    value
 }
 
 /// Backs up an unreadable settings.json and starts from defaults.
@@ -720,6 +728,37 @@ mod tests {
         assert!(not_in_use(&all, false).is_ok());
         // The transcription files are not llama-server's.
         assert!(not_in_use(&transcription, true).is_ok());
+    }
+
+    /// SUM-08: the local default is stored only while something local can summarize; a
+    /// connection under a reserved name does not count (d6).
+    #[test]
+    fn the_local_default_is_stored_only_while_something_local_can_summarize() {
+        let kept = |connections: Vec<settings::LlmConnection>, ready: bool| {
+            let value = Settings {
+                llm_connections: connections,
+                summarize_local_by_default: true,
+                ..Settings::default()
+            };
+            local_default_kept(value, ready).summarize_local_by_default
+        };
+        let local = |name: &str| settings::LlmConnection {
+            is_local: true,
+            ..cloud(name, "http://localhost:11434/v1")
+        };
+        assert!(kept(vec![], true));
+        assert!(kept(vec![local("Ollama")], false));
+        assert!(!kept(
+            vec![cloud("클라우드", "https://api.example.com/v1")],
+            false
+        ));
+        assert!(!kept(vec![local("이 PC")], false));
+        // Off stays off.
+        let off = Settings {
+            summarize_local_by_default: false,
+            ..Settings::default()
+        };
+        assert!(!local_default_kept(off, true).summarize_local_by_default);
     }
 
     /// Plan 5.4: the screens' list ends with the built-in route as "이 PC"; `get_settings` and the
