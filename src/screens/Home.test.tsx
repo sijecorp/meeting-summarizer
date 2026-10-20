@@ -30,7 +30,7 @@ const models = (installed: boolean): ModelState => ({
   downloading: false,
 });
 // Home reads only whether these lists are empty.
-const complete = { settings: { llm_connections: [{}], webhooks: [{}] } } as unknown as LoadedSettings;
+const complete = { settings: { llm_connections: [{}], slack_team: "SIJE" } } as unknown as LoadedSettings;
 
 // Complete settings and installed models unless the handler says otherwise, so no setup card shows
 // by accident.
@@ -208,13 +208,13 @@ test("a meeting waiting for its route says 요약 대기; a deleted connection a
 // item's (in `modelStatus()`), and a saved default, local or cloud, needs nothing.
 test("the setup line never asks for an LLM connection", async () => {
   for (const settings of [
-    { llm_connections: [], default_llm: null, webhooks: [] },
-    { llm_connections: [{ name: "Ollama", is_local: true }], default_llm: "Ollama", webhooks: [] },
+    { llm_connections: [], default_llm: null, slack_team: null },
+    { llm_connections: [{ name: "Ollama", is_local: true }], default_llm: "Ollama", slack_team: null },
   ]) {
     mock((cmd) => (cmd === "get_settings" ? { settings } : undefined));
     render(<Home {...props} meetings={[]} progress={{}} />);
     const items = within(await screen.findByRole("list", { name: "남은 설정" }));
-    expect(items.getByRole("button", { name: "Slack 채널 연결" })).toBeTruthy();
+    expect(items.getByRole("button", { name: "Slack 로그인" })).toBeTruthy();
     expect(items.queryByRole("button", { name: "LLM 연결" })).toBeNull();
     expect(items.queryByRole("button", { name: "모델 받기" })).toBeNull();
     cleanup();
@@ -272,7 +272,7 @@ test("a failed download says so and 다시 받기 tries again; each link opens i
   let downloads = 0;
   mock((cmd) => {
     if (cmd === "model_status") return models(false);
-    if (cmd === "get_settings") return { settings: { llm_connections: [], webhooks: [] } };
+    if (cmd === "get_settings") return { settings: { llm_connections: [], slack_team: null } };
     if (cmd === "download_models") {
       if (++downloads === 1) throw new Error("연결이 끊겼습니다");
       return new Promise<void>((resolve) => (release = resolve));
@@ -287,7 +287,7 @@ test("a failed download says so and 다시 받기 tries again; each link opens i
   fireEvent.click(items.getByRole("button", { name: "전사 설정" }));
   // No connection is no missing step: this PC summarizes (plan 5.8).
   expect(items.queryByRole("button", { name: "LLM 연결" })).toBeNull();
-  fireEvent.click(items.getByRole("button", { name: "Slack 채널 연결" }));
+  fireEvent.click(items.getByRole("button", { name: "Slack 로그인" }));
   expect(opened).toEqual(["transcription", "slack"]);
 
   fireEvent.click(items.getByRole("button", { name: "다시 받기" }));

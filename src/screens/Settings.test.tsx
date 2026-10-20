@@ -26,7 +26,7 @@ function Settings(props: ComponentProps<typeof SettingsScreen>) {
     </>
   );
 }
-// Connections and webhooks are rows that open to edit them.
+// Connections are rows that open to edit them.
 const expand = async (name: string) =>
   fireEvent.click(await screen.findByRole("button", { name: new RegExp(`^${name}`) }));
 
@@ -69,7 +69,7 @@ const loaded: LoadedSettings = {
     ],
     default_llm: "회사 클라우드",
     summarize_local_by_default: false,
-    webhooks: [],
+    slack_team: null,
     last_channel: null,
     glossary: [],
   },
@@ -128,16 +128,16 @@ test("keeps unsaved edits across tabs and saves them all, keys included, at once
   fireEvent.click(tab("요약(LLM)"));
   expect(tab("요약(LLM)").getAttribute("aria-current")).toBe("page");
   expect(tab("일반").getAttribute("aria-current")).toBeNull();
+  fireEvent.change(screen.getByRole("textbox", { name: "새 LLM 연결 이름" }), {
+    target: { value: "사내 서버" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "연결 추가" }));
   await expand("회사 클라우드");
   fireEvent.change(screen.getByLabelText(/^API 키/), { target: { value: "sk-아직-안-넣음" } });
 
   fireEvent.click(tab("Slack"));
   // Hidden panels stay mounted but out of reach.
   expect(recorderName()).toBeNull();
-  fireEvent.change(screen.getByRole("textbox", { name: "새 웹훅 이름" }), {
-    target: { value: "#회의록" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "웹훅 추가" }));
 
   fireEvent.click(tab("일반"));
   expect(recorderName().value).toBe("김철수");
@@ -157,7 +157,7 @@ test("keeps unsaved edits across tabs and saves them all, keys included, at once
   );
   expect(calls.find((c) => c.cmd === "save_settings")?.args.value).toMatchObject({
     recorder_name: "김철수",
-    webhooks: [{ name: "#회의록" }],
+    llm_connections: [{ name: "회사 클라우드" }, { name: "사내 서버" }],
   });
   fireEvent.click(tab("요약(LLM)"));
   expect(screen.getByLabelText("API 키 · 키체인에 저장됨")).toBeTruthy();
@@ -174,32 +174,31 @@ test("stores a new entry's key only after a successful save", async () => {
     if (cmd === "has_secret") return true;
     if (cmd === "save_settings" && saveFails) throw new Error("settings.json 저장 실패");
   });
-  render(<Settings tab="slack" onHome={() => {}} />);
+  render(<Settings tab="llm" onHome={() => {}} />);
 
-  fireEvent.change(await screen.findByRole("textbox", { name: "새 웹훅 이름" }), {
-    target: { value: "#회의록" },
+  fireEvent.change(await screen.findByRole("textbox", { name: "새 LLM 연결 이름" }), {
+    target: { value: "사내 서버" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "웹훅 추가" }));
-  const url = screen.getByLabelText(/^웹훅 URL/) as HTMLInputElement;
-  expect(url.disabled).toBe(false);
-  fireEvent.change(url, { target: { value: " https://hooks.slack.com/services/x " } });
+  fireEvent.click(screen.getByRole("button", { name: "연결 추가" }));
+  const key = screen.getByLabelText("API 키 · 입력 안 됨") as HTMLInputElement;
+  fireEvent.change(key, { target: { value: " sk-새 키 " } });
 
   fireEvent.click(screen.getByRole("button", { name: "저장" }));
   expect(await screen.findByText(/settings\.json 저장 실패/)).toBeTruthy();
   expect(calls.map((c) => c.cmd)).not.toContain("set_secret");
-  expect(url.value).toBe(" https://hooks.slack.com/services/x ");
+  expect(key.value).toBe(" sk-새 키 ");
 
   saveFails = false;
   fireEvent.click(screen.getByRole("button", { name: "저장" }));
-  await waitFor(() => expect(screen.getByLabelText("웹훅 URL · 키체인에 저장됨")).toBeTruthy());
+  await waitFor(() => expect(screen.getByLabelText("API 키 · 키체인에 저장됨")).toBeTruthy());
   const cmds = calls.map((c) => c.cmd);
   expect(cmds.lastIndexOf("save_settings")).toBeLessThan(cmds.indexOf("set_secret"));
   expect(calls.find((c) => c.cmd === "set_secret")?.args).toEqual({
-    kind: "slack",
-    name: "#회의록",
-    value: "https://hooks.slack.com/services/x",
+    kind: "llm",
+    name: "사내 서버",
+    value: "sk-새 키",
   });
-  expect((screen.getByLabelText(/^웹훅 URL/) as HTMLInputElement).value).toBe("");
+  expect((screen.getByLabelText(/^API 키/) as HTMLInputElement).value).toBe("");
 });
 
 test("keeps a typed key and says so when the keychain write fails", async () => {
@@ -396,24 +395,24 @@ test("removing an entry drops the key typed for it", async () => {
     if (cmd === "get_settings") return loaded;
     if (cmd === "has_secret") return false;
   });
-  render(<Settings tab="slack" onHome={() => {}} />);
+  render(<Settings tab="llm" onHome={() => {}} />);
   const add = () => {
-    fireEvent.change(screen.getByRole("textbox", { name: "새 웹훅 이름" }), {
-      target: { value: "#회의록" },
+    fireEvent.change(screen.getByRole("textbox", { name: "새 LLM 연결 이름" }), {
+      target: { value: "사내 서버" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "웹훅 추가" }));
+    fireEvent.click(screen.getByRole("button", { name: "연결 추가" }));
   };
 
-  await screen.findByRole("textbox", { name: "새 웹훅 이름" });
+  await screen.findByRole("textbox", { name: "새 LLM 연결 이름" });
   add();
-  fireEvent.change(screen.getByLabelText(/^웹훅 URL/), { target: { value: "https://hooks/x" } });
-  fireEvent.click(screen.getByRole("button", { name: "웹훅 삭제" }));
-  const dialog = await screen.findByRole("alertdialog", { name: "#회의록 웹훅을 삭제할까요?" });
+  fireEvent.change(screen.getByLabelText(/^API 키/), { target: { value: "sk-x" } });
+  fireEvent.click(screen.getByRole("button", { name: "연결 삭제" }));
+  const dialog = await screen.findByRole("alertdialog", { name: "사내 서버 연결을 삭제할까요?" });
   fireEvent.click(within(dialog).getByRole("button", { name: "삭제" }));
 
-  // Never saved, so the same name may come back, without the old typed URL.
+  // Never saved, so the same name may come back, without the old typed key.
   add();
-  expect((screen.getByLabelText(/^웹훅 URL/) as HTMLInputElement).value).toBe("");
+  expect((screen.getByLabelText(/^API 키/) as HTMLInputElement).value).toBe("");
   fireEvent.click(screen.getByRole("button", { name: "저장" }));
   expect(await screen.findByText("저장했습니다")).toBeTruthy();
   expect(cmds).not.toContain("set_secret");
@@ -1053,7 +1052,7 @@ test("the backend is a segmented choice, and choosing GPU clears the fallback", 
   expect(screen.queryByText(/GPU 전사에 실패해/)).toBeNull();
 });
 
-test("connection and webhook rows open in place and close again", async () => {
+test("connection rows open in place and close again", async () => {
   mockIPC((cmd) => {
     if (cmd === "get_settings") return loaded;
     if (cmd === "has_secret") return true;
@@ -1073,18 +1072,19 @@ test("connection and webhook rows open in place and close again", async () => {
   fireEvent.click(row("회사 클라우드"));
   expect(screen.queryByRole("textbox", { name: "Base URL" })).toBeNull();
 
-  // A new webhook opens for its URL; removed, focus goes to the add row, not the page.
-  fireEvent.click(screen.getByRole("button", { name: "Slack" }));
-  fireEvent.change(screen.getByRole("textbox", { name: "새 웹훅 이름" }), { target: { value: "#회의록" } });
-  fireEvent.click(screen.getByRole("button", { name: "웹훅 추가" }));
-  expect(row("#회의록").getAttribute("aria-expanded")).toBe("true");
-  expect(row("#회의록").getAttribute("aria-label")).toBe("#회의록, URL 입력 안 됨");
-  fireEvent.click(row("#회의록"));
-  expect(screen.queryByLabelText(/^웹훅 URL/)).toBeNull();
-  fireEvent.click(row("#회의록"));
-  fireEvent.click(screen.getByRole("button", { name: "웹훅 삭제" }));
+  // A new connection opens for its address; removed, focus goes to the add row, not the page.
+  fireEvent.change(screen.getByRole("textbox", { name: "새 LLM 연결 이름" }), { target: { value: "사내 서버" } });
+  fireEvent.click(screen.getByRole("button", { name: "연결 추가" }));
+  expect(row("사내 서버").getAttribute("aria-expanded")).toBe("true");
+  expect(row("사내 서버").getAttribute("aria-label")).toBe("사내 서버, 클라우드");
+  fireEvent.click(row("사내 서버"));
+  expect(screen.queryByRole("textbox", { name: "Base URL" })).toBeNull();
+  fireEvent.click(row("사내 서버"));
+  fireEvent.click(screen.getByRole("button", { name: "연결 삭제" }));
   fireEvent.click(within(await screen.findByRole("alertdialog")).getByRole("button", { name: "삭제" }));
-  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "새 웹훅 이름" })));
+  await waitFor(() =>
+    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "새 LLM 연결 이름" })),
+  );
 });
 
 test("the save bar shows only with unsaved changes, and counts them", async () => {
@@ -1111,12 +1111,11 @@ test("the save bar shows only with unsaved changes, and counts them", async () =
   fireEvent.change(screen.getByRole("textbox", { name: /^용어집/ }), { target: { value: "\n  \n" } });
   expect(count()).toBe("저장 안 한 변경 2개");
 
-  // An added webhook and its typed URL are two; an edited connection is one however many fields.
-  fireEvent.click(screen.getByRole("button", { name: "Slack" }));
-  fireEvent.change(screen.getByRole("textbox", { name: "새 웹훅 이름" }), { target: { value: "#회의록" } });
-  fireEvent.click(screen.getByRole("button", { name: "웹훅 추가" }));
-  fireEvent.change(screen.getByLabelText(/^웹훅 URL/), { target: { value: "https://hooks/x" } });
+  // An added connection and its typed key are two; an edited connection is one however many fields.
   fireEvent.click(screen.getByRole("button", { name: "요약(LLM)" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "새 LLM 연결 이름" }), { target: { value: "사내 서버" } });
+  fireEvent.click(screen.getByRole("button", { name: "연결 추가" }));
+  fireEvent.change(screen.getByLabelText(/^API 키/), { target: { value: "sk-x" } });
   await expand("회사 클라우드");
   fireEvent.change(screen.getByRole("textbox", { name: "모델" }), { target: { value: "m2" } });
   fireEvent.change(screen.getByRole("spinbutton", { name: "컨텍스트 토큰" }), { target: { value: "1000" } });
@@ -1146,21 +1145,21 @@ test("되돌리기 puts back what was saved, typed keys too after asking", async
   await waitFor(() => expect(screen.queryByRole("button", { name: "저장" })).toBeNull());
 
   fireEvent.change(name, { target: { value: "김철수" } });
-  fireEvent.click(screen.getByRole("button", { name: "Slack" }));
-  fireEvent.change(screen.getByRole("textbox", { name: "새 웹훅 이름" }), { target: { value: "#회의록" } });
-  fireEvent.click(screen.getByRole("button", { name: "웹훅 추가" }));
-  fireEvent.change(screen.getByLabelText(/^웹훅 URL/), { target: { value: "https://hooks/x" } });
+  fireEvent.click(screen.getByRole("button", { name: "요약(LLM)" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "새 LLM 연결 이름" }), { target: { value: "사내 서버" } });
+  fireEvent.click(screen.getByRole("button", { name: "연결 추가" }));
+  fireEvent.change(screen.getByLabelText(/^API 키/), { target: { value: "sk-x" } });
   fireEvent.click(screen.getByRole("button", { name: "되돌리기" }));
   const dialog = await screen.findByRole("alertdialog", { name: "입력한 키도 되돌릴까요?" });
   fireEvent.click(within(dialog).getByRole("button", { name: "되돌리기" }));
 
   await waitFor(() => expect(screen.queryByRole("button", { name: "저장" })).toBeNull());
-  expect(screen.queryByRole("button", { name: /^#회의록/ })).toBeNull();
+  expect(screen.queryByRole("button", { name: /^사내 서버/ })).toBeNull();
   expect(name.value).toBe("홍길동");
-  // Added again, it comes back without the URL typed before.
-  fireEvent.change(screen.getByRole("textbox", { name: "새 웹훅 이름" }), { target: { value: "#회의록" } });
-  fireEvent.click(screen.getByRole("button", { name: "웹훅 추가" }));
-  expect((screen.getByLabelText(/^웹훅 URL/) as HTMLInputElement).value).toBe("");
+  // Added again, it comes back without the key typed before.
+  fireEvent.change(screen.getByRole("textbox", { name: "새 LLM 연결 이름" }), { target: { value: "사내 서버" } });
+  fireEvent.click(screen.getByRole("button", { name: "연결 추가" }));
+  expect((screen.getByLabelText(/^API 키/) as HTMLInputElement).value).toBe("");
   expect(cmds).not.toContain("save_settings");
   expect(cmds).not.toContain("set_secret");
 });
@@ -1381,62 +1380,86 @@ test("the system audio check says what it heard, and no check runs while recordi
   expect(tests()).toHaveLength(3);
 });
 
-test("a test message goes with the URL typed, else the saved one, and leaves the draft alone", async () => {
-  const calls: Call[] = [];
-  const withWebhook: LoadedSettings = {
-    ...loaded,
-    settings: { ...loaded.settings, webhooks: [{ name: "#회의록" }] },
-  };
-  let finish = () => {};
-  mockIPC((cmd, args) => {
-    calls.push({ cmd, args: args as Call["args"] });
-    if (cmd === "get_settings") return withWebhook;
+// ONB-04: signing in is not a setting, so it never counts toward 저장.
+test("Slack으로 로그인 waits for the browser, then shows the workspace with nothing to save", async () => {
+  let finish = (_: string | null) => {};
+  mockIPC((cmd) => {
+    if (cmd === "get_settings") return loaded;
     if (cmd === "has_secret") return true;
-    if (cmd === "send_test_message") {
-      if (!(args as Call["args"]).url) return new Promise<void>((resolve) => (finish = resolve));
-      throw "Slack에 연결하지 못했습니다. 인터넷 연결을 확인해 주세요: connection refused";
-    }
+    if (cmd === "slack_sign_in") return new Promise<string | null>((resolve) => (finish = resolve));
   });
   render(<Settings tab="slack" onHome={() => {}} />);
-  const sends = () => calls.filter((c) => c.cmd === "send_test_message").map((c) => c.args);
-  await expand("#회의록");
 
-  const send = screen.getByRole("button", { name: "테스트 메시지 보내기" });
-  fireEvent.click(send);
-  expect(sends()).toEqual([{ webhook: "#회의록", url: null }]);
-  expect(send.textContent).toBe("보내는 중…");
-  expect(send.getAttribute("aria-disabled")).toBe("true");
-  await act(async () => finish());
-  expect(await screen.findByText("보냈습니다. Slack 채널을 확인하세요")).toBeTruthy();
+  expect(await screen.findByText("Slack 계정")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Slack으로 로그인", description: "로그인하지 않았습니다" }));
+  expect(screen.getByRole("button", { name: "취소", description: "브라우저에서 Slack 로그인을 마쳐 주세요" })).toBeTruthy();
+
+  await act(async () => finish("SIJE"));
+  expect(
+    await screen.findByRole("button", {
+      name: "로그아웃",
+      description: "로그인했습니다. 요약은 내 이름으로, 내가 들어가 있는 채널에 올라갑니다",
+    }),
+  ).toBeTruthy();
+  expect(screen.getByText("SIJE")).toBeTruthy();
   expect(unsaved()).toBeNull();
-
-  fireEvent.change(screen.getByLabelText(/^웹훅 URL/), {
-    target: { value: " https://hooks.slack.com/services/new " },
-  });
-  // It went to the saved URL, not this one.
-  expect(screen.queryByText("보냈습니다. Slack 채널을 확인하세요")).toBeNull();
-  fireEvent.click(send);
-  expect(sends()[1]).toEqual({ webhook: "#회의록", url: "https://hooks.slack.com/services/new" });
-  expect(await screen.findByText(/^Slack에 연결하지 못했습니다/)).toBeTruthy();
-  // Only the typed URL counts; the test sent nothing to save.
-  expect(unsaved()).toBe("저장 안 한 변경 1개");
-  expect(calls.map((c) => c.cmd)).not.toContain("set_secret");
+  expect(screen.queryByRole("button", { name: "저장" })).toBeNull();
 });
 
-// The typed URL is saved and its field empties: the result for the old keychain URL must not return.
-test("a test result for the saved URL goes once a new URL is saved", async () => {
+test("취소 stops a Slack sign-in, which then leaves the row signed out", async () => {
+  const cmds: string[] = [];
+  let finish = (_: string | null) => {};
   mockIPC((cmd) => {
-    if (cmd === "get_settings") return { ...loaded, settings: { ...loaded.settings, webhooks: [{ name: "#회의록" }] } };
+    cmds.push(cmd);
+    if (cmd === "get_settings") return loaded;
     if (cmd === "has_secret") return true;
+    if (cmd === "slack_sign_in") return new Promise<string | null>((resolve) => (finish = resolve));
+    // Like slack.rs: the waiting sign-in resolves null.
+    if (cmd === "slack_cancel_sign_in") finish(null);
   });
   render(<Settings tab="slack" onHome={() => {}} />);
-  await expand("#회의록");
-  fireEvent.click(screen.getByRole("button", { name: "테스트 메시지 보내기" }));
-  expect(await screen.findByText("보냈습니다. Slack 채널을 확인하세요")).toBeTruthy();
 
-  fireEvent.change(screen.getByLabelText(/^웹훅 URL/), { target: { value: "https://hooks.slack.com/services/b" } });
-  fireEvent.click(screen.getByRole("button", { name: "저장" }));
-  expect(await screen.findByText("저장했습니다")).toBeTruthy();
-  expect((screen.getByLabelText(/^웹훅 URL/) as HTMLInputElement).value).toBe("");
-  expect(screen.queryByText("보냈습니다. Slack 채널을 확인하세요")).toBeNull();
+  fireEvent.click(await screen.findByRole("button", { name: "Slack으로 로그인" }));
+  fireEvent.click(screen.getByRole("button", { name: "취소" }));
+  expect(
+    await screen.findByRole("button", { name: "Slack으로 로그인", description: "로그인하지 않았습니다" }),
+  ).toBeTruthy();
+  expect(cmds).toContain("slack_cancel_sign_in");
+  expect(screen.getByText("Slack 계정")).toBeTruthy();
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+test("a failed Slack sign-in says why, and 로그아웃 signs out", async () => {
+  const cmds: string[] = [];
+  let fails = true;
+  let finish = () => {};
+  mockIPC((cmd) => {
+    cmds.push(cmd);
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "has_secret") return true;
+    if (cmd === "slack_sign_in") {
+      if (fails) throw "Slack 로그인에 실패했습니다: access_denied";
+      return "SIJE";
+    }
+    if (cmd === "slack_sign_out") return new Promise<void>((resolve) => (finish = resolve));
+  });
+  render(<Settings tab="slack" onHome={() => {}} />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "Slack으로 로그인" }));
+  expect((await screen.findByRole("alert")).textContent).toBe("Slack 로그인에 실패했습니다: access_denied");
+  // A sign-in that works clears it.
+  fails = false;
+  fireEvent.click(screen.getByRole("button", { name: "Slack으로 로그인" }));
+  const signOut = await screen.findByRole("button", { name: "로그아웃" });
+  expect(screen.queryByRole("alert")).toBeNull();
+
+  fireEvent.click(signOut);
+  expect(signOut.textContent).toBe("로그아웃하는 중…");
+  await act(async () => finish());
+  expect(
+    await screen.findByRole("button", { name: "Slack으로 로그인", description: "로그인하지 않았습니다" }),
+  ).toBeTruthy();
+  expect(screen.getByText("Slack 계정")).toBeTruthy();
+  expect(cmds.filter((c) => c === "slack_sign_out")).toHaveLength(1);
+  expect(unsaved()).toBeNull();
 });

@@ -359,7 +359,7 @@ export default function Home({
     if (running) follow(running);
     getSettings()
       .then(({ settings }) =>
-        setSetup(settings.webhooks.length ? [] : [{ action: "Slack 채널 연결", tab: "slack" }]),
+        setSetup(settings.slack_team ? [] : [{ action: "Slack 로그인", tab: "slack" }]),
       )
       // The settings screen shows the error and offers starting over.
       .catch(() => setSetup([{ text: "설정 파일을 읽을 수 없습니다", action: "설정 열기", tab: "general" }]));

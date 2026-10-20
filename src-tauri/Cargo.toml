@@ -55,6 +55,10 @@ tauri-plugin-log = "2.10.1"
 log = "0.4.34"
 # The summary engine's per-summary API key (sidecar.rs). Same version tauri already pulls in.
 getrandom = "0.3.4"
+# Slack sign-in (slack.rs): PKCE's base64url and the Web API's form bodies. The versions reqwest
+# already pulls in.
+base64 = "0.23.1"
+form_urlencoded = "1.2.2"
 
 
 # Model hashes in dev builds and tests: unoptimized sha2 runs at ~30 MB/s, so checking the 874 MB

@@ -47,6 +47,10 @@ bun run app:dev
 
 요약 엔진(`llama-server` 사이드카)이 없거나, 빈 자리표시 파일이거나, 도장이 지금 커밋·옵션과 다르면 먼저 빌드한 뒤 `tauri dev`를 띄운다. 첫 빌드는 몇 분 걸리고, 그 뒤에는 캐시에서 복사만 한다. `bun run app:dev --check`는 사이드카 상태만 알려 준다.
 
+### Slack 앱
+
+Slack 로그인에는 회사 워크스페이스의 Slack 앱이 필요하다. 만드는 법과 매니페스트는 [docs/slack-app.md](docs/slack-app.md)에 있고, 그 Client ID를 `src-tauri/src/slack.rs`의 `CLIENT_ID`에 넣는다. 비어 있으면 앱은 "이 빌드에는 Slack 앱이 설정되지 않았습니다"로 로그인을 거부한다(나머지는 그대로 된다).
+
 ### 요약 엔진 사이드카
 
 llama.cpp의 `llama-server`를 정적 링크로 빌드해 `src-tauri/binaries/llama-server-<target-triple>`에 둔다. git에는 넣지 않는다. CI도 같은 스크립트를 부른다.
@@ -104,8 +108,9 @@ bun run tauri build
 worktree들은 같은 앱으로 실행된다(identifier `com.sije.meeting-summarizer`). 그래서 아래를 함께 쓴다.
 
 - 앱 데이터 폴더: 회의·모델·설정(macOS `~/Library/Application Support/com.sije.meeting-summarizer`, Windows 회의·모델은 `%LOCALAPPDATA%`, 설정은 `%APPDATA%` 아래 같은 이름)
-- 키체인 항목(LLM 키, Slack 웹훅)
+- 키체인 항목(LLM 키, Slack 로그인 토큰)
 - Vite 포트 1420: 두 번째 `bun run dev`·`app:dev`는 포트가 겹쳐 시작하지 않는다
+- Slack 로그인 포트 47815: 로그인을 기다리는 앱이 둘이면 나중 것이 포트를 열지 못한다
 - 단일 실행 검사: 앱이 이미 떠 있으면 두 번째 앱은 첫 창을 앞으로 가져오고 꺼진다
 
 따로 쓰게 하는 일은 `docs/TODOS.md`의 "worktree 격리"에 있다.

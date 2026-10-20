@@ -41,6 +41,7 @@ const mock = (handler: (cmd: string, args: Record<string, unknown>) => unknown) 
           { name: "builtin", label: "이 PC", host: "", is_local: true, builtin: true },
         ],
         queue_state: [],
+        slack_channels: [{ id: "C1", name: "회의록", private: false }],
       };
       return handler(cmd, args as Record<string, unknown>) ?? defaults[cmd];
     },
@@ -71,8 +72,8 @@ const loaded: LoadedSettings = {
     ],
     default_llm: "회사 클라우드",
     summarize_local_by_default: false,
-    webhooks: [{ name: "#회의록" }],
-    last_channel: null,
+    slack_team: "SIJE",
+    last_channel: "C1",
     glossary: [],
   },
 };
@@ -136,7 +137,7 @@ test("a screen changed from the keyboard takes the focus its button had", async 
 test("opens on Home with empty settings; the setup line opens the matching tab", async () => {
   const empty: LoadedSettings = {
     ...loaded,
-    settings: { ...loaded.settings, llm_connections: [], default_llm: null, webhooks: [] },
+    settings: { ...loaded.settings, llm_connections: [], default_llm: null, slack_team: null },
   };
   mock((cmd) => {
     if (cmd === "get_settings") return empty;
@@ -146,15 +147,15 @@ test("opens on Home with empty settings; the setup line opens the matching tab",
   render(<App />);
 
   const items = within(await screen.findByRole("list", { name: "남은 설정" }));
-  expect(await items.findByRole("button", { name: "Slack 채널 연결" })).toBeTruthy();
+  expect(await items.findByRole("button", { name: "Slack 로그인" })).toBeTruthy();
   // This PC summarizes with no connection (plan 5.8): its model is the model item's, here installed.
   expect(items.queryByRole("button", { name: "LLM 연결" })).toBeNull();
   expect(screen.getByRole("heading", { level: 1, name: FIRST })).toBeTruthy();
   // Recording needs no setup: no tour, no gate.
   expect((screen.getByRole("button", { name: "첫 회의 녹음하기" }) as HTMLButtonElement).disabled).toBe(false);
 
-  fireEvent.click(screen.getByRole("button", { name: "Slack 채널 연결" }));
-  expect(await screen.findByRole("textbox", { name: "새 웹훅 이름" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Slack 로그인" }));
+  expect(await screen.findByRole("button", { name: "Slack으로 로그인" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "Slack" }).getAttribute("aria-current")).toBe("page");
 });
 
@@ -431,7 +432,7 @@ test("the dock counts a summary as running, with its requests only past one", as
 
 test("the setup line's model item comes first; after a failed download 전사 설정 opens the 전사 tab", async () => {
   mock((cmd) => {
-    if (cmd === "get_settings") return { ...loaded, settings: { ...loaded.settings, webhooks: [] } };
+    if (cmd === "get_settings") return { ...loaded, settings: { ...loaded.settings, slack_team: null } };
     if (cmd === "list_meetings") return [];
     if (cmd === "has_secret") return true;
     if (cmd === "model_status") return models(false);
@@ -441,10 +442,10 @@ test("the setup line's model item comes first; after a failed download 전사 �
   render(<App />);
 
   const items = within(await screen.findByRole("list", { name: "남은 설정" }));
-  await items.findByRole("button", { name: "Slack 채널 연결" });
+  await items.findByRole("button", { name: "Slack 로그인" });
   await items.findByRole("button", { name: "모델 받기" });
   const rows = items.getAllByRole("listitem").map((li) => li.firstChild?.textContent);
-  expect(rows).toEqual(["모델 받기", "Slack 채널 연결"]);
+  expect(rows).toEqual(["모델 받기", "Slack 로그인"]);
   fireEvent.click(items.getByRole("button", { name: "모델 받기" }));
   expect(await items.findByText("모델을 받지 못했습니다")).toBeTruthy();
   fireEvent.click(items.getByRole("button", { name: "전사 설정" }));

@@ -86,8 +86,6 @@ export type LlmConnection = {
   timeout_secs: number;
 };
 
-export type Webhook = { name: string };
-
 export type Settings = {
   schema_version: number;
   recorder_name: string;
@@ -103,7 +101,10 @@ export type Settings = {
   llm_connections: LlmConnection[];
   default_llm: string | null;
   summarize_local_by_default: boolean;
-  webhooks: Webhook[];
+  /** The signed-in Slack workspace (ONB-04). Rust's alone: signing in and out write it, and a
+   * settings save keeps it. */
+  slack_team: string | null;
+  /** The channel id last sent to (SND-04). */
   last_channel: string | null;
   glossary: string[];
 };
@@ -125,11 +126,12 @@ export type ConnectionItem = { name: string; label: string; host: string; is_loc
 /** `getSettings` never holds the built-in route; screens that pick a connection read this. */
 export const listConnections = () => invoke<ConnectionItem[]>("list_connections");
 
-export type SecretKind = "llm" | "slack";
+/** Keychain keys the screens type: an LLM connection's. The Slack token never leaves Rust. */
+export type SecretKind = "llm";
 
 export const getSettings = () => invoke<LoadedSettings>("get_settings");
 /** Resolves to the settings as stored: the local default is off while nothing local can summarize
- * (SUM-08), and the fields Rust owns (`gpu_failed`, `last_channel`) are its own. */
+ * (SUM-08), and the fields Rust owns (`gpu_failed`, `last_channel`, `slack_team`) are its own. */
 export const saveSettings = (value: Settings) => invoke<Settings>("save_settings", { value });
 /** Backs up an unreadable settings.json and returns the defaults. */
 export const resetSettings = () => invoke<LoadedSettings>("reset_settings");
@@ -212,20 +214,25 @@ export const SLACK_MAX = 12_000;
  * `offsetMinutes`: the local UTC offset at the meeting's start; Rust cannot read it safely. */
 export const slackLength = (id: string, title: string, body: string, offsetMinutes: number) =>
   invoke<number>("slack_length", { id, title, body, offsetMinutes });
-/** SND-01..06, on the send button only: saves the title and body, then posts them to the webhook
- * named `webhook`. Resolves `sent`; on failure the meeting stays in `review` with the cause in
- * `error`. Never retried by itself: a resend could post twice. */
+/** A channel the signed-in recorder is in (SND-04). */
+export type Channel = { id: string; name: string; private: boolean };
+/** ONB-04: signs in in the browser. Resolves the workspace's name, or null when cancelled. */
+export const slackSignIn = () => invoke<string | null>("slack_sign_in");
+/** Stops a sign-in still waiting for the browser; it then resolves null. */
+export const slackCancelSignIn = () => invoke<void>("slack_cancel_sign_in");
+export const slackSignOut = () => invoke<void>("slack_sign_out");
+/** SND-04: the channels the recorder is in, by name. */
+export const slackChannels = () => invoke<Channel[]>("slack_channels");
+/** SND-01..06, on the send button only: saves the title and body, then posts them to `channel` as
+ * the signed-in recorder. Resolves `sent`; on failure the meeting stays in `review` with the cause
+ * in `error`. Never retried by itself: a resend could post twice. */
 export const sendToSlack = (
   id: string,
-  webhook: string,
+  channel: Channel,
   title: string,
   body: string,
   offsetMinutes: number,
-) => invoke<Meta>("send_to_slack", { id, webhook, title, body, offsetMinutes });
-/** ONB-06: a fixed message to the webhook `webhook`. `url`: one typed but not saved yet, sent
- * instead of the keychain's. Rejects with the same messages as `sendToSlack`. */
-export const sendTestMessage = (webhook: string, url: string | null) =>
-  invoke<void>("send_test_message", { webhook, url });
+) => invoke<Meta>("send_to_slack", { id, channel, title, body, offsetMinutes });
 /** A send of this meeting ended, sent or not, whichever screen started it. */
 export const onSlackFinished = (handler: (id: string) => void) =>
   listen<string>("slack://finished", (e) => handler(e.payload));

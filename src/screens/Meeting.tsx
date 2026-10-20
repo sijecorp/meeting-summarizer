@@ -52,6 +52,7 @@ import {
   SCHEMA_VERSION,
   sendToSlack,
   SLACK_MAX,
+  slackChannels,
   slackLength,
   STATUS_LABEL,
   type ConnectionItem,
@@ -61,7 +62,7 @@ import {
   type Segment,
   type Settings,
   type Status,
-  type Webhook,
+  type Channel,
 } from "@/lib/ipc";
 import { swapVariants, TITLE_GLIDE_MS, titleMove } from "@/lib/motion";
 import { cn } from "@/lib/utils";
@@ -92,10 +93,6 @@ const TRANSCRIBED: Status[] = ["transcribed", "summarizing", "summarize_failed",
 const CARET_ROOM = 16;
 /** App's sticky header (h-12). */
 const HEADER = 48;
-
-/** SND-04: the channel last sent to while it still exists, else the first (so the only one). */
-const defaultChannel = (webhooks: Webhook[], last: string | null) =>
-  last && webhooks.some((w) => w.name === last) ? last : (webhooks[0]?.name ?? "");
 
 /** The local UTC offset at the meeting's start, in minutes, for the Slack header's time. */
 const offsetOf = (createdAt: string) => -new Date(createdAt).getTimezoneOffset();
@@ -156,7 +153,7 @@ export default function Meeting({
   onHome: (e?: MouseEvent) => void;
   /** The app's banner: a save that fails after the screen has closed is told there. */
   onNotice: (message: string) => void;
-  /** Opens a settings tab: LLM connections, or Slack when there is no webhook to send to. */
+  /** Opens a settings tab: LLM connections, or Slack to sign in. */
   onSetup: (tab: SettingsTab) => void;
 }) {
   const s = savesOf(id);
@@ -179,7 +176,10 @@ export default function Meeting({
   // A copy's result shows briefly where it was asked; the saved `.md` path stays.
   const [copied, setCopied] = useState<{ at: "summary" | "transcript"; text: string } | null>(null);
   const [exported, setExported] = useState("");
-  const [channel, setChannel] = useState("");
+  // SND-04: the recorder's channels, read once the send bar can show, and the one picked: the last
+  // sent to while the recorder is still in it, else none until they pick.
+  const [channels, setChannels] = useState<Channel[] | null>(null);
+  const [channel, setChannel] = useState<Channel | null>(null);
   // REV-02, from slack.rs: what the send would carry, header included.
   const [length, setLength] = useState<number | null>(null);
   const [sending, setSending] = useState(false);
@@ -320,13 +320,11 @@ export default function Meeting({
     [],
   );
 
-  // The recorder's name for the meta line, the webhooks to send to, the connections to retry with.
+  const rereadSettings = () => getSettings().then(({ settings }) => setSettings(settings), () => {});
+  // The recorder's name for the meta line, the Slack sign-in, the connections to retry with.
   useEffect(() => {
     getSettings().then(
-      ({ settings }) => {
-        setSettings(settings);
-        setChannel(defaultChannel(settings.webhooks, settings.last_channel));
-      },
+      ({ settings }) => setSettings(settings),
       (e) => setError(`설정을 읽지 못했습니다: ${e}`),
     );
     listConnections().then(setConnections, (e) => setError(`LLM 연결 목록을 읽지 못했습니다: ${e}`));
@@ -449,14 +447,18 @@ export default function Meeting({
     flush()
       .then(
         () =>
-          sendToSlack(id, channel, title, body, offsetOf(createdAt)).then(
+          sendToSlack(id, channel!, title, body, offsetOf(createdAt)).then(
             (meta) => {
               seen.current = meta.status;
               setDetail((d) => d && { ...d, meta });
               setTitle(meta.title);
               setSentHere(true);
             },
-            (e) => setSendError(String(e)),
+            (e) => {
+              setSendError(String(e));
+              // An ended sign-in is forgotten by Rust: the bar then offers to sign in again.
+              rereadSettings();
+            },
           ),
         () => {},
       )
@@ -488,6 +490,28 @@ export default function Meeting({
   const canEdit = editable && !reveal && !inFlight;
   const over = Math.max(0, (length ?? 0) - SLACK_MAX);
   const canSend = editable && !!channel && over === 0 && !inFlight;
+  const signedIn = !!settings?.slack_team;
+  const lastChannel = settings?.last_channel;
+  useEffect(() => {
+    if (!editable || !signedIn) return;
+    let live = true;
+    slackChannels().then(
+      (list) => {
+        if (!live) return;
+        setChannels(list);
+        setChannel((picked) => picked ?? list.find((c) => c.id === lastChannel) ?? null);
+      },
+      (e) => {
+        if (!live) return;
+        setChannels([]);
+        setError(`Slack 채널 목록을 읽지 못했습니다: ${e}`);
+        rereadSettings();
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [editable, signedIn, lastChannel]);
   const transcribeFailed = meta?.status === "transcribe_failed" && now === null && !newer;
   const summaryFailed = meta?.status === "summarize_failed" && now === null && !newer;
   // Stopped after transcribing, with no place in line: its route does not resolve yet.
@@ -898,14 +922,15 @@ export default function Meeting({
           <div className="contents" onPointerDown={() => (leaving.current = "bar")}>
             <SendBar
             shown={present && !!text && (editable || sentHere)}
-            webhooks={settings?.webhooks ?? null}
+            signedIn={!!settings?.slack_team}
+            channels={channels}
             channel={channel}
             length={length}
             inFlight={inFlight}
             failed={!!sendError}
             canSend={canSend}
             sentTo={sentHere && meta?.status === "sent" ? meta.sent?.channel : undefined}
-            onChannel={setChannel}
+            onChannel={(picked) => setChannel(channels?.find((c) => c.id === picked) ?? null)}
             onSend={send}
             onSetup={() => onSetup("slack")}
             />

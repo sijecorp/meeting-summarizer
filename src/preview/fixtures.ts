@@ -85,8 +85,8 @@ const fullSettings = (): Settings => ({
   llm_connections: [CLOUD, OLLAMA, GATEWAY],
   default_llm: CLOUD.name,
   summarize_local_by_default: false,
-  webhooks: [{ name: "#회의록" }, { name: "#개발팀" }],
-  last_channel: "#회의록",
+  slack_team: "SIJE",
+  last_channel: "C1",
   glossary: ["Tauri", "Whisper", "파일럿"],
 });
 
@@ -222,6 +222,13 @@ let meetings: Stored[] = [];
 let line: Progress[] = [];
 let settings: Settings = fullSettings();
 let secrets = new Set<string>();
+// The sign-in waiting for its pretend browser (`slack_sign_in`).
+let signingIn = () => {};
+const CHANNELS: ipc.Channel[] = [
+  { id: "C2", name: "개발팀", private: false },
+  { id: "G1", name: "경영회의", private: true },
+  { id: "C1", name: "회의록", private: false },
+];
 let models: ModelState = { files: [], downloading: false };
 let recording: { id: string; startedAt: number } | null = null;
 let timers: ReturnType<typeof setInterval>[] = [];
@@ -277,14 +284,14 @@ export function reset(scenario: Scenario) {
   recording = null;
   serial = done = 0;
   settings = fullSettings();
-  secrets = new Set([`llm:${CLOUD.name}`, `llm:${GATEWAY.name}`, "slack:#회의록", "slack:#개발팀"]);
+  secrets = new Set([`llm:${CLOUD.name}`, `llm:${GATEWAY.name}`]);
   models = modelState(true);
   meetings = [];
   line = [];
 
   // The first run: no meetings and nothing set up yet, so the first screen shows its setup line.
   if (scenario === "empty") {
-    settings = { ...settings, llm_connections: [], default_llm: null, webhooks: [], last_channel: null };
+    settings = { ...settings, llm_connections: [], default_llm: null, slack_team: null, last_channel: null };
     secrets = new Set();
     models = modelState(false);
   }
@@ -402,7 +409,7 @@ export function reset(scenario: Scenario) {
   }
   // Home with its setup line: a meeting transcribed, waiting for the summary model (plan 5.4).
   if (scenario === "setup") {
-    settings = { ...settings, llm_connections: [], default_llm: null, webhooks: [], last_channel: null };
+    settings = { ...settings, llm_connections: [], default_llm: null, slack_team: null, last_channel: null };
     secrets = new Set();
     // A download stopped part way: 300 MB kept, resumed as the scenario starts (main.tsx).
     models = modelState(false, 300_000_000);
@@ -732,7 +739,10 @@ type Commands = {
   export_markdown: typeof ipc.exportMarkdown;
   slack_length: typeof ipc.slackLength;
   send_to_slack: typeof ipc.sendToSlack;
-  send_test_message: typeof ipc.sendTestMessage;
+  slack_sign_in: typeof ipc.slackSignIn;
+  slack_cancel_sign_in: typeof ipc.slackCancelSignIn;
+  slack_sign_out: typeof ipc.slackSignOut;
+  slack_channels: typeof ipc.slackChannels;
   start_recording: typeof ipc.startRecording;
   stop_recording: typeof ipc.stopRecording;
   recording_state: typeof ipc.recordingState;
@@ -887,22 +897,37 @@ const handlers: Handlers = {
         status: "sent",
         error: null,
         sent: {
-          channel: a.webhook as string,
+          channel: `#${(a.channel as ipc.Channel).name}`,
           at: new Date().toISOString(),
           edit_count: m.summary.split("\n").filter((l) => !lines.has(l)).length,
         },
       });
       m.sending = false;
-      settings.last_channel = a.webhook as string;
+      settings.last_channel = (a.channel as ipc.Channel).id;
       send("slack://finished", a.id);
       return clone(m.meta);
     });
   },
 
-  send_test_message: (a) => {
-    if (!a.url && !secrets.has(`slack:${a.webhook}`))
-      throw "웹훅 주소가 없습니다. 설정 → Slack에서 웹훅 주소를 입력해 주세요";
-    return later(1000, () => {});
+  // ONB-04: the browser comes back signed in after two seconds, unless cancelled first.
+  slack_sign_in: () =>
+    new Promise<string | null>((resolve) => {
+      const timer = setTimeout(() => {
+        settings.slack_team = "SIJE";
+        resolve("SIJE");
+      }, 2000);
+      signingIn = () => {
+        clearTimeout(timer);
+        resolve(null);
+      };
+    }),
+  slack_cancel_sign_in: () => signingIn(),
+  slack_sign_out: () => {
+    settings.slack_team = settings.last_channel = null;
+  },
+  slack_channels: () => {
+    if (!settings.slack_team) throw "Slack 로그인이 필요합니다. 설정 → Slack에서 다시 로그인해 주세요";
+    return later(400, () => clone(CHANNELS));
   },
 
   start_recording: () => {

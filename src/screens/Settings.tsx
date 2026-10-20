@@ -40,8 +40,10 @@ import {
   reserved,
   resetSettings,
   saveSettings,
-  sendTestMessage,
   setSecret,
+  slackCancelSignIn,
+  slackSignIn,
+  slackSignOut,
   startModelDownload,
   testMicrophone,
   testSystemAudio,
@@ -71,7 +73,11 @@ const TABS: { value: SettingsTab; label: string; about: string }[] = [
     label: "요약(LLM)",
     about: "기본은 이 PC에서 요약합니다. 다른 연결을 더할 수 있고, 클라우드 연결은 전사본을 그 주소로 보냅니다.",
   },
-  { value: "slack", label: "Slack", about: "요약을 보낼 채널의 웹훅입니다. URL은 OS 키체인에만 저장합니다." },
+  {
+    value: "slack",
+    label: "Slack",
+    about: "회사 Slack에 로그인하면 내가 들어가 있는 채널로 요약을 보냅니다. 로그인 정보는 OS 키체인에만 저장합니다.",
+  },
 ];
 
 const BACKENDS: { value: Backend; label: string }[] = [
@@ -110,12 +116,9 @@ const terms = (glossary: string) =>
     .map((term) => term.trim())
     .filter(Boolean);
 
-// Keychain entries are keyed `kind:name`, one per connection and webhook.
+// Keychain entries are keyed `kind:name`, one per connection.
 type SecretRef = { kind: SecretKind; name: string };
-const secretRefs = (s: SettingsData): SecretRef[] => [
-  ...s.llm_connections.map((c) => ({ kind: "llm" as const, name: c.name })),
-  ...s.webhooks.map((w) => ({ kind: "slack" as const, name: w.name })),
-];
+const secretRefs = (s: SettingsData): SecretRef[] => s.llm_connections.map((c) => ({ kind: "llm" as const, name: c.name }));
 const keyOf = ({ kind, name }: SecretRef) => `${kind}:${name}`;
 
 /** A saved connection can summarize on this PC; one under a reserved name is in no route (d6). */
@@ -126,8 +129,8 @@ const savedLocal = (s: SettingsData, rename: string[]) =>
  * local can summarize (SUM-08) and answers with what it stored. */
 const asSaved = (s: SettingsData): SettingsData => ({ ...s, recorder_name: s.recorder_name.trim() });
 
-// What the save bar counts: each field as 저장 would write it, and each connection or webhook
-// added, removed or edited once however many of its fields changed.
+// What the save bar counts: each field as 저장 would write it, and each connection added, removed
+// or edited once however many of its fields changed.
 const FIELDS = [
   "recorder_name",
   "backend",
@@ -158,7 +161,7 @@ const CONTROL = "w-full sm:w-72 sm:shrink-0";
 // The mic check's level starts empty; events then write it straight to the DOM.
 const LEVEL_ZERO = { transform: "scaleX(0)" };
 
-// A check's outcome (ONB-03, ONB-06), in words the recorder can act on.
+// A check's outcome (ONB-03), in words the recorder can act on.
 type Outcome = { ok: boolean; text: string };
 type CheckState = "running" | Outcome;
 
@@ -195,11 +198,10 @@ export default function Settings({
   const [done, setDone] = useState(false);
   const [revertAsked, setRevertAsked] = useState(false);
   const [newLlm, setNewLlm] = useState("");
-  const [newWebhook, setNewWebhook] = useState("");
   // Why a name cannot be added, under the row that adds it.
   const [nameError, setNameError] = useState<{ kind: SecretKind; text: string } | null>(null);
-  // The connection and the webhook open for editing, one of each.
-  const [expanded, setExpanded] = useState<Record<SecretKind, string | null>>({ llm: null, slack: null });
+  // The connection open for editing.
+  const [expanded, setExpanded] = useState<Record<SecretKind, string | null>>({ llm: null });
   // A key picked the tab or opened the row: nothing moves (design-system 5).
   const [instant, setInstant] = useState(false);
   const [devices, setDevices] = useState<AudioDevices | null>(null);
@@ -227,8 +229,8 @@ export default function Settings({
   );
   // Saved connections under a name this PC's route reserves (d6): listed, to be renamed.
   const [rename, setRename] = useState<string[]>([]);
-  // The audio and Slack checks, by "mic", "system" or the webhook's `keyOf`. Never part of the
-  // draft. `on`: the device or typed URL it ran with; no `outcome` while it runs.
+  // The audio checks, by "mic" or "system". Never part of the draft. `on`: the device it ran with;
+  // no `outcome` while it runs.
   const [checks, setChecks] = useState<Record<string, { on: string | null; outcome?: Outcome }>>({});
   const micLevel = useRef<HTMLDivElement>(null);
   const present = useIsPresent();
@@ -236,7 +238,6 @@ export default function Settings({
   const bar = useRef<HTMLDivElement>(null);
   const banner = useRef<HTMLDivElement>(null);
   const newLlmField = useRef<HTMLInputElement>(null);
-  const newWebhookField = useRef<HTMLInputElement>(null);
   // The bar the revert dialog came from is gone once it reverts.
   const reverted = useRef(false);
 
@@ -436,33 +437,14 @@ export default function Settings({
     setExpanded((x) => ({ ...x, llm: name }));
   };
 
-  const addWebhook = (keyboard: boolean) => {
-    const name = newWebhook.trim();
-    const problem = nameProblem(
-      name,
-      draft.webhooks.map((w) => w.name),
-      keyHolders("slack", persisted.webhooks),
-    );
-    if (problem) return setNameError({ kind: "slack", text: problem });
-    edit({ webhooks: [...draft.webhooks, { name }] });
-    setNewWebhook("");
-    setNameError(null);
-    setInstant(keyboard);
-    setExpanded((x) => ({ ...x, slack: name }));
-  };
-
   // Only the draft changes; the keychain entry goes once the settings are saved.
   const remove = (kind: SecretKind, name: string, keyboard: boolean) => {
     setInstant(keyboard);
     setSecretDrafts((d) => ({ ...d, [keyOf({ kind, name })]: "" }));
-    if (kind === "llm") {
-      edit({
-        llm_connections: draft.llm_connections.filter((c) => c.name !== name),
-        default_llm: draft.default_llm === name ? null : draft.default_llm,
-      });
-    } else {
-      edit({ webhooks: draft.webhooks.filter((w) => w.name !== name) });
-    }
+    edit({
+      llm_connections: draft.llm_connections.filter((c) => c.name !== name),
+      default_llm: draft.default_llm === name ? null : draft.default_llm,
+    });
   };
 
   const glossaryCount = terms(glossary).length;
@@ -488,7 +470,6 @@ export default function Settings({
     FIELDS.filter((k) => now[k] !== then[k]).length +
     Number(terms(glossary).join("\n") !== persisted.glossary.join("\n")) +
     entryChanges(draft.llm_connections, persisted.llm_connections) +
-    entryChanges(draft.webhooks, persisted.webhooks) +
     Object.values(secretDrafts).filter(Boolean).length +
     orphans.length;
   const typedKeys = Object.values(secretDrafts).some(Boolean);
@@ -578,11 +559,6 @@ export default function Settings({
           (e) => problems.push(`키체인에 키를 저장하지 못했습니다: ${e}`),
         );
       }
-      // A Slack check's result spoke of the URL before this save; the typed one it ran with is
-      // gone now, so it would read as the new URL's.
-      setChecks((c) =>
-        Object.fromEntries(Object.entries(c).filter(([key, check]) => !key.startsWith("slack:") || !check.outcome)),
-      );
       if (problems.length) report(`설정은 저장했지만 ${problems.join(" / ")}`);
       else setError("");
       setDone(!problems.length);
@@ -681,7 +657,13 @@ export default function Settings({
   // Rows move only when a row opens or closes or the list changes: a tab coming into view (its
   // rows measured as hidden a moment ago) must not fly in.
   const llmMoves = [expanded.llm, ...draft.llm_connections.map((c) => c.name)].join("\n");
-  const slackMoves = [expanded.slack, ...draft.webhooks.map((w) => w.name)].join("\n");
+  // Signing in and out are not settings: both copies take them, so 저장 counts nothing.
+  const signedIn = (team: string | null) => {
+    const signed = (s: SettingsData | null) =>
+      s && { ...s, slack_team: team, last_channel: team === s.slack_team ? s.last_channel : null };
+    setDraft(signed);
+    setPersisted(signed);
+  };
 
   return (
     <Page title="설정" onHome={onHome} width="wide">
@@ -1132,72 +1114,9 @@ export default function Settings({
           </Section>
 
           <Section tab="slack" open={tab}>
-            <List moves={slackMoves} move={move}>
-              {draft.webhooks.map((w) => {
-                const key = keyOf({ kind: "slack", name: w.name });
-                const status = secrets[key] ? "키체인에 저장됨" : "URL 입력 안 됨";
-                const typed = secretDrafts[key]?.trim() || null;
-                return (
-                  <Entry
-                    key={w.name}
-                    label={`${w.name}, ${status}`}
-                    open={expanded.slack === w.name}
-                    moves={slackMoves}
-                    instant={instant}
-                    onToggle={(keyboard) => toggle("slack", w.name, keyboard)}
-                    head={
-                      <>
-                        <span className="min-w-0 flex-1 truncate font-medium">{w.name}</span>
-                        <span className={cn(HELP, "shrink-0")}>{status}</span>
-                      </>
-                    }
-                  >
-                    <fieldset disabled={locked} className="grid min-w-0 gap-4 px-5 pt-1 pb-5">
-                      <SecretField label="웹훅 URL" {...secretProps("slack", w.name)} />
-                      <div className="flex items-start justify-between gap-3">
-                        {/* ONB-06: a URL typed and not saved yet is the one tried. */}
-                        <RunCheck
-                          action="테스트 메시지 보내기"
-                          busyText="보내는 중…"
-                          state={checkState(key, typed)}
-                          onRun={() =>
-                            run(key, typed, () =>
-                              sendTestMessage(w.name, typed).then(() => ({
-                                ok: true,
-                                text: "보냈습니다. Slack 채널을 확인하세요",
-                              })),
-                            )
-                          }
-                        />
-                        <RemoveButton
-                          label="웹훅 삭제"
-                          title={`${w.name} 웹훅을 삭제할까요?`}
-                          description="저장하면 키체인의 웹훅 URL도 함께 지웁니다."
-                          onConfirm={(keyboard) => remove("slack", w.name, keyboard)}
-                          focusAfter={() => newWebhookField.current?.focus()}
-                        />
-                      </div>
-                    </fieldset>
-                  </Entry>
-                );
-              })}
-              <AddRow
-                field={newWebhookField}
-                label="새 웹훅 이름"
-                placeholder="채널 이름 (예: #회의록)"
-                action="웹훅 추가"
-                value={newWebhook}
-                error={nameError?.kind === "slack" ? nameError.text : ""}
-                locked={locked}
-                moves={slackMoves}
-                move={move}
-                onChange={(v) => {
-                  setNewWebhook(v);
-                  setNameError(null);
-                }}
-                onAdd={addWebhook}
-              />
-            </List>
+            <div className={GROUP}>
+              <SlackAccount team={draft.slack_team} locked={readOnly} onTeam={signedIn} />
+            </div>
           </Section>
         </div>
       </div>
@@ -1218,7 +1137,7 @@ export default function Settings({
           <AlertDialogHeader>
             <AlertDialogTitle>입력한 키도 되돌릴까요?</AlertDialogTitle>
             <AlertDialogDescription>
-              저장하지 않은 API 키와 웹훅 URL을 지우고 마지막으로 저장한 설정으로 돌아갑니다.
+              저장하지 않은 API 키를 지우고 마지막으로 저장한 설정으로 돌아갑니다.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1362,6 +1281,96 @@ function Section({ tab, open, children }: { tab: SettingsTab; open: SettingsTab;
   );
 }
 
+/** ONB-04: the Slack sign-in, in the browser (OAuth with PKCE, slack.rs). Not a setting: signing in
+ * and out take effect at once and never count toward 저장. A sign-in waiting for the browser can be
+ * cancelled; a new one cancels it too. */
+function SlackAccount({
+  team,
+  locked,
+  onTeam,
+}: {
+  team: string | null;
+  /** Settings from a newer app (STO-05): the workspace could not be written. */
+  locked: boolean;
+  onTeam: (team: string | null) => void;
+}) {
+  const help = useId();
+  const [busy, setBusy] = useState<"in" | "out" | null>(null);
+  const [error, setError] = useState("");
+  const run = (which: "in" | "out", request: Promise<void>) => {
+    setError("");
+    setBusy(which);
+    request.catch((e) => setError(String(e))).finally(() => setBusy(null));
+  };
+  return (
+    <div className="space-y-3 px-5 py-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-8">
+        <div className="min-w-0 flex-1 space-y-0.5">
+          <p className="font-medium">{team ?? "Slack 계정"}</p>
+          <p id={help} className={HELP}>
+            {busy === "in"
+              ? "브라우저에서 Slack 로그인을 마쳐 주세요"
+              : team
+                ? "로그인했습니다. 요약은 내 이름으로, 내가 들어가 있는 채널에 올라갑니다"
+                : "로그인하지 않았습니다"}
+          </p>
+        </div>
+        {busy === "in" ? (
+          <Button size="sm" variant="outline" aria-describedby={help} onClick={() => slackCancelSignIn().catch(() => {})}>
+            취소
+          </Button>
+        ) : team ? (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={locked || busy === "out"}
+            aria-describedby={help}
+            onClick={() => run("out", slackSignOut().then(() => onTeam(null)))}
+          >
+            {busy === "out" ? "로그아웃하는 중…" : "로그아웃"}
+          </Button>
+        ) : (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={locked}
+            aria-describedby={help}
+            onClick={() => run("in", slackSignIn().then((signed) => void (signed && onTeam(signed))))}
+          >
+            <SlackMark />
+            Slack으로 로그인
+          </Button>
+        )}
+      </div>
+      {error && <Banner kind="error">{error}</Banner>}
+    </div>
+  );
+}
+
+/** Slack's mark, in its own colors, on the sign-in button. */
+function SlackMark() {
+  return (
+    <svg aria-hidden viewBox="0 0 54 54" className="size-4">
+      <path
+        fill="#36C5F0"
+        d="M19.712.133a5.381 5.381 0 0 0-5.376 5.387 5.381 5.381 0 0 0 5.376 5.386h5.376V5.52A5.381 5.381 0 0 0 19.712.133m0 14.365H5.376A5.381 5.381 0 0 0 0 19.884a5.381 5.381 0 0 0 5.376 5.387h14.336a5.381 5.381 0 0 0 5.376-5.387 5.381 5.381 0 0 0-5.376-5.386"
+      />
+      <path
+        fill="#2EB67D"
+        d="M53.76 19.884a5.381 5.381 0 0 0-5.376-5.386 5.381 5.381 0 0 0-5.376 5.386v5.387h5.376a5.381 5.381 0 0 0 5.376-5.387m-14.336 0V5.52A5.381 5.381 0 0 0 34.048.133a5.381 5.381 0 0 0-5.376 5.387v14.364a5.381 5.381 0 0 0 5.376 5.387 5.381 5.381 0 0 0 5.376-5.387"
+      />
+      <path
+        fill="#ECB22E"
+        d="M34.048 54a5.381 5.381 0 0 0 5.376-5.387 5.381 5.381 0 0 0-5.376-5.386h-5.376v5.386A5.381 5.381 0 0 0 34.048 54m0-14.365h14.336a5.381 5.381 0 0 0 5.376-5.386 5.381 5.381 0 0 0-5.376-5.387H34.048a5.381 5.381 0 0 0-5.376 5.387 5.381 5.381 0 0 0 5.376 5.386"
+      />
+      <path
+        fill="#E01E5A"
+        d="M0 34.249a5.381 5.381 0 0 0 5.376 5.386 5.381 5.381 0 0 0 5.376-5.386v-5.387H5.376A5.381 5.381 0 0 0 0 34.25m14.336-.001v14.364A5.381 5.381 0 0 0 19.712 54a5.381 5.381 0 0 0 5.376-5.387V34.25a5.381 5.381 0 0 0-5.376-5.387 5.381 5.381 0 0 0-5.376 5.387"
+      />
+    </svg>
+  );
+}
+
 /** DX1 "로그 폴더 열기". Not a setting: it works while read-only or saving and never counts
  * toward 저장, and it is on the unreadable-settings screen too, where logs matter most. A failure
  * stays beside it until a later open works. */
@@ -1435,7 +1444,7 @@ function Row({
   );
 }
 
-/** A check that changes no setting (ONB-03, ONB-06), so it never counts toward 저장. Running or
+/** A check that changes no setting (ONB-03), so it never counts toward 저장. Running or
  * unavailable, its button is `aria-disabled`, not `disabled`, so the focus stays (design-system 7,
  * phase 3). What it says is one `role="status"`: what it does, what to do while it runs, then the
  * outcome, which has an icon so color is never all it has. Rust runs one audio check at a time and
@@ -1584,7 +1593,7 @@ function Segmented<T extends string>({
   );
 }
 
-/** The connections' or webhooks' group. Its height follows the rows with `layout`, never CSS. */
+/** The connections' group. Its height follows the rows with `layout`, never CSS. */
 function List({ moves, move, children }: { moves: string; move: Transition; children: ReactNode }) {
   return (
     <motion.div
@@ -1599,7 +1608,7 @@ function List({ moves, move, children }: { moves: string; move: Transition; chil
   );
 }
 
-/** A connection or webhook: its summary row, opening in place to edit it. The rows below slide by
+/** A connection: its summary row, opening in place to edit it. The rows below slide by
  * `layout` (design-system 5); a key opens it at once. */
 function Entry({
   label,

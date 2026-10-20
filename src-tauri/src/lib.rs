@@ -398,7 +398,10 @@ pub fn run() {
             commands::export_markdown,
             commands::slack_length,
             commands::send_to_slack,
-            commands::send_test_message,
+            commands::slack_sign_in,
+            commands::slack_cancel_sign_in,
+            commands::slack_sign_out,
+            commands::slack_channels,
             commands::open_log_dir,
         ])
         .build(tauri::generate_context!())

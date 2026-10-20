@@ -1,6 +1,6 @@
 import { useEffect, useRef, type ComponentProps, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Check, ChevronRight, CircleAlert, Copy, Send, X } from "lucide-react";
+import { Check, ChevronRight, CircleAlert, Copy, Lock, Send, X } from "lucide-react";
 import { AnimatePresence, motion, useTransform, type Variants } from "motion/react";
 import {
   Bars,
@@ -16,7 +16,7 @@ import {
 } from "@/components/common";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { SLACK_MAX, type Meta, type Progress, type Segment, type Status, type Webhook } from "@/lib/ipc";
+import { SLACK_MAX, type Channel, type Meta, type Progress, type Segment, type Status } from "@/lib/ipc";
 import { dur, ease, exitDur, revealVariants, sectionVariants, spring } from "@/lib/motion";
 import { cn } from "@/lib/utils";
 
@@ -467,7 +467,8 @@ function Gauge({ length }: { length: number }) {
 /** The send bar (design-system 6.6): a white pill where the dock sits, above it when both show. */
 export function SendBar({
   shown,
-  webhooks,
+  signedIn,
+  channels,
   channel,
   length,
   inFlight,
@@ -479,8 +480,11 @@ export function SendBar({
   onSetup,
 }: {
   shown: boolean;
-  webhooks: Webhook[] | null;
-  channel: string;
+  /** Signed in to Slack (ONB-04); else the bar leads to the sign-in. */
+  signedIn: boolean;
+  /** The recorder's channels (SND-04), null until read. */
+  channels: Channel[] | null;
+  channel: Channel | null;
   length: number | null;
   inFlight: boolean;
   /** The last send failed (SND-06): the button sends again. */
@@ -488,7 +492,7 @@ export function SendBar({
   canSend: boolean;
   /** Sent while open: the button turns into where it went. */
   sentTo?: string;
-  onChannel: (name: string) => void;
+  onChannel: (id: string) => void;
   onSend: () => void;
   onSetup: () => void;
 }) {
@@ -500,7 +504,7 @@ export function SendBar({
       : failed
         ? "다시 보내기"
         : channel
-          ? `${channel}${ro(channel)} 보내기`
+          ? `#${channel.name}${ro(channel.name)} 보내기`
           : "Slack으로 보내기";
   // Sent from the keyboard: `disabled` dropped the focus meanwhile, so it comes back when the send
   // ends, sent or failed.
@@ -526,27 +530,35 @@ export function SendBar({
           className="pointer-events-auto flex h-14 max-w-full items-center gap-2 bg-surface p-2 shadow-float"
         >
           <Present className="contents">
-            {/* SND-04: a choice only when there is one; the button names the channel anyway. */}
-            {!sentTo && webhooks && webhooks.length > 1 && (
-              <Select value={channel} disabled={inFlight} onValueChange={onChannel}>
+            {/* SND-04: the recorder's channels; none is picked for them the first time. */}
+            {!sentTo && signedIn && (
+              <Select value={channel?.id ?? ""} disabled={inFlight || !channels} onValueChange={onChannel}>
                 <SelectTrigger
                   aria-label="보낼 채널"
-                  className="h-10 rounded-full border-transparent bg-transparent pl-4 hover:bg-sunken"
+                  className="h-10 max-w-56 rounded-full border-transparent bg-transparent pl-4 hover:bg-sunken"
                 >
-                  <SelectValue />
+                  <SelectValue
+                    placeholder={!channels ? "채널 읽는 중…" : channels.length ? "채널 고르기" : "채널 없음"}
+                  />
                 </SelectTrigger>
-                <SelectContent position="popper" side="top">
-                  {webhooks.map((w) => (
-                    <SelectItem key={w.name} value={w.name}>
-                      {w.name}
+                <SelectContent position="popper" side="top" className="max-h-80">
+                  {channels?.map((c) => (
+                    <SelectItem key={c.id} value={c.id}>
+                      {`#${c.name}`}
+                      {c.private && (
+                        <>
+                          <Lock aria-hidden className="size-3.5 text-ink-2" />
+                          <span className="sr-only">, 비공개 채널</span>
+                        </>
+                      )}
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
             )}
-            {!sentTo && webhooks?.length === 0 && (
+            {!sentTo && !signedIn && (
               <Button variant="link" size="sm" onClick={onSetup}>
-                웹훅 추가하기
+                Slack 로그인하기
               </Button>
             )}
             {!sentTo && length != null && <Gauge length={length} />}

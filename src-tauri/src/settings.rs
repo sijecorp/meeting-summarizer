@@ -53,11 +53,6 @@ pub struct LlmConnection {
     pub timeout_secs: u32,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Webhook {
-    pub name: String,
-}
-
 /// settings.json (architecture 9.1). No secrets here; those live in the keychain.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -76,7 +71,10 @@ pub struct Settings {
     pub llm_connections: Vec<LlmConnection>,
     pub default_llm: Option<String>,
     pub summarize_local_by_default: bool,
-    pub webhooks: Vec<Webhook>,
+    /// The signed-in Slack workspace's name (ONB-04), written by signing in and out (slack.rs); its
+    /// token is in the keychain. An older file's `webhooks` are dropped on the next save.
+    pub slack_team: Option<String>,
+    /// The channel id last sent to (SND-04).
     pub last_channel: Option<String>,
     pub glossary: Vec<String>,
 }
@@ -98,7 +96,7 @@ impl Default for Settings {
             llm_connections: Vec::new(),
             default_llm: None,
             summarize_local_by_default: false,
-            webhooks: Vec::new(),
+            slack_team: None,
             last_channel: None,
             glossary: Vec::new(),
         }
@@ -144,12 +142,6 @@ fn validate(settings: &Settings) -> Result<(), String> {
         }
         if c.timeout_secs == 0 {
             return Err(format!("응답 시간 제한은 1초 이상이어야 합니다: {name}"));
-        }
-    }
-    let mut seen = HashSet::new();
-    for name in settings.webhooks.iter().map(|w| &w.name) {
-        if name.trim().is_empty() || !seen.insert(name) {
-            return Err(format!("웹훅 이름이 비었거나 중복됩니다: {name}"));
         }
     }
     if settings.glossary.len() > GLOSSARY_MAX {
@@ -247,8 +239,9 @@ impl SettingsStore {
         let kept = |field: &str| stored[field].as_bool().unwrap_or(false) && !gpu_chosen;
         settings.gpu_failed = kept("gpu_failed");
         settings.summary_gpu_failed = kept("summary_gpu_failed");
-        // `last_channel` belongs to sending (SND-04) the same way.
+        // `last_channel` belongs to sending (SND-04) the same way, and `slack_team` to signing in.
         settings.last_channel = stored["last_channel"].as_str().map(String::from);
+        settings.slack_team = stored["slack_team"].as_str().map(String::from);
         self.write(settings)
     }
 
@@ -274,9 +267,19 @@ impl SettingsStore {
         self.patch(|s| s.summary_gpu_failed = true)
     }
 
-    /// SND-04: a send went to this webhook, so it is the next default.
-    pub fn set_last_channel(&self, name: &str) -> Result<(), String> {
-        self.patch(|s| s.last_channel = Some(name.to_string()))
+    /// SND-04: a send went to this channel, so it is the next default.
+    pub fn set_last_channel(&self, id: &str) -> Result<(), String> {
+        self.patch(|s| s.last_channel = Some(id.to_string()))
+    }
+
+    /// Signed in to `team`, or signed out with `None`: the last channel goes with the workspace.
+    pub fn set_slack_team(&self, team: Option<&str>) -> Result<(), String> {
+        self.patch(|s| {
+            if s.slack_team.as_deref() != team {
+                s.last_channel = None;
+            }
+            s.slack_team = team.map(String::from);
+        })
     }
 
     fn write(&self, mut settings: Settings) -> Result<(), String> {
@@ -306,23 +309,50 @@ impl SettingsStore {
     }
 }
 
+/// The webview's keys: an LLM connection's, by its name. The Slack token is Rust's alone
+/// (`slack_tokens`).
 #[derive(Deserialize, Clone, Copy, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum SecretKind {
     Llm,
-    Slack,
+}
+
+fn keychain(account: &str) -> Result<keyring::Entry, String> {
+    keyring::Entry::new(KEYRING_SERVICE, account)
+        .map_err(|e| format!("키체인을 열 수 없습니다: {e}"))
 }
 
 fn entry(kind: SecretKind, name: &str) -> Result<keyring::Entry, String> {
     if name.trim().is_empty() {
         return Err("이름이 비어 있습니다".into());
     }
-    let prefix = match kind {
-        SecretKind::Llm => "llm",
-        SecretKind::Slack => "slack",
-    };
-    keyring::Entry::new(KEYRING_SERVICE, &format!("{prefix}:{name}"))
-        .map_err(|e| format!("키체인을 열 수 없습니다: {e}"))
+    let SecretKind::Llm = kind;
+    keychain(&format!("llm:{name}"))
+}
+
+/// The Slack sign-in's tokens (slack.rs), JSON. Never a command, like `get_secret`.
+const SLACK_TOKENS: &str = "slack-auth";
+
+pub fn slack_tokens() -> Result<Option<String>, String> {
+    match keychain(SLACK_TOKENS)?.get_password() {
+        Ok(tokens) => Ok(Some(tokens)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("키체인 읽기 실패: {e}")),
+    }
+}
+
+/// Writes them, or deletes them with `None`.
+pub fn set_slack_tokens(tokens: Option<&str>) -> Result<(), String> {
+    let entry = keychain(SLACK_TOKENS)?;
+    match tokens {
+        Some(tokens) => entry
+            .set_password(tokens)
+            .map_err(|e| format!("키체인 저장 실패: {e}")),
+        None => match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(format!("키체인 삭제 실패: {e}")),
+        },
+    }
 }
 
 pub fn set_secret(kind: SecretKind, name: &str, value: &str) -> Result<(), String> {
@@ -418,9 +448,6 @@ mod tests {
             recorder_name: "홍길동".into(),
             backend: Backend::Cpu,
             llm_connections: vec![connection("클라우드", false), connection("내 Ollama", true)],
-            webhooks: vec![Webhook {
-                name: "#회의록".into(),
-            }],
             glossary: vec!["모놀리스".into()],
             ..Settings::default()
         };
@@ -548,19 +575,49 @@ mod tests {
     }
 
     #[test]
-    fn a_send_sets_last_channel_and_settings_saves_keep_it() {
+    fn a_send_and_a_sign_in_keep_their_fields_through_settings_saves() {
         let (_tmp, store) = store();
         let loaded_earlier = Settings {
             recorder_name: "홍길동".into(),
             ..Settings::default()
         };
         store.save(loaded_earlier.clone()).unwrap();
-        store.set_last_channel("#회의록").unwrap();
-        // The settings screen still holds what it loaded before the send.
+        store.set_slack_team(Some("SIJE")).unwrap();
+        store.set_last_channel("C0123").unwrap();
+        // The settings screen still holds what it loaded before the sign-in and the send.
         store.save(loaded_earlier).unwrap();
         let loaded = store.load().unwrap().settings;
-        assert_eq!(loaded.last_channel.as_deref(), Some("#회의록"));
+        assert_eq!(loaded.last_channel.as_deref(), Some("C0123"));
+        assert_eq!(loaded.slack_team.as_deref(), Some("SIJE"));
         assert_eq!(loaded.recorder_name, "홍길동");
+
+        // Another workspace, or none: the channel was the old one's.
+        store.set_slack_team(Some("SIJE")).unwrap();
+        assert_eq!(
+            store.load().unwrap().settings.last_channel.as_deref(),
+            Some("C0123")
+        );
+        store.set_slack_team(None).unwrap();
+        let loaded = store.load().unwrap().settings;
+        assert_eq!((loaded.slack_team, loaded.last_channel), (None, None));
+    }
+
+    #[test]
+    fn an_older_file_with_webhooks_still_loads() {
+        let (_tmp, store) = store();
+        fs::write(
+            &store.path,
+            r##"{"schema_version": 1, "webhooks": [{"name": "#회의록"}], "last_channel": "#회의록"}"##,
+        )
+        .unwrap();
+        let loaded = store.load().unwrap().settings;
+        assert_eq!(loaded.slack_team, None);
+        store.save(loaded).unwrap();
+        assert!(
+            !fs::read_to_string(&store.path)
+                .unwrap()
+                .contains("webhooks")
+        );
     }
 
     /// d6: the built-in route's names are refused on save; one saved before the update stays in

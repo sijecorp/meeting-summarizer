@@ -793,9 +793,13 @@ pub(crate) mod tests {
                             Ok(n) => data.extend_from_slice(&buf[..n]),
                         }
                     }
+                    // A form body (Slack's Web API) stays a string.
+                    let body = &data[head_end..];
                     let request = Request {
                         head,
-                        body: serde_json::from_slice(&data[head_end..]).unwrap(),
+                        body: serde_json::from_slice(body).unwrap_or_else(|_| {
+                            serde_json::Value::String(String::from_utf8_lossy(body).into())
+                        }),
                     };
                     seen.lock().unwrap().push(request.clone());
                     match answer(&request) {

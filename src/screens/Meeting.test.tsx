@@ -4,6 +4,7 @@ import { mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { hhmm } from "../components/common";
 import type {
+  Channel,
   ConnectionItem,
   LlmConnection,
   LoadedSettings,
@@ -76,8 +77,8 @@ const settings = (patch: Partial<Settings> = {}): LoadedSettings => ({
     llm_connections: [],
     default_llm: null,
     summarize_local_by_default: false,
-    webhooks: [{ name: "#회의록" }],
-    last_channel: null,
+    slack_team: "SIJE",
+    last_channel: "C1",
     glossary: [],
     ...patch,
   },
@@ -96,8 +97,15 @@ const progress = (patch: Partial<Progress>): Progress => ({
 
 type Call = { cmd: string; args: Record<string, unknown> };
 
+const CHANNELS: Channel[] = [
+  { id: "C1", name: "회의록", private: false },
+  { id: "C2", name: "개발", private: false },
+  { id: "G1", name: "경영", private: true },
+];
+
 /** `get_meeting` answers with `detail` as it is then (no send out unless it says so); `handler`
- * answers the rest (settings with one webhook unless it says otherwise), and every call is kept. */
+ * answers the rest (signed in, #회의록 sent to last, unless it says otherwise), and every call is
+ * kept. */
 const mock = (
   detail: Omit<MeetingDetail, "sending"> & { sending?: boolean },
   handler: (cmd: string, args: Call["args"]) => unknown = () => undefined,
@@ -107,7 +115,8 @@ const mock = (
     (cmd, args) => {
       calls.push({ cmd, args: args as Call["args"] });
       if (cmd === "get_meeting") return { sending: false, ...detail };
-      return handler(cmd, args as Call["args"]) ?? (cmd === "get_settings" ? settings() : undefined);
+      const fallback: Record<string, unknown> = { get_settings: settings(), slack_channels: CHANNELS };
+      return handler(cmd, args as Call["args"]) ?? fallback[cmd];
     },
     { shouldMockEvents: true },
   );
@@ -742,44 +751,41 @@ test("a save that fails after its meeting was deleted is dropped", async () => {
 const offset = -new Date("2026-10-13T05:00:03Z").getTimezoneOffset();
 const sendButton = (name: string) => screen.findByRole("button", { name }) as Promise<HTMLButtonElement>;
 
-// SND-04, NFR-04: with one webhook the button is ready, no choice to make.
-test("the send button names the default channel: the only one, the last one sent to, else the first", async () => {
+// SND-04: the channel sent to last is ready while the recorder is still in it; else they pick one.
+test("the send button names the channel sent to last, else waits for a pick", async () => {
   // The particle follows the channel's last syllable: 록 → 으로, 발 (ㄹ) → 로.
-  const cases: [Partial<Settings>, string, string, boolean][] = [
-    [{}, "#회의록", "#회의록으로 보내기", false],
-    [{ webhooks: [{ name: "#회의록" }, { name: "#개발" }], last_channel: "#개발" }, "#개발", "#개발로 보내기", true],
-    [
-      { webhooks: [{ name: "#회의록" }, { name: "#개발" }], last_channel: "#지운 채널" },
-      "#회의록",
-      "#회의록으로 보내기",
-      true,
-    ],
+  const cases: [Partial<Settings>, string, string][] = [
+    [{}, "#회의록", "#회의록으로 보내기"],
+    [{ last_channel: "C2" }, "#개발", "#개발로 보내기"],
+    [{ last_channel: "C9" }, "채널 고르기", "Slack으로 보내기"],
+    [{ last_channel: null }, "채널 고르기", "Slack으로 보내기"],
   ];
-  for (const [patch, channel, button, choice] of cases) {
+  for (const [patch, picked, button] of cases) {
     mock({ meta: meta(), summary: "요약" }, (cmd) => (cmd === "get_settings" ? settings(patch) : undefined));
     render(<Meeting id={id} {...props} />);
-    expect((await sendButton(button)).disabled).toBe(false);
-    const select = screen.queryByRole("combobox", { name: "보낼 채널" });
-    expect(select?.textContent ?? null).toBe(choice ? channel : null);
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "보낼 채널" }).textContent).toBe(picked));
+    expect((await sendButton(button)).disabled).toBe(picked === "채널 고르기");
     cleanup();
   }
 });
 
 test("sends to the channel picked, with the title, body and the start's UTC offset", async () => {
   const calls = mock({ meta: meta(), summary: "요약" }, (cmd) => {
-    if (cmd === "get_settings") return settings({ webhooks: [{ name: "#회의록" }, { name: "#개발" }] });
     if (cmd === "send_to_slack") return meta({ status: "sent" });
   });
   render(<Meeting id={id} {...props} />);
 
-  fireEvent.keyDown(await screen.findByRole("combobox", { name: "보낼 채널" }), { key: "Enter" });
-  fireEvent.click(await screen.findByRole("option", { name: "#개발" }));
+  await sendButton("#회의록으로 보내기");
+  fireEvent.keyDown(screen.getByRole("combobox", { name: "보낼 채널" }), { key: "Enter" });
+  // A private channel says so in words, not by its icon alone.
+  expect(await screen.findByRole("option", { name: "#경영, 비공개 채널" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("option", { name: "#개발" }));
   fireEvent.click(await sendButton("#개발로 보내기"));
 
   await waitFor(() => expect(calls.map((c) => c.cmd)).toContain("send_to_slack"));
   expect(calls.find((c) => c.cmd === "send_to_slack")?.args).toEqual({
     id,
-    webhook: "#개발",
+    channel: CHANNELS[1],
     title: "주간 회의",
     body: "요약",
     offsetMinutes: offset,
@@ -832,14 +838,48 @@ test("the length ring turns warn-line from 90% and danger-line past the limit", 
   expect(screen.getByText("1자를 줄여 주세요")).toBeTruthy();
 });
 
-test("no webhook: the send is off and the Slack settings are one click away", async () => {
+test("signed out: the send is off and the Slack sign-in is one click away", async () => {
   const tabs: string[] = [];
-  mock({ meta: meta(), summary: "요약" }, (cmd) => (cmd === "get_settings" ? settings({ webhooks: [] }) : undefined));
+  const calls = mock({ meta: meta(), summary: "요약" }, (cmd) =>
+    cmd === "get_settings" ? settings({ slack_team: null }) : undefined,
+  );
   render(<Meeting id={id} {...props} onSetup={(tab) => tabs.push(tab)} />);
 
-  fireEvent.click(await screen.findByRole("button", { name: "웹훅 추가하기" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Slack 로그인하기" }));
   expect(tabs).toEqual(["slack"]);
   expect((screen.getByRole("button", { name: "Slack으로 보내기" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(calls.map((c) => c.cmd)).not.toContain("slack_channels");
+});
+
+test("channels that cannot be read say why, and nothing can be sent", async () => {
+  mock({ meta: meta(), summary: "요약" }, (cmd) => {
+    if (cmd === "slack_channels") throw "Slack 응답을 받지 못했습니다. 잠시 후 다시 시도해 주세요";
+  });
+  render(<Meeting id={id} {...props} />);
+
+  expect(
+    await screen.findByText("Slack 채널 목록을 읽지 못했습니다: Slack 응답을 받지 못했습니다. 잠시 후 다시 시도해 주세요"),
+  ).toBeTruthy();
+  // Not still reading.
+  expect(screen.getByRole("combobox", { name: "보낼 채널" }).textContent).toBe("채널 없음");
+  expect((screen.getByRole("button", { name: "Slack으로 보내기" }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+// Rust forgets a sign-in Slack no longer takes; the bar then reads the settings again.
+test("an ended sign-in turns the bar back to the sign-in link", async () => {
+  let signedIn = true;
+  mock({ meta: meta(), summary: "요약" }, (cmd) => {
+    if (cmd === "get_settings") return settings({ slack_team: signedIn ? "SIJE" : null });
+    if (cmd === "send_to_slack") {
+      signedIn = false;
+      throw "Slack 로그인이 필요합니다. 설정 → Slack에서 다시 로그인해 주세요";
+    }
+  });
+  render(<Meeting id={id} {...props} />);
+
+  fireEvent.click(await sendButton("#회의록으로 보내기"));
+  expect(await screen.findByText("Slack 로그인이 필요합니다. 설정 → Slack에서 다시 로그인해 주세요")).toBeTruthy();
+  expect(await screen.findByRole("button", { name: "Slack 로그인하기" })).toBeTruthy();
 });
 
 test("a meeting out of review is never sent from here, and reads as text", async () => {
@@ -884,7 +924,7 @@ test("the pending edit is saved before the send, and a failed save stops it", as
 
 // SND-06.
 test("a failed send shows the cause and becomes 다시 보내기, with 요약 복사 still there", async () => {
-  const cause = "웹훅이 없거나 삭제됐습니다(HTTP 404: no_service). 설정 → Slack에서 웹훅 주소를 확인해 주세요";
+  const cause = "채널이 없거나 보관됐습니다(channel_not_found). 다른 채널을 골라 주세요";
   let fail = true;
   mock({ meta: meta(), summary: "요약" }, (cmd) => {
     if (cmd !== "send_to_slack") return;

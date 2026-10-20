@@ -3,7 +3,7 @@ use crate::QUIT_CONFIRMED;
 use crate::audio::{self, AudioDevices, Recorder, RecordingState};
 use crate::queue::{Progress, Queue};
 use crate::settings::{self, LoadedSettings, SecretKind, Settings, SettingsStore};
-use crate::slack::{self, Slack};
+use crate::slack::{self, Channel, Slack};
 use crate::store::{Meta, Status, Store, one_line};
 use crate::summarize::{self, SummaryRoute};
 use crate::transcribe::engine::Segment;
@@ -555,9 +555,9 @@ pub fn slack_length(
     Ok(text.chars().count())
 }
 
-/// SND-01..06: the reviewed summary to the webhook named `webhook`. Only the send button calls
-/// this (SND-05). `slack://finished` (the id) tells the list and a review screen opened meanwhile
-/// that it ended, sent or not.
+/// SND-01..06: the reviewed summary to `channel`, as the signed-in recorder. Only the send button
+/// calls this (SND-05). `slack://finished` (the id) tells the list and a review screen opened
+/// meanwhile that it ended, sent or not.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn send_to_slack(
@@ -566,7 +566,7 @@ pub async fn send_to_slack(
     settings: State<'_, SettingsStore>,
     slack: State<'_, Slack>,
     id: String,
-    webhook: String,
+    channel: Channel,
     title: String,
     body: String,
     offset_minutes: i32,
@@ -576,7 +576,7 @@ pub async fn send_to_slack(
             &store,
             &settings,
             &id,
-            &webhook,
+            &channel,
             &title,
             &body,
             offset_minutes,
@@ -589,16 +589,40 @@ pub async fn send_to_slack(
     sent
 }
 
-/// ONB-06: a fixed message to the webhook named `webhook`. `url`: one typed in the tab but not
-/// saved yet, sent instead of the keychain's. The URL never comes back.
+/// ONB-04: Slack sign-in in the browser. The workspace's name, or `None` when cancelled.
 #[tauri::command]
-pub async fn send_test_message(
+pub async fn slack_sign_in(
     settings: State<'_, SettingsStore>,
     slack: State<'_, Slack>,
-    webhook: String,
-    url: Option<String>,
+) -> Result<Option<String>, String> {
+    slack
+        .sign_in(&settings, |url| {
+            tauri_plugin_opener::open_url(url, None::<&str>)
+                .map_err(|e| format!("브라우저를 열지 못했습니다: {e}"))
+        })
+        .await
+}
+
+#[tauri::command]
+pub fn slack_cancel_sign_in(slack: State<'_, Slack>) {
+    slack.cancel_sign_in();
+}
+
+#[tauri::command]
+pub async fn slack_sign_out(
+    settings: State<'_, SettingsStore>,
+    slack: State<'_, Slack>,
 ) -> Result<(), String> {
-    slack.send_test(&settings, &webhook, url).await
+    slack.sign_out(&settings).await
+}
+
+/// SND-04: the channels the signed-in recorder is in, for the send bar.
+#[tauri::command]
+pub async fn slack_channels(
+    settings: State<'_, SettingsStore>,
+    slack: State<'_, Slack>,
+) -> Result<Vec<Channel>, String> {
+    slack.channels(&settings).await
 }
 
 /// SUM-06 "요약 다시 실행" after `summarize_failed`, and ENG15's change of connection for a meeting

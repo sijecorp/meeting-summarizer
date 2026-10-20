@@ -1,18 +1,25 @@
-//! Slack (architecture 7, SND-01..06): the message, its length (REV-02), the edit count (SND-03)
-//! and the webhook request. Nothing here runs but `send_to_slack`, the review screen's button
-//! (SND-05).
+//! Slack (architecture 7, SND-01..06, ONB-04): signing in, the recorder's channels, the message,
+//! its length (REV-02), the edit count (SND-03) and the post. Nothing posts but `send_to_slack`,
+//! the review screen's button (SND-05).
 //!
 //! Pure and tested without a server: `markdown` (header and length), `payload`, `sections` (the
-//! mrkdwn fallback) and `edit_count`. The requests are tested against local stub servers.
+//! mrkdwn fallback), `edit_count` and `classify`. The requests are tested against local stub
+//! servers.
 
-use crate::settings::{self, BUILTIN, BUILTIN_LABEL, SecretKind, Settings, SettingsStore};
+use crate::settings::{self, BUILTIN, BUILTIN_LABEL, Settings, SettingsStore};
 use crate::store::{self, Meta, Sent, Status, Store, can_transition, one_line};
-use crate::summarize::{cut, loopback, pack, split_title};
+use crate::summarize::{cut, pack, split_title};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::io::ErrorKind;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::io::{ErrorKind, Read, Write};
+use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 
@@ -201,8 +208,8 @@ fn route(meta: &Meta, settings: &Settings) -> Option<&'static str> {
     Some(server.unwrap_or("로컬 LLM"))
 }
 
-/// The webhook's JSON (7.1). `fallback`: `section` blocks in mrkdwn instead of the `markdown`
-/// block [S5].
+/// The message's `text` and `blocks` (7.1). `fallback`: `section` blocks in mrkdwn instead of the
+/// `markdown` block [S5].
 fn payload(title: &str, text: &str, footer: &str, fallback: bool) -> Value {
     let mut blocks: Vec<Value> = if fallback {
         sections(text)
@@ -218,15 +225,6 @@ fn payload(title: &str, text: &str, footer: &str, fallback: bool) -> Value {
     }));
     // The notification preview, in mrkdwn: an LLM-written `<!channel>` must stay text.
     json!({ "text": format!("{} 회의 요약", escape(heading(title))), "blocks": blocks })
-}
-
-/// ONB-06's test message, in mrkdwn: the recorder's name cannot become a mention.
-fn test_payload(recorder: &str) -> Value {
-    let mut text = "회의 요약 테스트 메시지입니다. 이 채널로 회의록이 전송됩니다.".to_string();
-    if !recorder.trim().is_empty() {
-        text += &format!("\n녹음: {}", recorder.trim());
-    }
-    json!({ "text": escape(&text) })
 }
 
 /// SND-03 (7.2): lines added or removed between the generated body and the sent one, by a line
@@ -268,26 +266,26 @@ pub fn edit_count(generated: &str, title: &str, body: &str) -> u32 {
     changes + removed.max(added) + u32::from(retitled)
 }
 
-/// Why a send failed (SND-06). `message` is what the recorder sees; none holds the webhook URL.
+/// Why a request failed (SND-06). `message` is what the recorder sees; none holds a token.
 #[derive(Debug, PartialEq)]
 enum Failure {
-    NoUrl,
-    /// Not https (plain http only to this machine), or not a URL.
-    BadUrl,
+    /// Not signed in, or the sign-in ended (revoked, expired, scopes changed): sign in again.
+    SignedOut,
     /// No connection: the only failure sure to have sent nothing.
     Network(String),
     Timeout,
     /// The request may have gone out, but its answer broke off.
     NoAnswer(String),
-    /// A redirect, or a 2xx that is not 200 `ok`: a proxy's or a login page's answer, maybe.
+    /// An answer that is not Slack's (a redirect, a proxy's or a login page's): maybe posted.
     Unconfirmed(u16),
-    /// 404, 410, `no_service`, `channel_not_found`, `channel_is_archived`.
+    /// `channel_not_found`, `is_archived`.
     Gone(String),
-    /// 403, `action_prohibited`.
+    /// `not_in_channel`.
+    NotIn,
+    /// `restricted_action` and its kind: the workspace forbids it.
     Forbidden(String),
-    /// 429.
     RateLimited,
-    /// A 400 about the blocks: the webhook does not take the `markdown` block [S5].
+    /// `invalid_blocks`: the `markdown` block is refused [S5].
     Blocks(String),
     Other(String),
 }
@@ -295,54 +293,84 @@ enum Failure {
 impl Failure {
     fn message(&self) -> String {
         match self {
-            Failure::NoUrl => "웹훅 주소가 없습니다. 설정 → Slack에서 웹훅 주소를 입력해 주세요".into(),
-            Failure::BadUrl => "웹훅 주소가 올바르지 않습니다. 설정 → Slack에서 https://로 시작하는 주소를 입력해 주세요".into(),
+            Failure::SignedOut => {
+                "Slack 로그인이 필요합니다. 설정 → Slack에서 다시 로그인해 주세요".into()
+            }
             Failure::Network(e) => {
                 format!("Slack에 연결하지 못했습니다. 인터넷 연결을 확인해 주세요: {e}")
             }
             // These three may have posted all the same.
-            Failure::Timeout => "Slack 응답 시간 초과입니다. 채널에 메시지가 올라갔는지 확인한 뒤 다시 보내 주세요".into(),
+            Failure::Timeout => {
+                "Slack 응답 시간 초과입니다. 채널에 메시지가 올라갔는지 확인한 뒤 다시 보내 주세요"
+                    .into()
+            }
             Failure::NoAnswer(e) => format!(
                 "Slack 응답을 받지 못했습니다({e}). 채널에 메시지가 올라갔는지 확인한 뒤 다시 보내 주세요"
             ),
             Failure::Unconfirmed(status) => format!(
                 "Slack 응답을 확인하지 못했습니다(HTTP {status}). 채널에 메시지가 올라갔는지 확인한 뒤 다시 보내 주세요"
             ),
-            Failure::Gone(detail) => format!(
-                "웹훅이 없거나 삭제됐습니다({detail}). 설정 → Slack에서 웹훅 주소를 확인해 주세요"
-            ),
-            Failure::Forbidden(detail) => format!(
-                "Slack이 이 채널로 보내는 것을 막았습니다({detail}). Slack 관리자에게 확인해 주세요"
-            ),
-            Failure::RateLimited => {
-                "Slack 전송 한도를 넘었습니다(HTTP 429). 잠시 후 다시 보내 주세요".into()
+            Failure::Gone(code) => {
+                format!("채널이 없거나 보관됐습니다({code}). 다른 채널을 골라 주세요")
             }
+            Failure::NotIn => {
+                "이 채널의 멤버가 아닙니다. Slack에서 채널에 들어간 뒤 다시 보내 주세요".into()
+            }
+            Failure::Forbidden(code) => format!(
+                "Slack이 이 채널로 보내는 것을 막았습니다({code}). Slack 관리자에게 확인해 주세요"
+            ),
+            Failure::RateLimited => "Slack 전송 한도를 넘었습니다. 잠시 후 다시 보내 주세요".into(),
             Failure::Blocks(detail) | Failure::Other(detail) => format!("Slack 오류: {detail}"),
+        }
+    }
+
+    /// For a call that posts nothing (signing in, the channels, a token refresh): there is no
+    /// channel to check.
+    fn elsewhere(&self) -> String {
+        match self {
+            Failure::Timeout | Failure::NoAnswer(_) | Failure::Unconfirmed(_) => {
+                "Slack 응답을 받지 못했습니다. 잠시 후 다시 시도해 주세요".into()
+            }
+            f => f.message(),
         }
     }
 }
 
-/// The keychain's URL for a webhook: https, or plain http only to `localhost` or a loopback IP (not
-/// `*.localhost`, which a resolver may send elsewhere). It is the secret, so it is never returned,
-/// logged or shown.
-fn webhook_url(secret: Option<String>) -> Result<String, Failure> {
-    let url = secret
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or(Failure::NoUrl)?;
-    let parsed = reqwest::Url::parse(&url).map_err(|_| Failure::BadUrl)?;
-    let subdomain = parsed
-        .host_str()
-        .is_some_and(|host| host.ends_with(".localhost"));
-    if parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback(&url) && !subdomain) {
-        Ok(url)
+/// A code from Slack, shown only as the snake_case word Slack's codes are: anything else could
+/// echo what it was sent.
+fn code(code: &str) -> &str {
+    if (1..=64).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+        code
     } else {
-        Err(Failure::BadUrl)
+        "unknown_error"
+    }
+}
+
+/// An error code from Slack's answer, as its failure.
+fn failure(code_word: &str) -> Failure {
+    let code = code(code_word);
+    match code {
+        "not_authed"
+        | "invalid_auth"
+        | "account_inactive"
+        | "token_revoked"
+        | "token_expired"
+        | "missing_scope"
+        | "no_permission"
+        | "invalid_refresh_token" => Failure::SignedOut,
+        "channel_not_found" | "is_archived" => Failure::Gone(code.into()),
+        "not_in_channel" => Failure::NotIn,
+        "ratelimited" => Failure::RateLimited,
+        "invalid_blocks" | "invalid_blocks_format" => Failure::Blocks(code.into()),
+        _ if code.starts_with("restricted_action") || code == "ekm_access_denied" => {
+            Failure::Forbidden(code.into())
+        }
+        _ => Failure::Other(code.into()),
     }
 }
 
 fn network(e: reqwest::Error) -> Failure {
-    // The innermost cause says the most (DNS, TLS, refused), and none carries the URL.
+    // The innermost cause says the most (DNS, TLS, refused).
     let e = e.without_url();
     let mut cause: &dyn std::error::Error = &e;
     while let Some(inner) = cause.source() {
@@ -357,80 +385,227 @@ fn network(e: reqwest::Error) -> Failure {
     }
 }
 
-/// Slack's answer: sent only with 200 and the body `ok`; an error code in the body otherwise.
-fn classify(status: u16, body: &str) -> Result<(), Failure> {
-    // Slack's error bodies are bare codes. Anything else, like a proxy's page, may quote the URL
-    // in some form (its path, cut, escaped), so only the status shows.
-    let code = body.trim();
-    let detail = || {
-        if (1..=64).contains(&code.len())
-            && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
-        {
-            format!("HTTP {status}: {code}")
-        } else {
-            format!("HTTP {status}")
-        }
+/// Slack's answer: its JSON with `ok: true`, or the failure its error code names. Any other answer
+/// is not Slack's, so whether it went through is unknown.
+fn classify(status: u16, body: &str) -> Result<Value, Failure> {
+    if status == 429 {
+        return Err(Failure::RateLimited);
+    }
+    match serde_json::from_str::<Value>(body)
+        .ok()
+        .filter(|v| v["ok"].is_boolean())
+    {
+        Some(v) if v["ok"] == true => Ok(v),
+        Some(v) => Err(failure(v["error"].as_str().unwrap_or_default())),
+        None if status < 400 => Err(Failure::Unconfirmed(status)),
+        None => Err(Failure::Other(format!("HTTP {status}"))),
+    }
+}
+
+/// The company workspace's Slack app (docs/slack-app.md). Not a secret: PKCE stands in for the
+/// client secret a desktop app could not keep.
+const CLIENT_ID: &str = "";
+/// The sign-in's loopback redirect, registered with the app (docs/slack-app.md): Slack wants it
+/// exactly.
+const PORT: u16 = 47815;
+const CALLBACK: &str = "/slack/callback";
+/// User scopes: the recorder's channels, public and private, and posting as the recorder.
+const SCOPES: &str = "channels:read,groups:read,chat:write";
+const AUTHORIZE: &str = "https://slack.com/oauth/v2/authorize";
+const API: &str = "https://slack.com/api";
+/// The recorder has this long to finish in the browser.
+const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
+/// One request to the redirect, in all (`answer`).
+const ANSWER_TIME: Duration = Duration::from_secs(2);
+/// A token this close to its end (seconds) is refreshed first. Slack's last 12 hours.
+const REFRESH_MARGIN: i64 = 300;
+/// users.conversations pages of 200: 5,000 channels at most.
+const PAGES: usize = 25;
+/// What the browser tab says when Slack sends it back.
+const SIGNED_IN_PAGE: &str = "Slack 로그인을 마쳤습니다. 이 창을 닫고 회의 요약으로 돌아가 주세요.";
+const NOT_SIGNED_IN_PAGE: &str =
+    "Slack 로그인을 하지 못했습니다. 회의 요약에서 다시 시도해 주세요.";
+
+/// A channel the recorder is in (SND-04), from `users.conversations`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Channel {
+    pub id: String,
+    pub name: String,
+    pub private: bool,
+}
+
+/// The user token and its rotation (keychain, 9.2). PKCE tokens always rotate: 12 hours each,
+/// the refresh token once.
+#[derive(Serialize, Deserialize, PartialEq)]
+struct Tokens {
+    access: String,
+    refresh: Option<String>,
+    /// Unix seconds.
+    expires_at: Option<i64>,
+}
+
+/// Never the tokens themselves, in a log or a failed test.
+impl std::fmt::Debug for Tokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Tokens {{ expires_at: {:?}, .. }}", self.expires_at)
+    }
+}
+
+/// The tokens in an `oauth.v2.access` answer: a user token's are under `authed_user` when signing
+/// in, at the top when refreshing.
+fn tokens_of(v: &Value, now: i64) -> Option<Tokens> {
+    let t = if v["authed_user"]["access_token"].is_string() {
+        &v["authed_user"]
+    } else {
+        v
     };
-    let says = |codes: &[&str]| codes.iter().any(|c| body.contains(c));
-    match status {
-        200 if code == "ok" => Ok(()),
-        200..=399 => Err(Failure::Unconfirmed(status)),
-        429 => Err(Failure::RateLimited),
-        404 | 410 => Err(Failure::Gone(detail())),
-        _ if says(&["no_service", "channel_not_found", "channel_is_archived"]) => {
-            Err(Failure::Gone(detail()))
+    Some(Tokens {
+        access: t["access_token"].as_str()?.into(),
+        refresh: t["refresh_token"].as_str().map(Into::into),
+        expires_at: t["expires_in"].as_i64().map(|secs| now + secs),
+    })
+}
+
+/// 32 random bytes as base64url: PKCE's verifier and the sign-in's state.
+fn random() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| format!("난수를 만들 수 없습니다: {e}"))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// The redirect's listeners: `localhost` may resolve to either address, so both, when this machine
+/// has IPv6. Port 0 (tests) takes a free one, the same on both. Another program on either one is
+/// refused: the browser could take the code there.
+fn listen(port: u16) -> Result<(Vec<TcpListener>, u16), String> {
+    let busy = |e: std::io::Error| {
+        format!(
+            "Slack 로그인에 쓰는 포트 {port}를 열 수 없습니다. 다른 프로그램이 쓰고 있는지 확인해 주세요: {e}"
+        )
+    };
+    let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).map_err(busy)?;
+    let port = v4.local_addr().map_err(|e| e.to_string())?.port();
+    let v6 = match TcpListener::bind((Ipv6Addr::LOCALHOST, port)) {
+        Ok(v6) => Some(v6),
+        Err(e) if e.kind() == ErrorKind::AddrInUse => return Err(busy(e)),
+        // No IPv6 on this machine.
+        Err(_) => None,
+    };
+    let listeners = [Some(v4), v6]
+        .into_iter()
+        .flatten()
+        .filter(|l| l.set_nonblocking(true).is_ok())
+        .collect();
+    Ok((listeners, port))
+}
+
+/// Waits for the browser's return to the redirect and answers it. The code, or why not. `None`:
+/// cancelled.
+fn wait_for_code(
+    listeners: &[TcpListener],
+    state: &str,
+    cancel: &AtomicBool,
+) -> Option<Result<String, String>> {
+    let deadline = Instant::now() + SIGN_IN_TIMEOUT;
+    while !cancel.load(Ordering::SeqCst) {
+        if Instant::now() > deadline {
+            return Some(Err(
+                "Slack 로그인을 기다리다 시간이 지났습니다. 다시 로그인해 주세요".into(),
+            ));
         }
-        _ if status == 403 || says(&["action_prohibited"]) => Err(Failure::Forbidden(detail())),
-        400 if says(&["invalid_blocks", "markdown"]) => Err(Failure::Blocks(detail())),
-        _ => Err(Failure::Other(detail())),
+        for listener in listeners {
+            if let Ok((stream, _)) = listener.accept()
+                && let Some(result) = answer(stream, state)
+            {
+                return Some(result);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
+    None
 }
 
-/// One request, never retried: Slack may have posted a message whose answer got lost (7.1).
-async fn post(url: &str, payload: &Value, timeout: Duration) -> Result<(), Failure> {
-    let mut http = reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(timeout)
-        // A redirect is an answer of its own (`classify`): followed, it could end on a login
-        // page's 200, and the Referer would take the webhook URL to another host.
-        .redirect(reqwest::redirect::Policy::none());
-    // Like the LLM requests (6.1): this machine is never reached through a proxy.
-    if loopback(url) {
-        http = http.no_proxy();
+/// One request to the redirect: the callback's code or Slack's refusal, both with our state, or
+/// `None` for anything else, like a favicon or another sign-in's callback. A request gets 2 s in all,
+/// so a slow one never holds up the wait (or the port) for long.
+fn answer(mut stream: TcpStream, state: &str) -> Option<Result<String, String>> {
+    let _ = stream.set_nonblocking(false);
+    let until = Instant::now() + ANSWER_TIME;
+    let mut head = Vec::new();
+    let mut buf = [0; 1024];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 8192 {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
     }
-    let response = http
-        .build()
-        .map_err(|e| Failure::Other(e.to_string()))?
-        .post(url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(payload.to_string())
-        .send()
-        .await
-        .map_err(network)?;
-    let status = response.status().as_u16();
-    // The status decides first: a body lost after a 200 leaves it unconfirmed, and a failure stays one.
-    let text = response.text().await.unwrap_or_default();
-    classify(status, &text)
+    let head = String::from_utf8_lossy(&head);
+    let target = head.split(' ').nth(1).unwrap_or_default();
+    let url = reqwest::Url::parse(&format!("http://localhost{target}")).ok();
+    let Some(url) = url.filter(|u| u.path() == CALLBACK) else {
+        let _ = stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return None;
+    };
+    let param = |name: &str| {
+        url.query_pairs()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.into_owned())
+    };
+    let ours = param("state").as_deref() == Some(state);
+    let result = match (ours, param("code"), param("error")) {
+        (true, Some(code), _) => Some(Ok(code)),
+        (true, _, Some(error)) => Some(Err(if error == "access_denied" {
+            "Slack에서 로그인을 허용하지 않았습니다".into()
+        } else {
+            format!("Slack 로그인을 하지 못했습니다({})", code(&error))
+        })),
+        // Not this sign-in's (an old tab, or a page made to look like Slack's answer): this one
+        // goes on waiting.
+        _ => None,
+    };
+    let page = if matches!(result, Some(Ok(_))) {
+        SIGNED_IN_PAGE
+    } else {
+        NOT_SIGNED_IN_PAGE
+    };
+    let html = format!(
+        "<!doctype html><html lang=\"ko\"><meta charset=\"utf-8\"><title>회의 요약</title>\
+         <body style=\"margin:0;height:100vh;display:grid;place-items:center;background:#f7f5f0;\
+         color:#1f1d1a;font:16px -apple-system,'Apple SD Gothic Neo','Malgun Gothic',sans-serif\">\
+         <p>{page}</p></body></html>"
+    );
+    let _ = stream.write_all(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+            html.len()
+        )
+        .as_bytes(),
+    );
+    result
 }
 
-/// `summary.generated.md`, or nothing when the meeting has none.
-fn generated(store: &Store, id: &str) -> Result<String, String> {
-    match std::fs::read_to_string(store.dir_for(id)?.join("summary.generated.md")) {
-        Ok(text) => Ok(text),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(format!("summary.generated.md을 읽을 수 없습니다: {e}")),
-    }
-}
+/// The keychain's tokens (JSON); tests put a stand-in here.
+type Load = Box<dyn Fn() -> Result<Option<String>, String> + Send + Sync>;
+/// Writes them, or with `None` deletes them.
+type Save = Box<dyn Fn(Option<&str>) -> Result<(), String> + Send + Sync>;
 
-/// A webhook's URL by its name.
-type Lookup = Box<dyn Fn(&str) -> Result<Option<String>, String> + Send + Sync>;
-
-/// Sending from the review screen.
+/// Signing in, the channels and sending from the review screen.
 pub struct Slack {
     /// Meetings being sent right now: a second click while one is out must not post twice.
     sending: Mutex<HashSet<String>>,
-    /// The keychain; tests put a stand-in here.
-    url: Lookup,
+    /// One token read at a time: a refresh token works once, so two refreshes would sign out.
+    tokens: tauri::async_runtime::Mutex<()>,
+    /// The sign-in waiting for the browser, to stop it.
+    signing_in: Mutex<Option<Arc<AtomicBool>>>,
+    load: Load,
+    save: Save,
+    api: String,
+    client_id: &'static str,
+    port: u16,
     timeout: Duration,
 }
 
@@ -438,7 +613,13 @@ impl Default for Slack {
     fn default() -> Self {
         Self {
             sending: Mutex::default(),
-            url: Box::new(|name| settings::get_secret(SecretKind::Slack, name)),
+            tokens: Default::default(),
+            signing_in: Mutex::default(),
+            load: Box::new(settings::slack_tokens),
+            save: Box::new(settings::set_slack_tokens),
+            api: API.into(),
+            client_id: CLIENT_ID,
+            port: PORT,
             timeout: TIMEOUT,
         }
     }
@@ -459,17 +640,271 @@ impl Slack {
         self.sending.lock().unwrap().contains(id)
     }
 
+    /// One Web API call with a form body, never retried: a post may have gone through though its
+    /// answer was lost (7.1). The token goes in the header, never in a URL.
+    async fn call(
+        &self,
+        method: &str,
+        token: Option<&str>,
+        form: &[(&str, &str)],
+    ) -> Result<Value, Failure> {
+        let http = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(self.timeout)
+            // A redirect is an answer of its own (`classify`): a login page's 200 is not a post.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| Failure::Other(e.to_string()))?;
+        let mut request = http
+            .post(format!("{}/{method}", self.api))
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(
+                form_urlencoded::Serializer::new(String::new())
+                    .extend_pairs(form)
+                    .finish(),
+            );
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.map_err(network)?;
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        classify(status, &text)
+    }
+
+    /// ONB-04: signs the recorder in, in the browser: OAuth with PKCE and a loopback redirect
+    /// (docs/slack-app.md). `open` opens the authorize page. The workspace's name, or `None` when
+    /// cancelled. A sign-in still waiting is cancelled first.
+    pub async fn sign_in(
+        &self,
+        settings: &SettingsStore,
+        open: impl FnOnce(&str) -> Result<(), String>,
+    ) -> Result<Option<String>, String> {
+        if self.client_id.is_empty() {
+            return Err("이 빌드에는 Slack 앱이 설정되지 않았습니다".into());
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        if let Some(earlier) = self.signing_in.lock().unwrap().replace(cancel.clone()) {
+            earlier.store(true, Ordering::SeqCst);
+        }
+        // The earlier one lets go of the port once it stops: within its 50 ms poll, or after the
+        // request it is answering (`ANSWER_TIME`).
+        let port = self.port;
+        let (listeners, port) = tauri::async_runtime::spawn_blocking(move || {
+            let until = Instant::now() + ANSWER_TIME + Duration::from_secs(1);
+            loop {
+                match listen(port) {
+                    Err(_) if Instant::now() < until => {
+                        std::thread::sleep(Duration::from_millis(50))
+                    }
+                    bound => return bound,
+                }
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        let (verifier, state) = (random()?, random()?);
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let redirect = format!("http://localhost:{port}{CALLBACK}");
+        let url = reqwest::Url::parse_with_params(
+            AUTHORIZE,
+            [
+                ("client_id", self.client_id),
+                ("user_scope", SCOPES),
+                ("redirect_uri", &redirect),
+                ("state", &state),
+                ("code_challenge", &challenge),
+                ("code_challenge_method", "S256"),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        open(url.as_str())?;
+        let waiting = cancel.clone();
+        let code = tauri::async_runtime::spawn_blocking(move || {
+            wait_for_code(&listeners, &state, &waiting)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        self.signing_in
+            .lock()
+            .unwrap()
+            .take_if(|c| Arc::ptr_eq(c, &cancel));
+        let Some(code) = code.transpose()? else {
+            return Ok(None);
+        };
+        let answer = self
+            .call(
+                "oauth.v2.access",
+                None,
+                &[
+                    ("client_id", self.client_id),
+                    ("code", &code),
+                    ("code_verifier", &verifier),
+                    ("redirect_uri", &redirect),
+                ],
+            )
+            .await
+            .map_err(|f| match f {
+                Failure::Other(detail) => format!("Slack 로그인을 마치지 못했습니다({detail})"),
+                f => f.elsewhere(),
+            })?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let tokens = tokens_of(&answer, now).ok_or("Slack이 토큰을 주지 않았습니다")?;
+        let team = answer["team"]["name"]
+            .as_str()
+            .unwrap_or("Slack")
+            .to_string();
+        let _one = self.tokens.lock().await;
+        (self.save)(Some(
+            &serde_json::to_string(&tokens).map_err(|e| e.to_string())?,
+        ))?;
+        settings.set_slack_team(Some(&team))?;
+        Ok(Some(team))
+    }
+
+    /// Stops a sign-in waiting for the browser.
+    pub fn cancel_sign_in(&self) {
+        if let Some(cancel) = self.signing_in.lock().unwrap().take() {
+            cancel.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The token is revoked when Slack can still be told (refreshed first if it has ended), and
+    /// leaves this PC either way.
+    pub async fn sign_out(&self, settings: &SettingsStore) -> Result<(), String> {
+        let _one = self.tokens.lock().await;
+        match self.current().await {
+            Ok(tokens) => {
+                if let Err(e) = self.call("auth.revoke", Some(&tokens.access), &[]).await {
+                    log::warn!("Slack 토큰 폐기 실패: {}", e.message());
+                }
+            }
+            Err(e) => log::warn!("Slack 토큰 폐기 전 갱신 실패: {}", e.message()),
+        }
+        (self.save)(None)?;
+        settings.set_slack_team(None)
+    }
+
+    /// The stored tokens, refreshed first when the access token is about to end. The new pair
+    /// replaces the old at once: the old refresh token no longer works. Under `tokens`.
+    async fn current(&self) -> Result<Tokens, Failure> {
+        let stored = (self.load)().map_err(Failure::Other)?;
+        let tokens = stored
+            .and_then(|t| serde_json::from_str::<Tokens>(&t).ok())
+            .ok_or(Failure::SignedOut)?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let (Some(at), Some(refresh)) = (tokens.expires_at, &tokens.refresh) else {
+            return Ok(tokens);
+        };
+        if at - now > REFRESH_MARGIN {
+            return Ok(tokens);
+        }
+        let answer = self
+            .call(
+                "oauth.v2.access",
+                None,
+                &[
+                    ("client_id", self.client_id),
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", refresh),
+                ],
+            )
+            .await?;
+        let fresh = tokens_of(&answer, now).ok_or(Failure::SignedOut)?;
+        let saved = serde_json::to_string(&fresh).map_err(|e| e.to_string());
+        if let Err(e) = saved.and_then(|t| (self.save)(Some(&t))) {
+            // This request still works; the next one asks for a sign-in.
+            log::error!("새 Slack 토큰을 키체인에 저장하지 못했습니다: {e}");
+        }
+        Ok(fresh)
+    }
+
+    /// The access token, one read at a time (`current`).
+    async fn token(&self, settings: &SettingsStore) -> Result<String, String> {
+        let current = {
+            let _one = self.tokens.lock().await;
+            self.current().await
+        };
+        match current {
+            Ok(tokens) => Ok(tokens.access),
+            Err(f) => Err(self.failed(settings, f, false).await),
+        }
+    }
+
+    /// What a failure says. A sign-in Slack no longer takes (expired, revoked, scopes changed) is
+    /// forgotten here too, so every screen offers to sign in again instead of looking signed in.
+    /// `posted`: the call might have posted, so the recorder checks the channel.
+    async fn failed(&self, settings: &SettingsStore, f: Failure, posted: bool) -> String {
+        if f == Failure::SignedOut {
+            let _one = self.tokens.lock().await;
+            if let Err(e) = (self.save)(None).and_then(|()| settings.set_slack_team(None)) {
+                log::warn!("끝난 Slack 로그인을 지우지 못했습니다: {e}");
+            }
+        }
+        if posted { f.message() } else { f.elsewhere() }
+    }
+
+    /// SND-04: the channels the recorder is in, by name.
+    pub async fn channels(&self, settings: &SettingsStore) -> Result<Vec<Channel>, String> {
+        let token = self.token(settings).await?;
+        let mut channels = Vec::new();
+        let mut cursor = String::new();
+        for _ in 0..PAGES {
+            let page = self
+                .call(
+                    "users.conversations",
+                    Some(&token),
+                    &[
+                        ("types", "public_channel,private_channel"),
+                        ("exclude_archived", "true"),
+                        ("limit", "200"),
+                        ("cursor", &cursor),
+                    ],
+                )
+                .await;
+            let page = match page {
+                Ok(page) => page,
+                Err(f) => return Err(self.failed(settings, f, false).await),
+            };
+            channels.extend(
+                page["channels"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|c| {
+                        Some(Channel {
+                            id: c["id"].as_str()?.into(),
+                            name: c["name"].as_str()?.into(),
+                            private: c["is_private"].as_bool().unwrap_or(false),
+                        })
+                    }),
+            );
+            cursor = page["response_metadata"]["next_cursor"]
+                .as_str()
+                .unwrap_or_default()
+                .into();
+            if cursor.is_empty() {
+                break;
+            }
+        }
+        channels.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(channels)
+    }
+
     /// `send_to_slack`: saves the edit the way autosave does, so what is sent is what is stored,
-    /// then posts it to `webhook`. Success: `sent` with the channel, time and edit count, and
-    /// `webhook` becomes `last_channel` (SND-04). Failure: still `review`, with the cause in
-    /// `error` for 다시 보내기 (SND-06).
+    /// then posts it to `channel` as the recorder. Success: `sent` with the channel, time and edit
+    /// count, and `channel` becomes `last_channel` (SND-04). Failure: still `review`, with the cause
+    /// in `error` for 다시 보내기 (SND-06).
     #[allow(clippy::too_many_arguments)]
     pub async fn send(
         &self,
         store: &Store,
         settings: &SettingsStore,
         id: &str,
-        webhook: &str,
+        channel: &Channel,
         title: &str,
         body: &str,
         offset_minutes: i32,
@@ -488,7 +923,7 @@ impl Slack {
             Ok(())
         })?;
         match self
-            .deliver(store, settings, &meta, webhook, body, offset_minutes)
+            .deliver(store, settings, &meta, channel, body, offset_minutes)
             .await
         {
             Ok(sent) => {
@@ -505,7 +940,7 @@ impl Slack {
                     .map_err(|e| {
                         format!("Slack에는 보냈지만 전송 기록을 저장하지 못했습니다: {e}")
                     })?;
-                if let Err(e) = settings.set_last_channel(webhook) {
+                if let Err(e) = settings.set_last_channel(&channel.id) {
                     log::warn!("마지막 채널 저장 실패: {e}");
                 }
                 Ok(meta)
@@ -523,43 +958,18 @@ impl Slack {
         }
     }
 
-    /// `send_test_message` (ONB-06): a fixed message through the same checks and request as a
-    /// meeting's. `typed`: a URL typed in the Slack tab and not saved yet, sent instead of the
-    /// keychain's. Only the outcome comes back, never the URL.
-    pub async fn send_test(
-        &self,
-        settings: &SettingsStore,
-        webhook: &str,
-        typed: Option<String>,
-    ) -> Result<(), String> {
-        let secret = match typed.filter(|url| !url.trim().is_empty()) {
-            Some(url) => Some(url),
-            None => (self.url)(webhook)?,
-        };
-        let url = webhook_url(secret).map_err(|f| f.message())?;
-        let recorder = settings
-            .load()
-            .map(|l| l.settings.recorder_name)
-            .unwrap_or_default();
-        post(&url, &test_payload(&recorder), self.timeout)
-            .await
-            .map_err(|f| f.message())
-    }
-
-    /// Between the save and the result: the webhook, the message, the request.
+    /// Between the save and the result: the message, the token, the post.
     async fn deliver(
         &self,
         store: &Store,
         settings: &SettingsStore,
         meta: &Meta,
-        webhook: &str,
+        channel: &Channel,
         body: &str,
         offset_minutes: i32,
     ) -> Result<Sent, String> {
-        let settings = settings.load()?.settings;
-        if !settings.webhooks.iter().any(|w| w.name == webhook) {
-            return Err(format!("웹훅 '{webhook}'을(를) 찾을 수 없습니다"));
-        }
+        let stored = settings;
+        let settings = stored.load()?.settings;
         let text = markdown(
             &meta.title,
             meta,
@@ -575,45 +985,76 @@ impl Slack {
         }
         let edits = edit_count(&generated(store, &meta.id)?, &meta.title, body);
         let footer = footer(edits, meta, &settings);
-        let url = webhook_url((self.url)(webhook)?).map_err(|f| f.message())?;
-        let mut sent = post(
-            &url,
-            &payload(&meta.title, &text, &footer, false),
-            self.timeout,
-        )
-        .await;
-        // [S5] A webhook that refuses the `markdown` block gets mrkdwn sections, once.
-        if matches!(sent, Err(Failure::Blocks(_))) {
-            sent = post(
-                &url,
-                &payload(&meta.title, &text, &footer, true),
-                self.timeout,
+        let token = self.token(stored).await?;
+        let mut sent = self
+            .post(
+                &token,
+                &channel.id,
+                &payload(&meta.title, &text, &footer, false),
             )
             .await;
+        // [S5] A refused `markdown` block gets mrkdwn sections, once.
+        if matches!(sent, Err(Failure::Blocks(_))) {
+            sent = self
+                .post(
+                    &token,
+                    &channel.id,
+                    &payload(&meta.title, &text, &footer, true),
+                )
+                .await;
         }
-        sent.map_err(|f| f.message())?;
+        if let Err(f) = sent {
+            return Err(self.failed(stored, f, true).await);
+        }
         Ok(Sent {
-            channel: webhook.to_string(),
+            channel: format!("#{}", channel.name),
             at: store::utc(OffsetDateTime::now_utc()),
             edit_count: edits,
         })
+    }
+
+    /// `chat.postMessage` with the payload's text and blocks. No link previews: a summary's links
+    /// are references, not the message.
+    async fn post(&self, token: &str, channel: &str, payload: &Value) -> Result<(), Failure> {
+        let text = payload["text"].as_str().unwrap_or_default();
+        let blocks = payload["blocks"].to_string();
+        self.call(
+            "chat.postMessage",
+            Some(token),
+            &[
+                ("channel", channel),
+                ("text", text),
+                ("blocks", &blocks),
+                ("unfurl_links", "false"),
+                ("unfurl_media", "false"),
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
+/// `summary.generated.md`, or nothing when the meeting has none.
+fn generated(store: &Store, id: &str) -> Result<String, String> {
+    match std::fs::read_to_string(store.dir_for(id)?.join("summary.generated.md")) {
+        Ok(text) => Ok(text),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("summary.generated.md을 읽을 수 없습니다: {e}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{LlmConnection, Webhook};
+    use crate::settings::LlmConnection;
     use crate::summarize::tests::{Request, Stub, reply, serve};
+    use std::collections::HashMap;
     use std::fs;
-    use std::net::TcpListener;
-    use std::sync::atomic::Ordering;
-    use std::sync::{Arc, mpsc};
+    use std::sync::mpsc;
     use std::thread;
-    use std::time::Instant;
     use tauri::async_runtime::block_on;
 
-    const SECRET: &str = "/services/T000/B000/secret-token";
+    const TOKEN: &str = "xoxp-secret-token";
 
     fn meta(created_at: &str, duration_ms: u64) -> Meta {
         Meta {
@@ -885,35 +1326,39 @@ mod tests {
     }
 
     #[test]
-    fn failures_are_classified_and_show_a_bare_code_only() {
+    fn answers_are_classified_and_show_a_bare_code_only() {
+        let ok = classify(200, r#"{"ok": true, "ts": "1.2"}"#).unwrap();
+        assert_eq!(ok["ts"], "1.2");
         let cases = [
-            (404, "no_service", "Gone"),
-            (410, "channel_is_archived", "Gone"),
-            (400, "channel_not_found", "Gone"),
-            (403, "action_prohibited", "Forbidden"),
-            (403, "posting_to_general_channel_denied", "Forbidden"),
-            (429, "rate_limited", "RateLimited"),
-            (400, "invalid_blocks", "Blocks"),
-            (400, "unsupported block type: markdown", "Blocks"),
-            (400, "invalid_payload", "Other"),
-            (500, "oops", "Other"),
+            ("invalid_auth", "SignedOut"),
+            ("token_revoked", "SignedOut"),
+            ("token_expired", "SignedOut"),
+            ("missing_scope", "SignedOut"),
+            ("invalid_refresh_token", "SignedOut"),
+            ("channel_not_found", "Gone"),
+            ("is_archived", "Gone"),
+            ("not_in_channel", "NotIn"),
+            ("restricted_action", "Forbidden"),
+            ("restricted_action_read_only_channel", "Forbidden"),
+            ("ratelimited", "RateLimited"),
+            ("invalid_blocks", "Blocks"),
+            ("msg_too_long", "Other"),
         ];
-        for (status, body, kind) in cases {
-            let failure = classify(status, body).unwrap_err();
+        for (code, kind) in cases {
+            let failure = classify(200, &json!({ "ok": false, "error": code }).to_string());
+            let failure = failure.unwrap_err();
             assert!(
                 format!("{failure:?}").starts_with(kind),
-                "{status} {body}: {failure:?}"
+                "{code}: {failure:?}"
             );
         }
-        assert_eq!(classify(200, "ok"), Ok(()));
-        assert_eq!(classify(200, "ok\n"), Ok(()));
-        // Not Slack's own success: a proxy's or a login page's answer, maybe posted, maybe not.
+        assert_eq!(classify(429, ""), Err(Failure::RateLimited));
+        // Not Slack's answer: a proxy's or a login page's, maybe posted, maybe not.
         for (status, body) in [
             (200, "<html>로그인</html>"),
             (200, ""),
-            (204, ""),
-            (201, "ok"),
             (302, ""),
+            (204, ""),
         ] {
             assert_eq!(
                 classify(status, body),
@@ -922,137 +1367,87 @@ mod tests {
             );
         }
         assert_eq!(
-            classify(404, " no_service\n").unwrap_err().message(),
-            "웹훅이 없거나 삭제됐습니다(HTTP 404: no_service). 설정 → Slack에서 웹훅 주소를 확인해 주세요"
+            classify(502, "<html>"),
+            Err(Failure::Other("HTTP 502".into()))
         );
-        // Anything but a bare code shows the status alone: an echo of the URL need not be verbatim.
-        let url = format!("https://hooks.slack.com{SECRET}");
-        let echoes = [
-            format!("bad request to {url}"),
-            format!("<html><body>Proxy: access to {SECRET} denied</body></html>"),
-            url[..url.len() - 6].to_string(),
-            url.replace('/', "\\/"),
-            url.replace('/', "%2F"),
-        ];
-        for body in echoes {
-            let failure = classify(500, &body).unwrap_err();
-            assert_eq!(failure.message(), "Slack 오류: HTTP 500", "{body}");
-            assert!(!format!("{failure:?}").contains("B000"), "{body}");
-        }
+        // A code that is not a code is not shown: it could echo what was sent.
+        let echo = json!({ "ok": false, "error": format!("bad token {TOKEN}") }).to_string();
+        assert_eq!(
+            classify(200, &echo),
+            Err(Failure::Other("unknown_error".into()))
+        );
+        assert_eq!(
+            classify(200, r#"{"ok": false, "error": "channel_not_found"}"#)
+                .unwrap_err()
+                .message(),
+            "채널이 없거나 보관됐습니다(channel_not_found). 다른 채널을 골라 주세요"
+        );
     }
 
     #[test]
-    fn only_https_or_this_machine_is_a_webhook() {
-        let ok = |url: &str| webhook_url(Some(url.into()));
+    fn tokens_come_from_the_sign_in_and_the_refresh_answers_alike() {
+        let signed_in = json!({ "ok": true, "authed_user": {
+            "id": "U1", "access_token": "xoxe.xoxp-1", "refresh_token": "xoxe-1", "expires_in": 43200
+        }, "team": { "name": "SIJE" } });
         assert_eq!(
-            ok(" https://hooks.slack.com/services/a\n"),
-            Ok("https://hooks.slack.com/services/a".into())
+            tokens_of(&signed_in, 1_000),
+            Some(Tokens {
+                access: "xoxe.xoxp-1".into(),
+                refresh: Some("xoxe-1".into()),
+                expires_at: Some(44_200)
+            })
         );
-        assert!(ok("http://127.0.0.1:9/services/a").is_ok());
-        assert!(ok("http://localhost:9/services/a").is_ok());
-        assert!(ok("http://[::1]:9/services/a").is_ok());
-        // A resolver may send a subdomain of `localhost` anywhere.
+        let refreshed = json!({ "ok": true, "access_token": "xoxe.xoxp-2", "refresh_token": "xoxe-2", "expires_in": 43200 });
+        assert_eq!(tokens_of(&refreshed, 0).unwrap().access, "xoxe.xoxp-2");
+        // A token that does not rotate.
+        let lasting = json!({ "ok": true, "authed_user": { "access_token": "xoxp-3" } });
         assert_eq!(
-            ok("http://hooks.localhost/services/a"),
-            Err(Failure::BadUrl)
+            tokens_of(&lasting, 0),
+            Some(Tokens {
+                access: "xoxp-3".into(),
+                refresh: None,
+                expires_at: None
+            })
         );
-        assert_eq!(
-            ok("http://hooks.slack.com/services/a"),
-            Err(Failure::BadUrl)
-        );
-        assert_eq!(ok("hooks.slack.com/services/a"), Err(Failure::BadUrl));
-        assert_eq!(webhook_url(None), Err(Failure::NoUrl));
-        assert_eq!(webhook_url(Some(" ".into())), Err(Failure::NoUrl));
+        assert_eq!(tokens_of(&json!({ "ok": true }), 0), None);
     }
 
-    fn webhook(stub: &Stub) -> String {
-        format!("{}{SECRET}", stub.url.trim_end_matches("/v1"))
-    }
-
-    fn sent_blocks(r: &Request) -> Vec<&str> {
-        r.body["blocks"]
+    fn sent_blocks(r: &Request) -> Vec<String> {
+        let blocks: Value = serde_json::from_str(&form(r)["blocks"]).unwrap();
+        blocks
             .as_array()
             .unwrap()
             .iter()
-            .map(|b| b["type"].as_str().unwrap())
+            .map(|b| b["type"].as_str().unwrap().to_string())
             .collect()
     }
 
-    #[test]
-    fn a_silent_server_times_out_once_and_a_dropped_one_is_not_retried() {
-        let silent = serve(|_| None);
-        let started = Instant::now();
-        let failure = block_on(post(&webhook(&silent), &json!({}), Duration::from_secs(1)));
-        assert_eq!(failure, Err(Failure::Timeout));
-        assert!(started.elapsed() < Duration::from_secs(4));
-        assert_eq!(silent.connections.load(Ordering::SeqCst), 1);
-
-        // Reads the request and hangs up without answering: it may have posted.
-        let dropped = serve(|_| Some(Vec::new()));
-        let failure = block_on(post(&webhook(&dropped), &json!({}), TIMEOUT)).unwrap_err();
-        assert!(matches!(failure, Failure::NoAnswer(_)), "{failure:?}");
-        assert!(
-            failure
-                .message()
-                .contains("채널에 메시지가 올라갔는지 확인한 뒤")
-        );
-        assert!(!failure.message().contains("secret-token"), "{failure:?}");
-        thread::sleep(Duration::from_millis(100));
-        assert_eq!(dropped.connections.load(Ordering::SeqCst), 1);
+    /// A request's form body.
+    fn form(r: &Request) -> HashMap<String, String> {
+        form_urlencoded::parse(r.body.as_str().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect()
     }
 
-    #[test]
-    fn a_refused_connection_never_shows_the_url() {
-        let port = TcpListener::bind("127.0.0.1:0")
+    fn ok(fields: Value) -> Vec<u8> {
+        let mut body = json!({ "ok": true });
+        body.as_object_mut()
             .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let url = format!("http://127.0.0.1:{port}{SECRET}");
-        let failure = block_on(post(&url, &json!({}), TIMEOUT)).unwrap_err();
-        // Nothing went out, so no channel to check.
-        assert!(matches!(failure, Failure::Network(_)), "{failure:?}");
-        assert!(failure.message().starts_with("Slack에 연결하지 못했습니다"));
-        assert!(!failure.message().contains("secret-token"), "{failure:?}");
-        assert!(!format!("{failure:?}").contains("secret-token"));
+            .extend(fields.as_object().unwrap().clone());
+        reply("200 OK", &body.to_string())
     }
 
-    /// A proxy or an SSO gateway in the way: its redirect is not followed (nor its Referer sent),
-    /// and neither it nor a login page's 200 counts as sent or takes the mrkdwn fallback.
-    #[test]
-    fn a_redirect_or_a_200_that_is_not_ok_stays_in_review_after_one_request() {
-        let redirect = serve(|r| {
-            Some(if r.head.starts_with("post /services/") {
-                b"HTTP/1.1 302 Found\r\nLocation: /login\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    .to_vec()
-            } else {
-                reply("200 OK", "ok")
-            })
-        });
-        let login = serve(|_| Some(reply("200 OK", "<html><title>로그인</title></html>")));
-        for (stub, status) in [(redirect, 302), (login, 200)] {
-            let f = fixture();
-            f.point_at(&stub);
-            let error = f.send("주간 회의", "- 본문").unwrap_err();
-            assert_eq!(error, Failure::Unconfirmed(status).message());
-            let meta = f.store.get(&f.id).unwrap();
-            assert_eq!(
-                (meta.status, meta.error.as_deref()),
-                (Status::Review, Some(error.as_str()))
-            );
-            // A followed redirect would be a second connection, and the fallback a second request.
-            assert_eq!(stub.connections.load(Ordering::SeqCst), 1);
-            assert_eq!(stub.requests.lock().unwrap().len(), 1);
-        }
+    fn error(code: &str) -> Vec<u8> {
+        reply("200 OK", &json!({ "ok": false, "error": code }).to_string())
     }
 
-    /// A meeting in review with its generated summary, two webhooks, and a `Slack` whose keychain
-    /// holds `url` once `point_at` sets it.
+    /// A meeting in review with its generated summary, a signed-in workspace, and a `Slack` whose
+    /// API is `stub` and whose keychain is `tokens`.
     struct Fixture {
         store: Store,
         settings: SettingsStore,
         slack: Slack,
-        url: Arc<Mutex<Option<String>>>,
+        tokens: Arc<Mutex<Option<String>>>,
         id: String,
         _tmp: tempfile::TempDir,
     }
@@ -1060,7 +1455,7 @@ mod tests {
     const GENERATED: &str =
         "# 주간 회의\n\n## 결정사항\n- 목요일 배포\n## 액션 아이템\n- [미정] 노트";
 
-    fn fixture() -> Fixture {
+    fn fixture(stub: &Stub) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(tmp.path().join("meetings")).unwrap();
         let id = store.create("", false).unwrap().id;
@@ -1079,68 +1474,84 @@ mod tests {
         )
         .unwrap();
         let settings = SettingsStore::new(tmp.path().join("settings.json"));
-        let webhooks = ["#회의록", "#개발"].map(|name| Webhook { name: name.into() });
         settings
             .save(Settings {
                 recorder_name: "홍길동".into(),
-                webhooks: webhooks.into(),
                 ..Settings::default()
             })
             .unwrap();
-        let url = Arc::new(Mutex::new(None));
-        let keychain = url.clone();
+        settings.set_slack_team(Some("SIJE")).unwrap();
+        let tokens = Arc::new(Mutex::new(Some(
+            json!({ "access": TOKEN, "refresh": "xoxe-1", "expires_at": i64::MAX }).to_string(),
+        )));
+        let (read, write) = (tokens.clone(), tokens.clone());
         // Never the real keychain.
         let slack = Slack {
-            sending: Mutex::default(),
-            url: Box::new(move |_| Ok(keychain.lock().unwrap().clone())),
+            load: Box::new(move || Ok(read.lock().unwrap().clone())),
+            save: Box::new(move |t| {
+                *write.lock().unwrap() = t.map(String::from);
+                Ok(())
+            }),
+            api: stub.url.clone(),
+            client_id: "123.456",
+            port: 0,
             timeout: Duration::from_secs(5),
+            ..Slack::default()
         };
         Fixture {
             store,
             settings,
             slack,
-            url,
+            tokens,
             id,
             _tmp: tmp,
         }
     }
 
-    impl Fixture {
-        fn point_at(&self, stub: &Stub) {
-            *self.url.lock().unwrap() = Some(webhook(stub));
+    fn channel() -> Channel {
+        Channel {
+            id: "C2".into(),
+            name: "개발".into(),
+            private: false,
         }
+    }
 
+    impl Fixture {
         fn send(&self, title: &str, body: &str) -> Result<Meta, String> {
             block_on(self.slack.send(
                 &self.store,
                 &self.settings,
                 &self.id,
-                "#개발",
+                &channel(),
                 title,
                 body,
                 540,
             ))
         }
+
+        fn stored(&self) -> Tokens {
+            serde_json::from_str(self.tokens.lock().unwrap().as_deref().unwrap()).unwrap()
+        }
     }
 
     #[test]
-    fn a_send_saves_the_edit_first_then_marks_it_sent() {
-        let f = fixture();
-        let summary = f.store.dir_for(&f.id).unwrap().join("summary.md");
+    fn a_send_saves_the_edit_first_then_posts_it_as_the_recorder() {
+        let summary = Arc::new(Mutex::new(None::<std::path::PathBuf>));
         let on_disk = Arc::new(Mutex::new(None));
-        let seen = on_disk.clone();
+        let (path, seen) = (summary.clone(), on_disk.clone());
         let stub = serve(move |_| {
-            *seen.lock().unwrap() = fs::read_to_string(&summary).ok();
-            Some(reply("200 OK", "ok"))
+            let path = path.lock().unwrap().clone().unwrap();
+            *seen.lock().unwrap() = fs::read_to_string(path).ok();
+            Some(ok(json!({ "ts": "1.2" })))
         });
-        f.point_at(&stub);
+        let f = fixture(&stub);
+        *summary.lock().unwrap() = Some(f.store.dir_for(&f.id).unwrap().join("summary.md"));
         let body = "## 결정사항\n- 금요일 배포\n## 액션 아이템\n- [미정] 노트";
 
         let meta = f.send("주간\n회의 ", body).unwrap();
 
         // What went out was already on disk, as the screen showed it.
         assert_eq!(on_disk.lock().unwrap().as_deref(), Some(body));
-        assert_eq!(f.store.summary(&f.id).unwrap(), body);
         assert_eq!(
             (meta.status, meta.title.as_str()),
             (Status::Sent, "주간 회의")
@@ -1152,43 +1563,49 @@ mod tests {
             "{}",
             sent.at
         );
-        assert_eq!(f.store.get(&f.id).unwrap().status, Status::Sent);
         assert_eq!(
             f.settings.load().unwrap().settings.last_channel.as_deref(),
-            Some("#개발")
+            Some("C2")
         );
 
         let requests = stub.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
+        assert!(requests[0].head.starts_with("post /v1/chat.postmessage "));
         assert!(
             requests[0]
                 .head
-                .starts_with("post /services/t000/b000/secret-token ")
+                .contains(&format!("authorization: bearer {TOKEN}"))
+        );
+        let sent = form(&requests[0]);
+        assert_eq!(sent["channel"], "C2");
+        assert_eq!(sent["text"], "주간 회의 회의 요약");
+        assert_eq!(
+            (sent["unfurl_links"].as_str(), sent["unfurl_media"].as_str()),
+            ("false", "false")
         );
         assert_eq!(sent_blocks(&requests[0]), ["markdown", "context"]);
-        let block = requests[0].body["blocks"][0]["text"].as_str().unwrap();
+        let blocks: Value = serde_json::from_str(&sent["blocks"]).unwrap();
         assert_eq!(
-            block,
+            blocks[0]["text"],
             format!("**주간 회의**\n2026-10-13 (화) 14:00 · 1시간 5분 · 녹음: 홍길동\n\n{body}")
         );
         assert_eq!(
-            requests[0].body["blocks"][1]["elements"][0]["text"],
+            blocks[1]["elements"][0]["text"],
             "AI 요약 · 녹음자 검토 완료 (수정 1곳)"
         );
     }
 
     /// [S5] handled at runtime: the `markdown` block is refused, so mrkdwn sections go, once.
     #[test]
-    fn a_webhook_that_refuses_the_markdown_block_gets_sections_once() {
+    fn a_refused_markdown_block_gets_sections_once() {
         let stub = serve(|r| {
             Some(if sent_blocks(r)[0] == "markdown" {
-                reply("400 Bad Request", "invalid_blocks")
+                error("invalid_blocks")
             } else {
-                reply("200 OK", "ok")
+                ok(json!({}))
             })
         });
-        let f = fixture();
-        f.point_at(&stub);
+        let f = fixture(&stub);
 
         let meta = f
             .send("주간 회의", "## 결정사항\n- **목요일** 배포")
@@ -1198,35 +1615,28 @@ mod tests {
         let requests = stub.requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(sent_blocks(&requests[1]), ["section", "context"]);
+        let blocks: Value = serde_json::from_str(&form(&requests[1])["blocks"]).unwrap();
         assert_eq!(
-            requests[1].body["blocks"][0]["text"]["text"],
+            blocks[0]["text"]["text"],
             "*주간 회의*\n2026-10-13 (화) 14:00 · 1시간 5분 · 녹음: 홍길동\n\n*결정사항*\n- *목요일* 배포"
         );
     }
 
     #[test]
     fn a_failed_send_stays_in_review_with_the_cause_until_a_resend_works() {
-        let f = fixture();
-        let gone = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let gone = Arc::new(AtomicBool::new(true));
         let answer = gone.clone();
-        // The cause on disk while each request is out.
-        let meta_json = f.store.dir_for(&f.id).unwrap().join("meta.json");
-        let causes = Arc::new(Mutex::new(Vec::new()));
-        let seen = causes.clone();
         let stub = serve(move |_| {
-            let meta: Meta = serde_json::from_slice(&fs::read(&meta_json).unwrap()).unwrap();
-            seen.lock().unwrap().push(meta.error);
             Some(if answer.load(Ordering::SeqCst) {
-                reply("404 Not Found", "no_service")
+                error("channel_not_found")
             } else {
-                reply("200 OK", "ok")
+                ok(json!({}))
             })
         });
-        f.point_at(&stub);
+        let f = fixture(&stub);
 
         let error = f.send("주간 회의", "- 고친 본문").unwrap_err();
-        assert!(error.contains("웹훅이 없거나 삭제됐습니다"), "{error}");
-        assert!(!error.contains("secret-token"));
+        assert!(error.starts_with("채널이 없거나 보관됐습니다"), "{error}");
         let meta = f.store.get(&f.id).unwrap();
         assert_eq!(
             (meta.status, meta.error.as_deref()),
@@ -1239,72 +1649,468 @@ mod tests {
         let meta = f.send("주간 회의", "- 고친 본문").unwrap();
         assert_eq!((meta.status, meta.error), (Status::Sent, None));
         assert_eq!(stub.requests.lock().unwrap().len(), 2);
-        // The old cause was gone as soon as the new attempt started.
-        assert_eq!(*causes.lock().unwrap(), [None, None]);
     }
 
     #[test]
-    fn no_url_in_the_keychain_says_where_to_put_it() {
-        let f = fixture();
+    fn signed_out_says_where_to_sign_in_and_asks_nothing() {
+        let stub = serve(|_| Some(ok(json!({}))));
+        let f = fixture(&stub);
+        *f.tokens.lock().unwrap() = None;
         let error = f.send("주간 회의", "- 본문").unwrap_err();
-        assert!(error.contains("설정 → Slack"), "{error}");
+        assert_eq!(error, Failure::SignedOut.message());
         assert_eq!(f.store.get(&f.id).unwrap().error, Some(error));
+        assert!(
+            block_on(f.slack.channels(&f.settings))
+                .unwrap_err()
+                .contains("설정 → Slack")
+        );
+        assert!(stub.requests.lock().unwrap().is_empty());
+        // The workspace goes too, so every screen offers to sign in again.
+        assert_eq!(f.settings.load().unwrap().settings.slack_team, None);
     }
 
-    /// ONB-06: a URL typed but not saved goes first; a blank one means the keychain's.
+    /// A token Slack revoked (or whose scopes changed) is forgotten, like a refused refresh.
     #[test]
-    fn a_test_message_goes_to_the_typed_url_or_else_the_saved_one() {
-        let ok = |_: &Request| Some(reply("200 OK", "ok"));
-        let (saved, typed) = (serve(ok), serve(ok));
-        let f = fixture();
-        f.point_at(&saved);
-        let test = |url: Option<String>| block_on(f.slack.send_test(&f.settings, "#개발", url));
+    fn a_revoked_token_is_forgotten_and_a_lasting_one_is_never_refreshed() {
+        let stub = serve(|r| {
+            Some(if r.head.starts_with("post /v1/users.conversations ") {
+                error("token_revoked")
+            } else {
+                ok(json!({}))
+            })
+        });
+        let f = fixture(&stub);
+        // No end and no refresh token: used as it is.
+        *f.tokens.lock().unwrap() = Some(json!({ "access": TOKEN }).to_string());
+        f.send("주간 회의", "- 본문").unwrap();
+        assert_eq!(stub.requests.lock().unwrap().len(), 1);
 
-        test(Some(webhook(&typed))).unwrap();
-        test(Some(" ".into())).unwrap();
-        test(None).unwrap();
-
-        let body = |stub: &Stub| stub.requests.lock().unwrap()[0].body.clone();
-        assert_eq!(typed.requests.lock().unwrap().len(), 1);
-        assert_eq!(saved.requests.lock().unwrap().len(), 2);
         assert_eq!(
-            body(&typed),
-            json!({ "text": "회의 요약 테스트 메시지입니다. 이 채널로 회의록이 전송됩니다.\n녹음: 홍길동" })
+            block_on(f.slack.channels(&f.settings)).unwrap_err(),
+            Failure::SignedOut.message()
         );
-        // Nothing about a meeting changes.
-        assert_eq!(f.store.get(&f.id).unwrap().status, Status::Review);
+        assert_eq!(*f.tokens.lock().unwrap(), None);
+        assert_eq!(f.settings.load().unwrap().settings.slack_team, None);
+    }
 
-        // The same checks and messages as a meeting's send.
-        let error = test(Some("http://hooks.slack.com/services/a".into())).unwrap_err();
+    /// A refresh token works once: the new pair replaces the old before the post, and a token
+    /// with time left is not refreshed again.
+    #[test]
+    fn an_ending_token_is_refreshed_once_and_the_new_pair_kept() {
+        let stub = serve(|r| {
+            Some(if r.head.starts_with("post /v1/oauth.v2.access ") {
+                ok(
+                    json!({ "access_token": "xoxe.xoxp-2", "refresh_token": "xoxe-2", "expires_in": 43200 }),
+                )
+            } else {
+                ok(json!({}))
+            })
+        });
+        let f = fixture(&stub);
+        let soon = OffsetDateTime::now_utc().unix_timestamp() + 60;
+        *f.tokens.lock().unwrap() =
+            Some(json!({ "access": TOKEN, "refresh": "xoxe-1", "expires_at": soon }).to_string());
+
+        f.send("주간 회의", "- 본문").unwrap();
+        let stored = f.stored();
+        assert_eq!(
+            (stored.access.as_str(), stored.refresh.as_deref()),
+            ("xoxe.xoxp-2", Some("xoxe-2"))
+        );
+        assert!(stored.expires_at.unwrap() > soon + 40_000);
+
+        let requests = stub.requests.lock().unwrap();
+        let refresh = form(&requests[0]);
+        assert_eq!(
+            (
+                refresh["grant_type"].as_str(),
+                refresh["refresh_token"].as_str(),
+                refresh["client_id"].as_str()
+            ),
+            ("refresh_token", "xoxe-1", "123.456")
+        );
+        // No client secret: PKCE (docs/slack-app.md).
+        assert!(!refresh.contains_key("client_secret"));
         assert!(
-            error.starts_with("웹훅 주소가 올바르지 않습니다"),
+            requests[1]
+                .head
+                .contains("authorization: bearer xoxe.xoxp-2")
+        );
+        drop(requests);
+
+        block_on(f.slack.channels(&f.settings)).unwrap();
+        let requests = stub.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[2]
+                .head
+                .starts_with("post /v1/users.conversations ")
+        );
+    }
+
+    #[test]
+    fn a_refused_refresh_signs_out() {
+        let stub = serve(|_| Some(error("invalid_refresh_token")));
+        let f = fixture(&stub);
+        *f.tokens.lock().unwrap() =
+            Some(json!({ "access": TOKEN, "refresh": "xoxe-1", "expires_at": 0 }).to_string());
+        assert_eq!(
+            f.send("주간 회의", "- 본문").unwrap_err(),
+            Failure::SignedOut.message()
+        );
+        assert_eq!(stub.requests.lock().unwrap().len(), 1);
+        assert_eq!(*f.tokens.lock().unwrap(), None);
+        assert_eq!(f.settings.load().unwrap().settings.slack_team, None);
+    }
+
+    #[test]
+    fn channels_come_page_by_page_sorted_by_name() {
+        let stub = serve(|r| {
+            let cursor = form(r).get("cursor").cloned().unwrap_or_default();
+            Some(if cursor.is_empty() {
+                ok(json!({
+                    "channels": [
+                        { "id": "C3", "name": "회의록", "is_private": false },
+                        { "id": "G1", "name": "경영", "is_private": true },
+                    ],
+                    "response_metadata": { "next_cursor": "page2" }
+                }))
+            } else {
+                ok(json!({
+                    "channels": [{ "id": "C1", "name": "개발", "is_private": false }],
+                    "response_metadata": { "next_cursor": "" }
+                }))
+            })
+        });
+        let f = fixture(&stub);
+
+        let channels = block_on(f.slack.channels(&f.settings)).unwrap();
+
+        let names: Vec<_> = channels
+            .iter()
+            .map(|c| (c.name.as_str(), c.private))
+            .collect();
+        assert_eq!(names, [("개발", false), ("경영", true), ("회의록", false)]);
+        let requests = stub.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let first = form(&requests[0]);
+        assert_eq!(first["types"], "public_channel,private_channel");
+        assert_eq!(first["exclude_archived"], "true");
+        assert_eq!(form(&requests[1])["cursor"], "page2");
+    }
+
+    /// The browser's side of a sign-in: a favicon first, then each redirect back to it.
+    fn browse(authorize: &str, queries: &[fn(&str) -> String]) -> mpsc::Receiver<String> {
+        let url = reqwest::Url::parse(authorize).unwrap();
+        let param = |name: &str| {
+            url.query_pairs()
+                .find(|(k, _)| k == name)
+                .unwrap()
+                .1
+                .into_owned()
+        };
+        let redirect = reqwest::Url::parse(&param("redirect_uri")).unwrap();
+        let port = redirect.port().unwrap();
+        let state = param("state");
+        let callbacks = queries
+            .iter()
+            .map(|query| format!("{}?{}", redirect.path(), query(&state)));
+        let paths: Vec<String> = ["/favicon.ico".to_string()]
+            .into_iter()
+            .chain(callbacks)
+            .collect();
+        let (page, pages) = mpsc::channel();
+        thread::spawn(move || {
+            for path in paths {
+                let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                write!(stream, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+                let mut answer = String::new();
+                let _ = stream.read_to_string(&mut answer);
+                page.send(answer).unwrap();
+            }
+        });
+        pages
+    }
+
+    #[test]
+    fn a_sign_in_uses_pkce_and_keeps_the_tokens_and_the_workspace() {
+        let stub = serve(|_| {
+            Some(ok(json!({
+                "authed_user": { "id": "U1", "access_token": "xoxe.xoxp-1", "refresh_token": "xoxe-1", "expires_in": 43200 },
+                "team": { "id": "T1", "name": "SIJE" }
+            })))
+        });
+        let f = fixture(&stub);
+        f.settings.set_slack_team(None).unwrap();
+        let opened = Arc::new(Mutex::new(String::new()));
+        let mut pages = None;
+
+        let team = block_on(f.slack.sign_in(&f.settings, |url| {
+            *opened.lock().unwrap() = url.to_string();
+            pages = Some(browse(url, &[|state| format!("code=abc&state={state}")]));
+            Ok(())
+        }))
+        .unwrap();
+
+        assert_eq!(team.as_deref(), Some("SIJE"));
+        assert_eq!(
+            f.settings.load().unwrap().settings.slack_team.as_deref(),
+            Some("SIJE")
+        );
+        assert_eq!(f.stored().access, "xoxe.xoxp-1");
+        let pages = pages.unwrap();
+        assert!(pages.recv().unwrap().starts_with("HTTP/1.1 404"));
+        assert!(pages.recv().unwrap().contains(SIGNED_IN_PAGE));
+
+        let authorize = reqwest::Url::parse(&opened.lock().unwrap()).unwrap();
+        let param = |name: &str| {
+            authorize
+                .query_pairs()
+                .find(|(k, _)| k == name)
+                .map(|p| p.1.into_owned())
+        };
+        assert_eq!(param("client_id").as_deref(), Some("123.456"));
+        assert_eq!(param("user_scope").as_deref(), Some(SCOPES));
+        assert_eq!(param("code_challenge_method").as_deref(), Some("S256"));
+        assert!(param("scope").is_none(), "no bot scopes from a desktop app");
+        let exchange = form(&stub.requests.lock().unwrap()[0]);
+        assert_eq!(exchange["code"], "abc");
+        assert_eq!(exchange["redirect_uri"], param("redirect_uri").unwrap());
+        assert!(!exchange.contains_key("client_secret"));
+        // The challenge was the verifier's SHA-256.
+        let verifier = &exchange["code_verifier"];
+        assert_eq!(
+            param("code_challenge").unwrap(),
+            URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+        );
+    }
+
+    #[test]
+    fn a_sign_in_refused_in_slack_keeps_nothing() {
+        let stub = serve(|_| Some(ok(json!({}))));
+        let f = fixture(&stub);
+        f.settings.set_slack_team(None).unwrap();
+        *f.tokens.lock().unwrap() = None;
+        let mut pages = None;
+        let error = block_on(f.slack.sign_in(&f.settings, |url| {
+            pages = Some(browse(
+                url,
+                &[|state| format!("error=access_denied&state={state}")],
+            ));
+            Ok(())
+        }))
+        .unwrap_err();
+        assert_eq!(error, "Slack에서 로그인을 허용하지 않았습니다");
+        let pages = pages.unwrap();
+        pages.recv().unwrap();
+        assert!(pages.recv().unwrap().contains(NOT_SIGNED_IN_PAGE));
+        assert!(stub.requests.lock().unwrap().is_empty());
+        assert_eq!(*f.tokens.lock().unwrap(), None);
+        assert_eq!(f.settings.load().unwrap().settings.slack_team, None);
+    }
+
+    /// An old tab's callback, or a page posing as Slack's answer, cannot end the sign-in: it goes on
+    /// waiting for its own.
+    #[test]
+    fn a_callback_with_another_state_is_turned_away_and_the_sign_in_waits_on() {
+        let stub = serve(|_| {
+            Some(ok(json!({
+                "authed_user": { "access_token": "xoxe.xoxp-1" }, "team": { "name": "SIJE" }
+            })))
+        });
+        let f = fixture(&stub);
+        let mut pages = None;
+        let team = block_on(f.slack.sign_in(&f.settings, |url| {
+            pages = Some(browse(
+                url,
+                &[
+                    |_| "code=stolen&state=other".to_string(),
+                    |_| "code=nostate".to_string(),
+                    |state| format!("code=abc&state={state}"),
+                ],
+            ));
+            Ok(())
+        }))
+        .unwrap();
+        assert_eq!(team.as_deref(), Some("SIJE"));
+        let pages = pages.unwrap();
+        pages.recv().unwrap();
+        assert!(pages.recv().unwrap().contains(NOT_SIGNED_IN_PAGE));
+        assert!(pages.recv().unwrap().contains(NOT_SIGNED_IN_PAGE));
+        assert!(pages.recv().unwrap().contains(SIGNED_IN_PAGE));
+        let requests = stub.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(form(&requests[0])["code"], "abc");
+    }
+
+    /// A request that trickles in gets 2 s in all, then the wait goes on.
+    #[test]
+    fn a_slow_request_never_holds_the_wait() {
+        let (listeners, port) = listen(0).unwrap();
+        let cancel = AtomicBool::new(false);
+        let slow = thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            for _ in 0..10 {
+                if stream.write_all(b"G").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+        });
+        thread::scope(|s| {
+            let waiting = s.spawn(|| wait_for_code(&listeners, "s", &cancel));
+            thread::sleep(Duration::from_millis(3_000));
+            cancel.store(true, Ordering::SeqCst);
+            let started = Instant::now();
+            assert_eq!(waiting.join().unwrap(), None);
+            assert!(started.elapsed() < Duration::from_secs(1));
+        });
+        slow.join().unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_sign_in_ends_quietly_and_a_build_without_the_app_says_so() {
+        let stub = serve(|_| Some(ok(json!({}))));
+        let f = fixture(&stub);
+        let signing_in = thread::scope(|s| {
+            let waiting = s.spawn(|| block_on(f.slack.sign_in(&f.settings, |_| Ok(()))));
+            let until = Instant::now() + Duration::from_secs(5);
+            while f.slack.signing_in.lock().unwrap().is_none() {
+                assert!(Instant::now() < until, "the sign-in never started");
+                thread::sleep(Duration::from_millis(10));
+            }
+            f.slack.cancel_sign_in();
+            waiting.join().unwrap()
+        });
+        assert_eq!(signing_in, Ok(None));
+
+        let unset = Slack {
+            client_id: "",
+            ..Slack::default()
+        };
+        assert_eq!(
+            block_on(unset.sign_in(&f.settings, |_| panic!("no browser without an app"))),
+            Err("이 빌드에는 Slack 앱이 설정되지 않았습니다".into())
+        );
+    }
+
+    #[test]
+    fn signing_out_revokes_and_forgets_the_token_and_the_workspace() {
+        let stub = serve(|r| {
+            Some(if r.head.starts_with("post /v1/oauth.v2.access ") {
+                ok(
+                    json!({ "access_token": "xoxe.xoxp-2", "refresh_token": "xoxe-2", "expires_in": 43200 }),
+                )
+            } else {
+                ok(json!({ "revoked": true }))
+            })
+        });
+        let f = fixture(&stub);
+        f.settings.set_last_channel("C2").unwrap();
+
+        block_on(f.slack.sign_out(&f.settings)).unwrap();
+
+        let requests = stub.requests.lock().unwrap();
+        assert!(requests[0].head.starts_with("post /v1/auth.revoke "));
+        assert!(
+            requests[0]
+                .head
+                .contains(&format!("authorization: bearer {TOKEN}"))
+        );
+        assert_eq!(*f.tokens.lock().unwrap(), None);
+        let settings = f.settings.load().unwrap().settings;
+        assert_eq!((settings.slack_team, settings.last_channel), (None, None));
+        drop(requests);
+
+        // An ended token is refreshed first, so Slack can still be told.
+        f.settings.set_slack_team(Some("SIJE")).unwrap();
+        *f.tokens.lock().unwrap() =
+            Some(json!({ "access": TOKEN, "refresh": "xoxe-1", "expires_at": 0 }).to_string());
+        block_on(f.slack.sign_out(&f.settings)).unwrap();
+        let requests = stub.requests.lock().unwrap();
+        assert!(requests[1].head.starts_with("post /v1/oauth.v2.access "));
+        assert!(
+            requests[2]
+                .head
+                .contains("authorization: bearer xoxe.xoxp-2")
+        );
+        assert_eq!(*f.tokens.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn a_silent_server_times_out_once_and_a_dropped_one_is_not_retried() {
+        let silent = serve(|_| None);
+        let mut f = fixture(&silent);
+        f.slack.timeout = Duration::from_secs(1);
+        let started = Instant::now();
+        assert_eq!(
+            f.send("주간 회의", "- 본문").unwrap_err(),
+            Failure::Timeout.message()
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(silent.connections.load(Ordering::SeqCst), 1);
+        // Reading the channels posts nothing: no channel to check.
+        assert_eq!(
+            block_on(f.slack.channels(&f.settings)).unwrap_err(),
+            "Slack 응답을 받지 못했습니다. 잠시 후 다시 시도해 주세요"
+        );
+
+        // Reads the request and hangs up without answering: it may have posted.
+        let dropped = serve(|_| Some(Vec::new()));
+        let f = fixture(&dropped);
+        let error = f.send("주간 회의", "- 본문").unwrap_err();
+        assert!(
+            error.contains("채널에 메시지가 올라갔는지 확인한 뒤"),
             "{error}"
         );
-        *f.url.lock().unwrap() = None;
-        assert!(test(None).unwrap_err().starts_with("웹훅 주소가 없습니다"));
-        let gone = serve(|_| Some(reply("404 Not Found", "no_service")));
-        let error = test(Some(webhook(&gone))).unwrap_err();
-        assert!(error.contains("HTTP 404: no_service"), "{error}");
-        assert!(!error.contains("secret-token"), "{error}");
+        assert!(!error.contains(TOKEN), "{error}");
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(dropped.connections.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn the_test_message_keeps_a_name_from_becoming_a_mention() {
-        assert_eq!(
-            test_payload("  <!channel> & co ")["text"],
-            "회의 요약 테스트 메시지입니다. 이 채널로 회의록이 전송됩니다.\n녹음: &lt;!channel&gt; &amp; co"
-        );
-        assert_eq!(
-            test_payload(" ")["text"],
-            "회의 요약 테스트 메시지입니다. 이 채널로 회의록이 전송됩니다."
-        );
+    fn a_refused_connection_says_nothing_went_out() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let stub = serve(|_| None);
+        let mut f = fixture(&stub);
+        f.slack.api = format!("http://127.0.0.1:{port}/api");
+        let error = f.send("주간 회의", "- 본문").unwrap_err();
+        assert!(error.starts_with("Slack에 연결하지 못했습니다"), "{error}");
+        assert!(!error.contains(TOKEN), "{error}");
+    }
+
+    /// A proxy or an SSO gateway in the way: its redirect is not followed, and neither it nor a
+    /// login page's 200 counts as sent or takes the mrkdwn fallback.
+    #[test]
+    fn a_redirect_or_a_page_that_is_not_slacks_stays_in_review_after_one_request() {
+        let redirect = serve(|_| {
+            Some(
+                b"HTTP/1.1 302 Found\r\nLocation: /login\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            )
+        });
+        let login = serve(|_| Some(reply("200 OK", "<html><title>로그인</title></html>")));
+        for (stub, status) in [(redirect, 302), (login, 200)] {
+            let f = fixture(&stub);
+            let error = f.send("주간 회의", "- 본문").unwrap_err();
+            assert_eq!(error, Failure::Unconfirmed(status).message());
+            let meta = f.store.get(&f.id).unwrap();
+            assert_eq!(
+                (meta.status, meta.error.as_deref()),
+                (Status::Review, Some(error.as_str()))
+            );
+            assert_eq!(stub.connections.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[test]
     fn exactly_12000_characters_go_and_one_more_does_not() {
-        let stub = serve(|_| Some(reply("200 OK", "ok")));
-        let f = fixture();
-        f.point_at(&stub);
+        let stub = serve(|_| Some(ok(json!({}))));
+        let f = fixture(&stub);
         let header = "**주간 회의**\n2026-10-13 (화) 14:00 · 1시간 5분 · 녹음: 홍길동\n\n";
         let room = MAX_CHARS - header.chars().count();
 
@@ -1318,9 +2124,12 @@ mod tests {
 
         f.send("주간 회의", &"가".repeat(room)).unwrap();
         let requests = stub.requests.lock().unwrap();
-        let block = requests[0].body["blocks"][0]["text"].as_str().unwrap();
+        let blocks: Value = serde_json::from_str(&form(&requests[0])["blocks"]).unwrap();
         // The footer is a block of its own and does not count.
-        assert_eq!(block.chars().count(), MAX_CHARS);
+        assert_eq!(
+            blocks[0]["text"].as_str().unwrap().chars().count(),
+            MAX_CHARS
+        );
     }
 
     #[test]
@@ -1329,10 +2138,9 @@ mod tests {
         let wait = Mutex::new(wait);
         let stub = serve(move |_| {
             let _ = wait.lock().unwrap().recv();
-            Some(reply("200 OK", "ok"))
+            Some(ok(json!({})))
         });
-        let f = fixture();
-        f.point_at(&stub);
+        let f = fixture(&stub);
         thread::scope(|s| {
             let first = s.spawn(|| f.send("주간 회의", "- 본문"));
             let until = Instant::now() + Duration::from_secs(5);
@@ -1355,9 +2163,8 @@ mod tests {
 
     #[test]
     fn no_speech_and_meetings_out_of_review_are_never_sent() {
-        let stub = serve(|_| Some(reply("200 OK", "ok")));
-        let f = fixture();
-        f.point_at(&stub);
+        let stub = serve(|_| Some(ok(json!({}))));
+        let f = fixture(&stub);
         f.store
             .update(&f.id, |m| {
                 m.no_speech = true;
