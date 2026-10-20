@@ -4,7 +4,7 @@
 
 ## 설치 파일 받기
 
-<OneDrive 링크>에서 내 컴퓨터에 맞는 파일 하나를 받습니다.
+<OneDrive 링크>에서 내 컴퓨터에 맞는 파일 하나를 받습니다. 저장소에 접근할 수 있으면 [GitHub Releases](https://github.com/sijecorp/meeting-summarizer/releases/latest)에서 받아도 됩니다.
 
 | 컴퓨터 | 파일 |
 |---|---|
@@ -41,6 +41,16 @@ Intel 칩 Mac은 지원하지 않습니다. Mac의 칩은 Apple 메뉴 > 이 Mac
 드물게 WebView2라는 구성 요소가 없는 PC에서는 설치 중에 이것을 함께 설치하며, 이때 관리자 암호를 물을 수 있습니다. 암호를 모르면 IT 담당자에게 요청하세요.
 
 앱을 종료하려면 작업 표시줄 오른쪽 아래(숨겨진 아이콘 ^ 안에 있을 수 있습니다)의 앱 아이콘을 오른쪽 클릭하고 "종료"를 고릅니다. 창을 닫으면 앱은 그곳에 남아 있습니다.
+
+## Slack 연결
+
+요약을 Slack으로 보내려면 한 번 로그인합니다. 녹음과 요약은 로그인하지 않아도 됩니다.
+
+1. 앱 오른쪽 위 톱니(설정) > Slack > "Slack으로 로그인"을 누릅니다.
+2. 브라우저가 열리면 회사 워크스페이스를 확인하고 "허용"을 누릅니다. "Slack 로그인을 마쳤습니다"가 보이면 브라우저 탭을 닫습니다.
+3. 앱의 Slack 탭에 워크스페이스 이름이 보이면 끝입니다.
+
+요약을 검토한 뒤 회의 문서 아래의 보내기 막대에서 채널을 고르고 보냅니다. 메시지는 내 이름으로 올라갑니다. 목록에는 내가 들어가 있는 채널만 나오므로, 보낼 채널에 먼저 들어가 둡니다. 앱에서 Slack을 30일 동안 쓰지 않으면 로그인이 끝나고, 앱이 다시 로그인하라고 알려 줍니다.
 
 ## 새 버전으로 업데이트
 
@@ -105,10 +115,10 @@ IT 담당자용:
 2. 워크플로를 실행합니다. 둘 중 하나입니다.
    - 저장소의 Actions 탭 > 왼쪽 목록의 build > "Run workflow" > 브랜치 master > "Run workflow"
    - 버전 태그 push: `git tag v1.0.0 && git push origin v1.0.0`
-3. 실행이 끝나면 그 실행 페이지 아래쪽 "Artifacts"에서 `meeting-summarizer-macos-arm64`와 `meeting-summarizer-windows-x64`를 받습니다. zip으로 받아지니 풀어서 `.dmg`와 `-setup.exe`를 꺼냅니다.
-4. 두 파일을 OneDrive 공유 폴더에 올리고 동료들에게 링크와 이 문서를 알립니다.
+3. 태그로 실행했으면 두 OS의 빌드와 검사가 모두 통과한 뒤 그 태그의 GitHub Release가 만들어지고 `.dmg`와 `-setup.exe`가 붙습니다(저장소 첫 화면 오른쪽 "Releases"). Release 설명은 `docs/releases/<태그>.md`이고, 없으면 GitHub가 커밋으로 만듭니다. 그래서 태그를 push하기 전에 그 파일을 써 둡니다. 수동 실행은 Release를 만들지 않으니, 그 실행 페이지 아래쪽 "Artifacts"에서 `meeting-summarizer-macos-arm64`와 `meeting-summarizer-windows-x64`를 받습니다(zip이니 풀어서 꺼냅니다).
+4. 두 파일을 OneDrive 공유 폴더에도 올리고 동료들에게 링크와 이 문서를 알립니다. 비공개 저장소의 Release는 저장소 접근 권한이 있는 사람만 받을 수 있습니다.
 
-- Artifacts는 30일 뒤 지워집니다. 받아 둘 파일은 그 전에 OneDrive에 올립니다.
+- Artifacts는 30일 뒤 지워집니다. Release에 붙은 파일은 남습니다.
 - 비공개 저장소에서는 macOS 실행 시간이 10배로 계산됩니다. 배포할 때만 실행합니다.
 - 실제 서명과 공증을 하려면 Apple Developer 계정을 만든 뒤 워크플로의 주석 처리된 `APPLE_*` 항목을 저장소 Secrets로 채우고 주석을 풉니다. 그러면 "그래도 열기" 단계와 업데이트 뒤 권한 문제가 없어집니다.
 

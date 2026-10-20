@@ -1,5 +1,6 @@
 # Installers for internal distribution (docs/install.md): macOS Apple Silicon .dmg and Windows x64
-# NSIS setup.exe, uploaded as workflow artifacts. No GitHub release is created.
+# NSIS setup.exe, uploaded as workflow artifacts. A v* tag also gets a GitHub Release with both, once
+# both builds and their checks pass (the release job).
 name: build
 
 on:
@@ -265,3 +266,34 @@ jobs:
           path: ${{ env.CARGO_TARGET_DIR || 'src-tauri/target' }}/${{ matrix.installer }}
           if-no-files-found: error
           retention-days: 30
+
+  # A v* tag, once both builds and every check above pass: a GitHub Release with both installers, so
+  # the repository's front page links to them and they outlive the 30-day artifacts. The notes are
+  # docs/releases/<tag>.md, else GitHub's generated ones. A tag moved and built again replaces the
+  # files of its release.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: installers
+          merge-multiple: true
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l installers
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" installers/* --clobber
+            exit 0
+          fi
+          notes="docs/releases/$GITHUB_REF_NAME.md"
+          if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
+          gh release create "$GITHUB_REF_NAME" installers/* --verify-tag --title "$GITHUB_REF_NAME" "$@"
