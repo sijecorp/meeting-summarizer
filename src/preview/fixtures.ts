@@ -744,7 +744,8 @@ type Commands = {
   download_models: typeof ipc.startModelDownload;
   cancel_model_download: typeof ipc.cancelModelDownload;
   import_model: typeof ipc.importModel;
-  /** Settings' 직접 가져오기 file picker (`@tauri-apps/plugin-dialog`). */
+  import_recording: typeof ipc.importRecording;
+  /** Settings' 직접 가져오기 and Home's recording file picker (`@tauri-apps/plugin-dialog`). */
   "plugin:dialog|open": () => Promise<string | null>;
 };
 type Handlers = {
@@ -971,9 +972,21 @@ const handlers: Handlers = {
     return modelStatus(args.scope);
   },
   "plugin:dialog|open": (a) => {
-    const gguf = JSON.stringify(a).includes("gguf");
-    return `/Users/hong/Downloads/${gguf ? SUMMARY_MODEL.file : models.files[0].file}`;
+    const filters = JSON.stringify(a);
+    if (filters.includes("mp3")) return "/Users/hong/Downloads/주간 회의.m4a";
+    return `/Users/hong/Downloads/${filters.includes("gguf") ? SUMMARY_MODEL.file : models.files[0].file}`;
   },
+  // REC-12: a 37-minute file that ended a minute ago, decoded in a second and a half.
+  import_recording: () =>
+    later(1500, () => {
+      const m = stored("recorded", new Date(Date.now() - 38 * 60_000), {
+        duration_ms: 37 * 60_000,
+        summarize_local: settings.summarize_local_by_default,
+      });
+      meetings.push(m);
+      enqueue(m);
+      return clone(m.meta);
+    }),
 
   confirm_quit: () => {
     console.info("[미리보기] 종료 확인: 실제 앱이라면 진행 중인 작업을 멈추고 종료합니다");

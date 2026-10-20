@@ -80,7 +80,9 @@ const props = {
   onOpen: () => {},
   onRecord: () => {},
   onStart: () => {},
+  onImport: () => {},
   onSetup: () => {},
+  importing: false,
 };
 
 const home = (meetings: MeetingItem[], queue: Progress[], onChanged = () => {}) =>
@@ -498,4 +500,17 @@ test("the first screen shows only while there are no meetings", () => {
   rerender(view(null, true));
   expect(screen.getByRole("button", { name: "녹음 시작" })).toBeTruthy();
   expect(screen.queryByRole("button", { name: "첫 회의 녹음하기" })).toBeNull();
+});
+
+test("REC-12: the first screen and Home's head both offer an import, held while one runs", () => {
+  mock();
+  let asked = 0;
+  const { rerender } = render(<Home {...props} meetings={[]} progress={{}} onImport={() => asked++} />);
+  fireEvent.click(screen.getByRole("button", { name: "녹음 파일 가져오기" }));
+  rerender(<Home {...props} meetings={[meeting("a", "sent")]} progress={{}} onImport={() => asked++} />);
+  fireEvent.click(screen.getByRole("button", { name: "녹음 파일 가져오기" }));
+  expect(asked).toBe(2);
+
+  rerender(<Home {...props} importing meetings={[meeting("a", "sent")]} progress={{}} />);
+  expect((screen.getByRole("button", { name: "가져오는 중…" }) as HTMLButtonElement).disabled).toBe(true);
 });

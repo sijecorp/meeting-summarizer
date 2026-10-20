@@ -4,6 +4,7 @@
 mod capture;
 pub mod check;
 mod clock;
+pub mod import;
 #[cfg(target_os = "macos")]
 mod macos_tap;
 pub mod mix;

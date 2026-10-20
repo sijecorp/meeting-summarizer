@@ -194,6 +194,14 @@ for 각 20ms 프레임:
 - **녹음 중**: 60초마다 여유 공간을 확인한다. 200MB 미만이 되거나 WAV 쓰기 오류가 나면 녹음을 안전하게 끝낸다. 마지막 flush, 상태 `recorded`, 처리 대기열에 넣기, "디스크 공간이 부족해 녹음을 종료했습니다" 알림 순서다.
 - 단위 테스트: 쓰기 오류를 주입하면 상태가 `recorded`가 되고 WAV가 유효한지 확인한다.
 
+### 4.7 녹음 파일 가져오기 (REC-12)
+
+- **풀기** (`audio/import.rs`): `symphonia` 0.5(MPL-2.0, 순수 Rust)로 첫 오디오 트랙을 푼다. 켠 형식은 wav(PCM, ADPCM), mp3, m4a·mp4(AAC), ADTS aac, flac, ogg(Vorbis)다. Opus는 0.5에 디코더가 없어 뺐다. 파일 고르기 창의 확장자 목록(`RECORDING_FILES`, ipc.ts)이 이 목록을 따른다. 풀린 샘플은 녹음과 같은 `writer::Pipe`로 모노로 합치고 16kHz로 바꿔 `mic.wav`에 쓴다. 깨진 프레임은 건너뛴다(재생기처럼). 16kHz 샘플이 4시간을 넘으면 멈추고 거부한다(REC-04와 같은 상한).
+- **트랙 하나**: 가져온 회의에는 `system.wav`가 없다. `mix::recording_len`과 `mix::mixed`는 `system.wav`가 없으면 `mic.wav`만 그대로 읽는다(게이팅할 상대가 없다, 4.5). 무음 `system.wav`를 쓰지 않는 것은 디스크를 두 배로 쓰지 않으려는 것이다.
+- **회의 만들기**: 먼저 `meetings/.import-{시각}.wav`에 풀고, 다 풀리면 `Store::import`가 회의 폴더를 만들어 그 파일을 `mic.wav`로 옮긴 뒤(같은 볼륨의 이름 바꾸기) `meta.json`을 `recorded`로 마지막에 쓴다. 그래서 대기열은 오디오 없는 회의를 만나지 않는다. 실패하면 임시 파일과 폴더를 지운다. 풀다가 앱이 꺼지면 남은 임시 파일은 다음 시작의 복구(8.4)가 지운다.
+- **회의 시작** (`created_at`): 녹음기는 끝날 때 파일을 저장하므로, 파일의 마지막 수정 시각(지금보다 늦으면 지금)에서 길이를 뺀다. 다운로드한 파일은 받은 시각이 기준이 된다. 홈 목록 순서와 Slack 머리말의 일시가 이것을 따른다. id는 지금 시각으로 만든다(겹치지 않게).
+- `import_recording`은 blocking 스레드에서 돈다(1시간 파일을 푸는 데 몇 초). "로컬로 요약"은 녹음처럼 설정의 기본값으로 시작한다(SUM-08). 녹음 중에 가져오면 대기열에 들어가 녹음이 끝나기를 기다린다(TRN-09).
+
 ## 5. 전사
 
 ### 5.1 모델 파일
@@ -519,7 +527,7 @@ Queue의 Sidecar ──spawn── 앱 실행 파일 --llm-supervisor {llama-ser
     2026-10-13T1400-a1b2/
       meta.json
       mic.wav
-      system.wav
+      system.wav               가져온 회의(4.7)에는 없다
       chunks.json              구간 계획 (5.2)
       transcript.partial.jsonl 끝난 구간 결과 (5.2)
       transcript.json          전사본 (5.2)
@@ -605,6 +613,7 @@ recording ─▶ recorded ─▶ transcribing ─▶ transcribed ─▶ summariz
 - 앱 시작 시 `store.rs`의 복구 함수가 모든 `meta.json`을 읽어 다음을 한다.
   - `recording` → 디스크의 상태는 그대로 두고, 메모리에서 "중단된 녹음"으로 표시한다. 녹음자가 "처리 계속"을 고르면 `recorded`로 바꿔 대기열에 넣는다. 종료 확인(8.5)의 "진행 중인 작업"에는 세지 않는다. 실행 중에 녹음을 끝냈는데 `recorded`를 쓰지 못한 회의(디스크가 가득 참 등)도 "중단된 녹음"이 된다. 공간을 비운 뒤 "처리 계속"이 다시 쓴다.
   - `deleting` → 폴더 삭제를 마저 한다.
+  - 회의 폴더가 아닌 `.import-*` 파일(풀다가 꺼진 가져오기, 4.7) → 지운다.
   - `transcribing`, `summarizing` → 앱 자체가 중간에 꺼진 경우다(워커 크래시와 무관). 디스크에 `paused`로 고쳐 쓴 뒤 대기열에 넣는다. 실제로 돌지 않는 작업을 디스크가 "진행 중"이라고 주장하지 않게 하려는 것이다.
   - `paused`, `recorded`, `transcribed` → 대기열에 넣는다. 요약만 남은 회의는 경로가 풀릴 때만 넣는다(위의 회의마다 경로 검사).
 

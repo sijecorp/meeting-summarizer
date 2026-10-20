@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
-import { Check, ChevronRight, CircleAlert, TriangleAlert } from "lucide-react";
+import { Check, ChevronRight, CircleAlert, FileAudio, TriangleAlert } from "lucide-react";
 import { motion } from "motion/react";
 import {
   Banner,
@@ -263,11 +263,13 @@ export default function Home({
   progress,
   recording,
   starting,
+  importing,
   morphFrom,
   onChanged,
   onOpen,
   onRecord,
   onStart,
+  onImport,
   onSetup,
 }: {
   meetings: MeetingItem[] | null;
@@ -278,6 +280,8 @@ export default function Home({
   recording: boolean;
   /** A start was asked and the list does not show the recording yet. */
   starting: boolean;
+  /** A recording file is being decoded (REC-12). */
+  importing: boolean;
   /** The meeting just left by a click: its title glides back into its row. */
   morphFrom?: string | null;
   onChanged: () => void;
@@ -287,6 +291,8 @@ export default function Home({
   onRecord: () => void;
   /** Starts a recording (App.tsx, which also listens for ⌘R). */
   onStart: () => void;
+  /** Picks a recording file to import (App.tsx, so it outlasts this screen). */
+  onImport: (e: MouseEvent) => void;
   onSetup: (tab: SettingsTab) => void;
 }) {
   const [setup, setSetup] = useState<SetupItem[]>([]);
@@ -364,6 +370,14 @@ export default function Home({
 
   const resume = (id: string) => resumeMeeting(id).then(onChanged, (e) => setError(String(e)));
 
+  // REC-12, on both the first screen and Home's head.
+  const importButton = (className: string) => (
+    <Button variant="ghost" className={className} disabled={importing} onClick={onImport}>
+      <FileAudio aria-hidden />
+      {importing ? "가져오는 중…" : "녹음 파일 가져오기"}
+    </Button>
+  );
+
   // One short line instead of a card (design-system 6.4): what transcribing, summarizing and sending
   // still need, each item its own way there. The model downloads in place; its tab (cancel, import,
   // the mirror) shows up as a quieter link while that matters.
@@ -424,24 +438,27 @@ export default function Home({
           </h1>
           <p className="text-ink-2">녹음만 하면 이 PC에서 전사하고, 요약을 검토해 Slack으로 보냅니다.</p>
         </div>
-        <button
-          className="group flex flex-col items-center gap-5 rounded-float p-3 disabled:opacity-50"
-          disabled={starting}
-          aria-keyshortcuts={SHORTCUT.start.aria}
-          onClick={onStart}
-        >
-          <span aria-hidden className="relative grid size-24 place-items-center">
-            <span className="absolute inset-0 rounded-full border border-ink/30 motion-safe:animate-ring" />
-            <span className="absolute inset-0 rounded-full border border-ink/30 [animation-delay:-1.4s] motion-safe:animate-ring" />
-            <span className="relative grid size-24 place-items-center rounded-full bg-ink motion-safe:transition-transform motion-safe:duration-200 motion-safe:group-hover:scale-[1.03] motion-safe:group-active:scale-[0.97]">
-              <span className="size-7 rounded-full bg-rec" />
+        <div className="flex flex-col items-center gap-3">
+          <button
+            className="group flex flex-col items-center gap-5 rounded-float p-3 disabled:opacity-50"
+            disabled={starting}
+            aria-keyshortcuts={SHORTCUT.start.aria}
+            onClick={onStart}
+          >
+            <span aria-hidden className="relative grid size-24 place-items-center">
+              <span className="absolute inset-0 rounded-full border border-ink/30 motion-safe:animate-ring" />
+              <span className="absolute inset-0 rounded-full border border-ink/30 [animation-delay:-1.4s] motion-safe:animate-ring" />
+              <span className="relative grid size-24 place-items-center rounded-full bg-ink motion-safe:transition-transform motion-safe:duration-200 motion-safe:group-hover:scale-[1.03] motion-safe:group-active:scale-[0.97]">
+                <span className="size-7 rounded-full bg-rec" />
+              </span>
             </span>
-          </span>
-          <span className="flex items-center gap-2 font-semibold">
-            첫 회의 녹음하기
-            <Kbd>{SHORTCUT.start.label}</Kbd>
-          </span>
-        </button>
+            <span className="flex items-center gap-2 font-semibold">
+              첫 회의 녹음하기
+              <Kbd>{SHORTCUT.start.label}</Kbd>
+            </span>
+          </button>
+          {importButton("h-9 rounded-full text-ink-2")}
+        </div>
         <ol className="flex flex-wrap items-center justify-center gap-x-2 gap-y-1 text-label text-ink-2">
           {["녹음", "이 PC에서 전사", "요약 검토", "Slack으로 보내기"].map((step, i) => (
             <li key={step} className="flex items-center gap-1.5">
@@ -525,17 +542,20 @@ export default function Home({
               {today.toLocaleDateString("ko-KR", { weekday: "long" })}
             </span>
           </h1>
-          <Button
-            variant="ink"
-            className="h-10 rounded-full pr-4 pl-3.5"
-            disabled={starting}
-            aria-keyshortcuts={recording ? undefined : SHORTCUT.start.aria}
-            onClick={recording ? onRecord : onStart}
-          >
-            <span aria-hidden className={`size-2 rounded-full bg-rec ${recording ? "motion-safe:animate-breathe" : ""}`} />
-            {recording ? "녹음 화면으로" : "녹음 시작"}
-            {!recording && <Kbd className="ml-1">{SHORTCUT.start.label}</Kbd>}
-          </Button>
+          <div className="flex items-center gap-2">
+            {importButton("h-10 rounded-full px-3.5")}
+            <Button
+              variant="ink"
+              className="h-10 rounded-full pr-4 pl-3.5"
+              disabled={starting}
+              aria-keyshortcuts={recording ? undefined : SHORTCUT.start.aria}
+              onClick={recording ? onRecord : onStart}
+            >
+              <span aria-hidden className={`size-2 rounded-full bg-rec ${recording ? "motion-safe:animate-breathe" : ""}`} />
+              {recording ? "녹음 화면으로" : "녹음 시작"}
+              {!recording && <Kbd className="ml-1">{SHORTCUT.start.label}</Kbd>}
+            </Button>
+          </div>
         </header>
         {setupLine("justify-start")}
         {errorBanner}

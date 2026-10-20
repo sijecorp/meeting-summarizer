@@ -169,6 +169,29 @@ pub fn start_recording(
     started
 }
 
+/// REC-12: the recording file at `path` (the file picker's) as a new `recorded` meeting, queued
+/// like one that just finished recording. "로컬로 요약" starts as for a recording (SUM-08). On a
+/// blocking thread: an hour of audio takes seconds to decode.
+#[tauri::command]
+pub async fn import_recording(app: AppHandle, path: String) -> Result<Meta, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = app
+            .state::<SettingsStore>()
+            .load()
+            .map(|l| l.settings)
+            .unwrap_or_default();
+        let meta = audio::import::import(
+            &app.state::<Store>(),
+            Path::new(&path),
+            settings.summarize_local_by_default,
+        )?;
+        app.state::<Queue>().enqueue(&meta.id, meta.status);
+        Ok(meta)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// For the settings' audio tab. Device calls can block inside the OS audio API, so this runs on
 /// a blocking thread rather than an async worker.
 #[tauri::command]

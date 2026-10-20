@@ -378,6 +378,7 @@ pub fn run() {
             commands::start_recording,
             commands::stop_recording,
             commands::recording_state,
+            commands::import_recording,
             commands::list_audio_devices,
             commands::test_system_audio,
             commands::test_microphone,

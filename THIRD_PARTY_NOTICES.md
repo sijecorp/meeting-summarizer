@@ -13,6 +13,7 @@ Meetily: no code from it is included, so it is not listed. Handy: only the macOS
 | Qwen3-4B-Instruct-2507 model weights (Alibaba Cloud) | `unsloth/Qwen3-4B-Instruct-2507-GGUF` `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` at commit a06e946, downloaded at first run | Apache-2.0 | downloaded, not bundled |
 | Vulkan Loader (`vulkan-1.dll`) | `KhronosGroup/Vulkan-Loader`, from the Vulkan SDK | Apache-2.0 | bundled with the Windows installer, next to the exe |
 | Handy | `cjpais/Handy` `build.rs` at 5197faf (macOS link fix in `src-tauri/build.rs`) | MIT | build script only |
+| Symphonia | `symphonia` 0.5.5 (crates.io; source at https://github.com/pdeljanov/Symphonia, unmodified) | MPL-2.0 | compiled into the app (recording file import) |
 | Pretendard | pretendard 1.3.9 | SIL OFL 1.1 | bundled in the frontend |
 | Instrument Serif | @fontsource/instrument-serif 5.3.0 | SIL OFL 1.1 | bundled in the frontend |
 | Noto Serif KR | @fontsource-variable/noto-serif-kr 5.3.0 | SIL OFL 1.1 | bundled in the frontend |

@@ -186,6 +186,27 @@ pub fn one_line(title: &str) -> String {
         .join(" ")
 }
 
+/// `fs::rename`, tried again a few times on Windows: antivirus or the search indexer can hold a file
+/// open for a moment.
+fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut retries = 0;
+    loop {
+        match fs::rename(from, to) {
+            // 32 is ERROR_SHARING_VIOLATION, which std reports as an uncategorized error.
+            Err(e)
+                if cfg!(windows)
+                    && (e.kind() == ErrorKind::PermissionDenied
+                        || e.raw_os_error() == Some(32))
+                    && retries < 3 =>
+            {
+                retries += 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Write to a temp file, fsync, then rename over the target so a crash never leaves a torn file.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut tmp_name = path.as_os_str().to_owned();
@@ -197,23 +218,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.sync_all()?;
         // Windows cannot rename a file this process still holds open.
         drop(file);
-        let mut retries = 0;
-        loop {
-            match fs::rename(&tmp, path) {
-                // Windows: antivirus or the search indexer can hold the target open for a moment.
-                // 32 is ERROR_SHARING_VIOLATION, which std reports as an uncategorized error.
-                Err(e)
-                    if cfg!(windows)
-                        && (e.kind() == ErrorKind::PermissionDenied
-                            || e.raw_os_error() == Some(32))
-                        && retries < 3 =>
-                {
-                    retries += 1;
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                result => return result,
-            }
-        }
+        rename(&tmp, path)
     })();
     if replaced.is_err() {
         // A half-written temp file holds the disk space the low-disk guard is trying to keep.
@@ -226,6 +231,47 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         fs::File::open(dir)?.sync_all()?;
     }
     Ok(())
+}
+
+/// Starts the name of an upload's temp file in `meetings/` (`Store::import_temp`).
+const IMPORT_PREFIX: &str = ".import-";
+
+/// A new meeting's `meta.json`. The id is `now` (UTC) and a few changing bits of it, so two never
+/// meet; `created_at` is when the meeting began.
+fn new_meta(
+    now: time::OffsetDateTime,
+    created_at: time::OffsetDateTime,
+    title: &str,
+    status: Status,
+    summarize_local: bool,
+) -> Meta {
+    Meta {
+        schema_version: SCHEMA_VERSION,
+        id: format!(
+            "{:04}-{:02}-{:02}T{:02}{:02}-{:04x}",
+            now.year(),
+            now.month() as u8,
+            now.day(),
+            now.hour(),
+            now.minute(),
+            (now.unix_timestamp_nanos() / 1000) as u16
+        ),
+        title: title.to_string(),
+        status,
+        created_at: utc(created_at),
+        duration_ms: 0,
+        gaps: Vec::new(),
+        backend: None,
+        chunks_done: 0,
+        llm_connection: None,
+        summarize_local,
+        no_speech: false,
+        error: None,
+        sent: None,
+        grounding_replaced: 0,
+        grounding_checked: None,
+        wait: None,
+    }
 }
 
 pub struct Store {
@@ -301,37 +347,46 @@ impl Store {
     /// `summarize_local`: "로컬로 요약" starts as the settings' default (SUM-08).
     pub fn create(&self, title: &str, summarize_local: bool) -> Result<Meta, String> {
         let now = time::OffsetDateTime::now_utc();
-        let id = format!(
-            "{:04}-{:02}-{:02}T{:02}{:02}-{:04x}",
-            now.year(),
-            now.month() as u8,
-            now.day(),
-            now.hour(),
-            now.minute(),
-            (now.unix_timestamp_nanos() / 1000) as u16
-        );
-        let meta = Meta {
-            schema_version: SCHEMA_VERSION,
-            id: id.clone(),
-            title: title.to_string(),
-            status: Status::Recording,
-            created_at: utc(now),
-            duration_ms: 0,
-            gaps: Vec::new(),
-            backend: None,
-            chunks_done: 0,
-            llm_connection: None,
-            summarize_local,
-            no_speech: false,
-            error: None,
-            sent: None,
-            grounding_replaced: 0,
-            grounding_checked: None,
-            wait: None,
-        };
+        let meta = new_meta(now, now, title, Status::Recording, summarize_local);
         // create_dir (not _all) fails on an id collision instead of reusing a folder.
-        fs::create_dir(self.dir_for(&id)?).map_err(|e| format!("회의 폴더 생성 실패: {e}"))?;
+        fs::create_dir(self.dir_for(&meta.id)?).map_err(|e| format!("회의 폴더 생성 실패: {e}"))?;
         self.write(&meta)?;
+        Ok(meta)
+    }
+
+    /// Where an upload is decoded (REC-12) before it has a meeting: a file in `meetings/`, so moving
+    /// it in is a rename on the same volume. Startup recovery removes one left by a crash.
+    pub fn import_temp(&self) -> PathBuf {
+        let nanos = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+        self.dir.join(format!("{IMPORT_PREFIX}{nanos:x}.wav"))
+    }
+
+    /// An upload (REC-12) as a `recorded` meeting, `wav` (from `import_temp`) as its `mic.wav`.
+    /// `meta.json` comes last, so nothing ever sees the meeting without its audio.
+    pub fn import(
+        &self,
+        wav: &Path,
+        created_at: time::OffsetDateTime,
+        duration_ms: u64,
+        summarize_local: bool,
+    ) -> Result<Meta, String> {
+        let now = time::OffsetDateTime::now_utc();
+        let mut meta = new_meta(now, created_at, "", Status::Recorded, summarize_local);
+        meta.duration_ms = duration_ms;
+        let dir = self.dir_for(&meta.id)?;
+        // create_dir (not _all): a folder already there is another meeting's, never cleaned up here.
+        if let Err(e) = fs::create_dir(&dir) {
+            let _ = fs::remove_file(wav);
+            return Err(format!("회의 폴더 생성 실패: {e}"));
+        }
+        let placed = rename(wav, &dir.join("mic.wav"))
+            .map_err(|e| format!("녹음 파일을 옮기지 못했습니다: {e}"))
+            .and_then(|_| self.write(&meta));
+        if let Err(e) = placed {
+            let _ = fs::remove_file(wav);
+            let _ = fs::remove_dir_all(&dir);
+            return Err(e);
+        }
         Ok(meta)
     }
 
@@ -507,9 +562,18 @@ impl Store {
     pub fn recover(&self) {
         // Delete step 4 can stop after meta.json is gone, leaving an empty folder. `remove_dir`
         // only removes an empty folder, so one that still holds files is never touched.
+        // An upload's temp file is a crash's leftover too (REC-12).
         if let Ok(entries) = fs::read_dir(&self.dir) {
             for entry in entries.flatten() {
-                let _ = fs::remove_dir(entry.path());
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(IMPORT_PREFIX)
+                {
+                    let _ = fs::remove_file(entry.path());
+                } else {
+                    let _ = fs::remove_dir(entry.path());
+                }
             }
         }
         for meta in self.list() {
@@ -1064,6 +1128,17 @@ mod tests {
         store.recover();
         assert!(!store.dir.join(&id).exists());
         assert!(orphan.join("mic.wav").exists());
+    }
+
+    #[test]
+    fn recovery_removes_an_upload_a_crash_left_half_decoded() {
+        let (_tmp, store) = store();
+        let temp = store.import_temp();
+        fs::write(&temp, b"RIFF").unwrap();
+        let kept = put(&store, Review).id;
+        store.recover();
+        assert!(!temp.exists());
+        assert!(store.dir.join(&kept).join("meta.json").exists());
     }
 
     #[test]

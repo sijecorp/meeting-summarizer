@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { open } from "@tauri-apps/plugin-dialog";
 import { Copy, Minus, Settings as SettingsIcon, Square, X } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { Banner, MAC, phase, Present, SijeLogo, WIDTH, WINDOWS, withModifier } from "@/components/common";
@@ -20,6 +21,7 @@ import { cn } from "@/lib/utils";
 import {
   confirmQuit,
   getMeeting,
+  importRecording,
   listMeetings,
   onGpuFailed,
   onMeetingProgress,
@@ -28,6 +30,7 @@ import {
   onRecordingStopped,
   onSlackFinished,
   queueState,
+  RECORDING_FILES,
   requestQuit,
   SCHEMA_VERSION,
   startRecording,
@@ -247,6 +250,24 @@ export default function App() {
       },
     );
   };
+  // REC-12: a recording made elsewhere joins the line like one just recorded, and its document
+  // opens while Home is still the screen. Held here, so leaving Home neither drops its failure nor
+  // offers a second import meanwhile.
+  const [importing, setImporting] = useState(false);
+  const importFile = (e: MouseEvent) => {
+    const keyboard = e.detail === 0;
+    open({ filters: [RECORDING_FILES] })
+      .then((path) => {
+        if (typeof path !== "string") return;
+        setImporting(true);
+        return importRecording(path).then((meta) => {
+          refresh();
+          go((s) => (s.name === "home" ? screenOf(meta) : s), keyboard);
+        });
+      })
+      .catch((err) => setNotice(`녹음 파일을 가져오지 못했습니다: ${err}`))
+      .finally(() => setImporting(false));
+  };
   // From the recording screen it goes on to the meeting; from the dock it stays where it is.
   const stop = () => {
     if (stopAsked.current) return;
@@ -390,12 +411,14 @@ export default function App() {
                   progress={progress}
                   recording={recording}
                   starting={starting}
+                  importing={importing}
                   morphFrom={from}
                   onChanged={refresh}
                   // Home presses a row's title into its glide only by pointer on an unscrolled page.
                   onOpen={(m, keyboard) => go(screenOf(m, !keyboard && !window.scrollY), keyboard)}
                   onRecord={() => go({ name: "recording" })}
                   onStart={start}
+                  onImport={importFile}
                   onSetup={(tab) => go({ name: "settings", tab })}
                 />
               )}

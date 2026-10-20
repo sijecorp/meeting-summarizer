@@ -75,11 +75,15 @@ fn open(path: &Path) -> Result<hound::WavReader<std::io::BufReader<std::fs::File
 }
 
 /// The recording's length in samples: the shorter track. `meta.json`'s `duration_ms` is not used
-/// (architecture 5.2): after a write error or a crash the WAV files hold less than that.
+/// (architecture 5.2): after a write error or a crash the WAV files hold less than that. An upload
+/// has `mic.wav` alone (REC-12).
 pub fn recording_len(dir: &Path) -> Result<u64, String> {
     let mic = open(&dir.join("mic.wav"))?.duration();
-    let system = open(&dir.join("system.wav"))?.duration();
-    Ok(mic.min(system).into())
+    let system = dir.join("system.wav");
+    if !system.exists() {
+        return Ok(mic.into());
+    }
+    Ok(mic.min(open(&system)?.duration()).into())
 }
 
 /// `len` samples from `start`, fewer at the end of the file.
@@ -100,10 +104,15 @@ fn read(path: &Path, start: u64, len: usize) -> Result<Vec<f32>, String> {
         .collect()
 }
 
-/// Both tracks for `[start, start + len)` samples, gated and mixed in memory (never written).
+/// Both tracks for `[start, start + len)` samples, gated and mixed in memory (never written). An
+/// upload's one track as it is.
 pub fn mixed(dir: &Path, start: u64, len: usize) -> Result<Vec<f32>, String> {
     let mut mic = read(&dir.join("mic.wav"), start, len)?;
-    let system = read(&dir.join("system.wav"), start, len)?;
+    let system = dir.join("system.wav");
+    if !system.exists() {
+        return Ok(mic);
+    }
+    let system = read(&system, start, len)?;
     let len = mic.len().min(system.len());
     mic.truncate(len);
     Gate::new().mix(&mut mic, &system[..len]);

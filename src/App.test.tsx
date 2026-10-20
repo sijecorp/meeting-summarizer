@@ -749,3 +749,51 @@ test("a shortcut waits while a select is open", async () => {
   expect(press(document.body, "KeyR")).toBe(false);
   expect(calls).not.toContain("start_recording");
 });
+
+test("REC-12: a picked recording file becomes a meeting, and its document opens", async () => {
+  const path = "/Users/hong/Downloads/주간 회의.m4a";
+  const calls: { cmd: string; args: unknown }[] = [];
+  let list = [meeting("지난 회의", "sent")];
+  mock((cmd, args) => {
+    calls.push({ cmd, args });
+    if (cmd === "list_meetings") return list;
+    if (cmd === "plugin:dialog|open") return path;
+    if (cmd === "import_recording") {
+      list = [meeting("가져온 회의", "recorded"), ...list];
+      return list[0];
+    }
+    if (cmd === "get_meeting") return { meta: list[0], summary: "", sending: false };
+  });
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "녹음 파일 가져오기" }));
+
+  expect(await screen.findByRole("heading", { level: 1, name: "가져온 회의" })).toBeTruthy();
+  expect(calls.find((c) => c.cmd === "import_recording")?.args).toEqual({ path });
+  expect(calls.find((c) => c.cmd === "plugin:dialog|open")?.args).toMatchObject({
+    options: { filters: [{ extensions: expect.arrayContaining(["mp3", "m4a", "wav"]) }] },
+  });
+});
+
+test("REC-12: a cancelled pick does nothing; a file that cannot be read says why, wherever the recorder is", async () => {
+  let picked: string | null = null;
+  const calls: string[] = [];
+  mock((cmd) => {
+    calls.push(cmd);
+    if (cmd === "list_meetings") return [meeting("지난 회의", "sent")];
+    if (cmd === "plugin:dialog|open") return picked;
+    if (cmd === "import_recording") throw "지원하지 않는 오디오 형식입니다";
+  });
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "녹음 파일 가져오기" }));
+  await waitFor(() => expect(calls).toContain("plugin:dialog|open"));
+  expect(calls).not.toContain("import_recording");
+
+  picked = "/Users/hong/notes.mp3";
+  fireEvent.click(screen.getByRole("button", { name: "녹음 파일 가져오기" }));
+  // Off to settings meanwhile: the failure follows.
+  fireEvent.click(screen.getByRole("button", { name: "설정" }));
+  expect(await screen.findByText("녹음 파일을 가져오지 못했습니다: 지원하지 않는 오디오 형식입니다")).toBeTruthy();
+  expect(screen.getByRole("heading", { level: 1, name: "설정" })).toBeTruthy();
+});
