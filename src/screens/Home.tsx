@@ -429,8 +429,12 @@ export default function Home({
   // the ring around the record button. No tour, no checklist: recording needs no setup.
   if (meetings?.length === 0) {
     return (
-      // Centered in the window under the header, clear of the dock's room (App.tsx `pb-24`).
-      <main className="mx-auto box-content flex min-h-[calc(100dvh-9rem)] max-w-home flex-col items-center justify-center gap-12 px-8 py-10 text-center">
+      // Centered in the window under the header, as tall as the room there so nothing scrolls. Half
+      // of App's dock room (`pb-24`) is given back (`-mb-12`): the dock takes the bottom 80px, so it
+      // still clears the content. The gaps follow the window's height (48px from 960 high, 36 at the
+      // default 720, 30 at the smallest window, 600) and centering puts the rest above and below, so
+      // a resized window never scrolls either.
+      <main className="mx-auto -mb-12 box-content flex min-h-[calc(100dvh-6rem)] max-w-home flex-col items-center justify-center gap-[clamp(1rem,5dvh,3rem)] px-8 text-center">
         {errorBanner}
         <div className="space-y-4">
           <h1 tabIndex={-1} className="font-display text-display-l outline-hidden">
