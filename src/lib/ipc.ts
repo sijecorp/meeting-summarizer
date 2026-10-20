@@ -266,6 +266,10 @@ export const isRecordingFile = (path: string) =>
 /** REC-12: the picked recording file as a new `recorded` meeting, queued like a finished recording.
  * Resolves once it is decoded (seconds for an hour). */
 export const importRecording = (path: string) => invoke<Meta>("import_recording", { path });
+/** How far an import has decoded its file: `name` is the file's name, `percent` 0 to 100. */
+export type ImportProgress = { name: string; percent: number };
+export const onImportProgress = (handler: (p: ImportProgress) => void) =>
+  listen<ImportProgress>("import://progress", (e) => handler(e.payload));
 /** Resolves once both WAV files are closed; returns the meeting id. */
 export const stopRecording = () => invoke<string | null>("stop_recording");
 export const recordingState = () => invoke<RecordingState | null>("recording_state");

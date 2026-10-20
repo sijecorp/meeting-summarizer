@@ -1001,16 +1001,25 @@ const handlers: Handlers = {
     if (filters.includes("mp3")) return "/Users/hong/Downloads/주간 회의.m4a";
     return `/Users/hong/Downloads/${filters.includes("gguf") ? SUMMARY_MODEL.file : models.files[0].file}`;
   },
-  // REC-12: a 37-minute file that ended a minute ago, decoded in a second and a half.
-  import_recording: () =>
-    later(1500, () => {
-      const m = stored("recorded", new Date(Date.now() - 38 * 60_000), {
-        duration_ms: 37 * 60_000,
-        summarize_local: settings.summarize_local_by_default,
-      });
-      meetings.push(m);
-      enqueue(m);
-      return clone(m.meta);
+  // REC-12: a 37-minute file that ended a minute ago, decoded in two seconds, 5% at a time.
+  import_recording: (a) =>
+    new Promise((resolve) => {
+      const name = String(a.path).split("/").pop();
+      let percent = 0;
+      const timer = setInterval(() => {
+        send("import://progress", { name, percent });
+        percent += 5;
+        if (percent <= 100) return;
+        clearInterval(timer);
+        const m = stored("recorded", new Date(Date.now() - 38 * 60_000), {
+          duration_ms: 37 * 60_000,
+          summarize_local: settings.summarize_local_by_default,
+        });
+        meetings.push(m);
+        enqueue(m);
+        resolve(clone(m.meta));
+      }, 100);
+      timers.push(timer);
     }),
 
   confirm_quit: () => {

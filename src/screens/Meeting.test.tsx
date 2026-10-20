@@ -622,7 +622,8 @@ test("the header says when, how long and who recorded; a title waits for the sum
   render(<Meeting id={id} {...props} listed={{ ...meta({ status: "transcribing", title: "" }), interrupted: false }} />);
 
   // From the list at once, so the title can glide in from its row.
-  expect(screen.getByRole("heading", { level: 1, name: "제목은 요약 뒤에 붙어요" })).toBeTruthy();
+  expect(screen.getByRole("heading", { level: 1, name: "제목 준비 중" })).toBeTruthy();
+  expect(screen.getByText("열심히 듣는 중…")).toBeTruthy();
   expect(screen.getByText(when)).toBeTruthy();
   expect(await screen.findByText("42분")).toBeTruthy();
   expect(await screen.findByText("녹음 홍길동")).toBeTruthy();
@@ -1094,7 +1095,8 @@ test("the summary arrives in place once ready, as a document to edit", async () 
   const { rerender } = render(<Meeting id={id} {...props} progress={progress({})} />);
   expect(await screen.findByText("요약을 쓰고 있어요")).toBeTruthy();
   // The place for the title says it is not there yet, in ink-2.
-  expect(screen.getByRole("heading", { level: 1, name: "제목은 요약 뒤에 붙어요" }).className).toMatch(/text-ink-2/);
+  expect(screen.getByRole("heading", { level: 1, name: "제목 준비 중" }).className).toMatch(/text-ink-2/);
+  expect(screen.getByText("열심히 읽는 중…")).toBeTruthy();
 
   Object.assign(detail, { meta: meta({ status: "review" }), summary: "## 결정사항\n- 미정" });
   rerender(<Meeting id={id} {...props} progress={progress({ status: "review" })} />);
@@ -1273,4 +1275,36 @@ test("a summary on this PC says while its engine starts", async () => {
   expect(screen.queryByText("요약을 쓰고 있어요")).toBeNull();
   rerender(<Meeting id={id} {...props} progress={progress({ engine_since: null })} />);
   expect(await screen.findByText("요약을 쓰고 있어요")).toBeTruthy();
+});
+
+// Design-system 6.6: the title's place says what is going on, a new line every 2 s, per stage.
+test("until the title comes, its place turns over a line every 2 seconds, and screen readers hear one name", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  mock({ meta: meta({ status: "transcribing", title: "" }), summary: "" });
+  const { rerender } = render(<Meeting id={id} {...props} progress={progress({ status: "transcribing" })} />);
+  const heading = await screen.findByRole("heading", { level: 1, name: "제목 준비 중" });
+  // The line on screen, once the one it replaced has faded out.
+  const shows = (line: string) =>
+    waitFor(() =>
+      expect([...heading.querySelectorAll("[aria-hidden]")].map((s) => s.textContent)).toEqual([line]),
+    );
+
+  await shows("열심히 듣는 중…");
+  await act(() => vi.advanceTimersByTimeAsync(2000));
+  await shows("말을 글로 옮기는 중…");
+  await act(() => vi.advanceTimersByTimeAsync(4000));
+  // Around again.
+  await shows("열심히 듣는 중…");
+
+  // The summary started: its own lines, from the first.
+  rerender(<Meeting id={id} {...props} progress={progress({ status: "summarizing" })} />);
+  await shows("열심히 읽는 중…");
+  expect(screen.getByRole("heading", { level: 1, name: "제목 준비 중" })).toBe(heading);
+
+  // In line behind another meeting.
+  cleanup();
+  mock({ meta: meta({ status: "recorded", title: "" }), summary: "" });
+  render(<Meeting id={id} {...props} progress={progress({ status: "recorded", position: 2 })} />);
+  const waiting = await screen.findByRole("heading", { level: 1, name: "제목 준비 중" });
+  expect(waiting.querySelector("[aria-hidden]")?.textContent).toBe("차례를 기다리는 중…");
 });

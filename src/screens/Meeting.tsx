@@ -76,6 +76,7 @@ import {
   Steps,
   TITLE,
   TranscriptPanel,
+  WaitingTitle,
 } from "@/screens/MeetingParts";
 import type { SettingsTab } from "@/screens/Settings";
 
@@ -697,7 +698,20 @@ export default function Meeting({
                   />
                 </Grow>
               ) : (
-                meta.title || (reviewable ? "제목 없음" : "제목은 요약 뒤에 붙어요")
+                meta.title ||
+                (reviewable || !now ? (
+                  "제목 없음"
+                ) : (
+                  <WaitingTitle
+                    stage={
+                      now === "waiting"
+                        ? "waiting"
+                        : (progress?.status ?? meta.status) === "summarizing"
+                          ? "summarizing"
+                          : "transcribing"
+                    }
+                  />
+                ))
               )}
             </h1>
           </motion.div>

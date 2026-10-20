@@ -169,9 +169,10 @@ pub fn start_recording(
     started
 }
 
-/// REC-12: the recording file at `path` (the file picker's) as a new `recorded` meeting, queued
+/// REC-12: the recording file at `path` (picked or dropped) as a new `recorded` meeting, queued
 /// like one that just finished recording. "로컬로 요약" starts as for a recording (SUM-08). On a
-/// blocking thread: an hour of audio takes seconds to decode.
+/// blocking thread: an hour of audio takes seconds to decode. `import://progress` (`{ name,
+/// percent }`, the file's name) says how far it is.
 #[tauri::command]
 pub async fn import_recording(app: AppHandle, path: String) -> Result<Meta, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -180,10 +181,18 @@ pub async fn import_recording(app: AppHandle, path: String) -> Result<Meta, Stri
             .load()
             .map(|l| l.settings)
             .unwrap_or_default();
+        let path = Path::new(&path);
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
         let meta = audio::import::import(
             &app.state::<Store>(),
-            Path::new(&path),
+            path,
             settings.summarize_local_by_default,
+            |percent| {
+                let progress = serde_json::json!({ "name": name, "percent": percent });
+                if let Err(e) = app.emit("import://progress", progress) {
+                    log::warn!("가져오기 진행률 전송 실패: {e}");
+                }
+            },
         )?;
         app.state::<Queue>().enqueue(&meta.id, meta.status);
         Ok(meta)

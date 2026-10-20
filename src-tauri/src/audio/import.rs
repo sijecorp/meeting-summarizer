@@ -8,13 +8,16 @@ use super::SPEC;
 use super::writer::Pipe;
 use crate::store::{Meta, Store};
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use symphonia::core::audio::{SampleBuffer, SignalSpec};
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
 use symphonia::core::errors::Error;
 use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use time::{Duration, OffsetDateTime};
@@ -28,10 +31,16 @@ const UNSUPPORTED_CODEC: &str =
 const TOO_LONG: &str = "4시간보다 긴 녹음은 가져올 수 없습니다";
 
 /// `path` as a new `recorded` meeting. Its start is the file's last change (a recorder saves at the
-/// end) less its length, never later than now less its length.
-pub fn import(store: &Store, path: &Path, summarize_local: bool) -> Result<Meta, String> {
+/// end) less its length, never later than now less its length. `progress` hears how much of the
+/// file is decoded, 0 to 100, each time that changes.
+pub fn import(
+    store: &Store,
+    path: &Path,
+    summarize_local: bool,
+    progress: impl FnMut(u8),
+) -> Result<Meta, String> {
     let temp = store.import_temp();
-    let decoded = decode(path, &temp);
+    let decoded = decode(path, &temp, progress);
     let samples = match decoded {
         Ok(samples) => samples,
         Err(e) => {
@@ -52,10 +61,50 @@ fn started(modified: Option<SystemTime>, now: SystemTime, duration_ms: u64) -> O
     OffsetDateTime::from(ended) - Duration::milliseconds(duration_ms as i64)
 }
 
+/// The file being decoded, counting how far it has been read: the decode's progress for every
+/// container (not all of them say how many frames they hold).
+struct Reading {
+    file: File,
+    at: Arc<AtomicU64>,
+}
+
+impl Read for Reading {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.file.read(buf)?;
+        self.at.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+impl Seek for Reading {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let at = self.file.seek(to)?;
+        self.at.store(at, Ordering::Relaxed);
+        Ok(at)
+    }
+}
+
+impl MediaSource for Reading {
+    fn is_seekable(&self) -> bool {
+        self.file.is_seekable()
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        self.file.byte_len()
+    }
+}
+
 /// Decodes the first audio track of `path` into `out`, a 16 kHz mono 16-bit WAV. Returns its
-/// length in samples. A corrupt frame is skipped, as players do.
-fn decode(path: &Path, out: &Path) -> Result<u64, String> {
+/// length in samples. A corrupt frame is skipped, as players do. `progress`: the share of the file
+/// read so far, in percent, when it changes.
+fn decode(path: &Path, out: &Path, mut progress: impl FnMut(u8)) -> Result<u64, String> {
     let file = File::open(path).map_err(|e| format!("파일을 열 수 없습니다: {e}"))?;
+    let size = file.metadata().map_or(0, |m| m.len()).max(1);
+    let at = Arc::new(AtomicU64::new(0));
+    let file = Reading {
+        file,
+        at: at.clone(),
+    };
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
@@ -94,7 +143,13 @@ fn decode(path: &Path, out: &Path) -> Result<u64, String> {
     let mut interleaved: Option<SampleBuffer<f32>> = None;
     let mut mono = Vec::new();
     let mut written = 0u64;
+    let mut told = None;
     loop {
+        let percent = (at.load(Ordering::Relaxed).min(size) * 100 / size) as u8;
+        if told != Some(percent) {
+            told = Some(percent);
+            progress(percent);
+        }
         let packet = match format.next_packet() {
             Ok(packet) => packet,
             // The end of the file; a chained Ogg stream ends with its first part.
@@ -140,6 +195,9 @@ fn decode(path: &Path, out: &Path) -> Result<u64, String> {
     }
     wav.finalize()
         .map_err(|e| format!("녹음 파일을 쓰지 못했습니다: {e}"))?;
+    if told != Some(100) {
+        progress(100);
+    }
     if written == 0 {
         return Err("파일에서 소리를 읽지 못했습니다".into());
     }
@@ -173,7 +231,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (src, out) = (tmp.path().join("회의.wav"), tmp.path().join("mic.wav"));
         tone(&src, 3);
-        let samples = decode(&src, &out).unwrap();
+        let mut told = Vec::new();
+        let samples = decode(&src, &out, |p| told.push(p)).unwrap();
+        // How much of the file is read: rising, each value once, to the end.
+        assert!(told.windows(2).all(|w| w[0] < w[1]), "{told:?}");
+        assert_eq!((told.first(), told.last()), (Some(&0), Some(&100)));
+        assert!(told.len() > 2, "{told:?}");
         // The resampler holds back less than one 1024-frame chunk at the end.
         assert!((47_000..=48_000).contains(&samples), "{samples}");
         let reader = hound::WavReader::open(&out).unwrap();
@@ -193,7 +256,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (src, out) = (tmp.path().join("notes.mp3"), tmp.path().join("mic.wav"));
         std::fs::write(&src, "회의 메모입니다").unwrap();
-        assert_eq!(decode(&src, &out).unwrap_err(), UNSUPPORTED);
+        assert_eq!(decode(&src, &out, |_| {}).unwrap_err(), UNSUPPORTED);
     }
 
     #[test]
@@ -213,7 +276,7 @@ mod tests {
         let store = Store::new(tmp.path().join("meetings")).unwrap();
         let src = tmp.path().join("주간 회의.wav");
         tone(&src, 2);
-        let meta = import(&store, &src, true).unwrap();
+        let meta = import(&store, &src, true, |_| {}).unwrap();
         assert_eq!(meta.status, crate::store::Status::Recorded);
         assert!(meta.summarize_local);
         assert!(
@@ -231,7 +294,7 @@ mod tests {
         assert_eq!(store.list(), [meta]);
         // A failed upload leaves nothing behind.
         std::fs::write(&src, "x").unwrap();
-        assert!(import(&store, &src, false).is_err());
+        assert!(import(&store, &src, false, |_| {}).is_err());
         assert_eq!(
             std::fs::read_dir(tmp.path().join("meetings"))
                 .unwrap()

@@ -24,6 +24,7 @@ import {
   getMeeting,
   importRecording,
   isRecordingFile,
+  onImportProgress,
   listMeetings,
   onGpuFailed,
   onMeetingProgress,
@@ -37,6 +38,7 @@ import {
   SCHEMA_VERSION,
   startRecording,
   stopRecording,
+  type ImportProgress,
   type MeetingItem,
   type Meta,
   type Progress,
@@ -257,12 +259,26 @@ export default function App() {
   // screen. Held here, so leaving Home neither drops a failure nor the busy state. A count: a drop
   // can come while another import runs.
   const [importing, setImporting] = useState(0);
+  // The file being decoded and how far, for the dock. The first event comes as decoding starts.
+  const [imported, setImported] = useState<ImportProgress | null>(null);
+  useEffect(() => {
+    const unlisten = onImportProgress(setImported);
+    unlisten.catch((e) => setNotice(`가져오기 진행률을 받지 못했습니다: ${e}`));
+    return () => {
+      unlisten.then((stop) => stop(), () => {});
+    };
+  }, []);
+  useEffect(() => {
+    if (!importing) setImported(null);
+  }, [importing]);
   const importPaths = async (paths: string[], keyboard: boolean) => {
     setImporting((n) => n + 1);
     const failed: string[] = [];
     let last: Meta | null = null;
     // One after another, so the line keeps the order of one drop.
     for (const path of paths) {
+      // Its own name from the start, not the last file's 100%.
+      setImported({ name: path.split(/[\\/]/).pop() ?? path, percent: 0 });
       try {
         last = await importRecording(path);
       } catch (err) {
@@ -498,6 +514,7 @@ export default function App() {
             live={live}
             stopping={ending}
             queue={[...running, ...waiting]}
+            imported={importing ? imported : null}
             progress={progress}
             hidden={screen.name === "recording"}
             onRecording={(keyboard) => go({ name: "recording" }, keyboard)}

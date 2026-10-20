@@ -1,4 +1,4 @@
-import { useEffect, useRef, type ComponentProps, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Check, ChevronRight, CircleAlert, Copy, Lock, Send, X } from "lucide-react";
 import { AnimatePresence, motion, useTransform, type Variants } from "motion/react";
@@ -28,6 +28,47 @@ import { cn } from "@/lib/utils";
  * glyphs reaching a pixel or two past the last line, so the textarea has nothing to scroll. */
 export const BODY =
   "block w-full p-0 pb-1 font-sans text-body-doc text-ink whitespace-pre-wrap break-keep wrap-break-word [tab-size:4]";
+/** What is going on while the summary is still to come (design-system 6.6), in the title's place. */
+const WAITING_LINES = {
+  transcribing: ["열심히 듣는 중…", "말을 글로 옮기는 중…", "조금만 기다려 주세요…"],
+  summarizing: ["열심히 읽는 중…", "중요한 내용을 고르는 중…", "조금만 기다려 주세요…"],
+  waiting: ["차례를 기다리는 중…", "조금만 기다려 주세요…"],
+};
+export type WaitingStage = keyof typeof WAITING_LINES;
+/** Each line stays this long. */
+export const LINE_MS = 2000;
+
+/** The title's place until there is one: a new line every 2 s, crossfading (opacity only, so
+ * Reduce Motion keeps it). A screen reader hears one steady name instead of a change every 2 s. */
+export function WaitingTitle({ stage }: { stage: WaitingStage }) {
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    setTick(0);
+    const timer = window.setInterval(() => setTick((n) => n + 1), LINE_MS);
+    return () => window.clearInterval(timer);
+  }, [stage]);
+  const lines = WAITING_LINES[stage];
+  const line = lines[tick % lines.length];
+  return (
+    <>
+      <span className="sr-only">제목 준비 중</span>
+      <AnimatePresence mode="popLayout" initial={false}>
+        <motion.span
+          key={`${stage}:${line}`}
+          aria-hidden
+          className="inline-block"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: dur.medium }}
+        >
+          {line}
+        </motion.span>
+      </AnimatePresence>
+    </>
+  );
+}
+
 /** The title's: serif `display-l`, wrapping like the body. */
 export const TITLE =
   "block w-full p-0 pb-1 font-display text-display-l text-ink whitespace-pre-wrap break-keep wrap-break-word";

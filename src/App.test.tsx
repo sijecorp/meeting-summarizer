@@ -864,3 +864,25 @@ test("REC-12: several dropped go in line in order and stay put; failures name th
   ).toBeTruthy();
   expect(imported).toHaveLength(2);
 });
+
+test("REC-12: the dock shows the file being imported and how far, then lets go", async () => {
+  let finish: (m: MeetingItem) => void = () => {};
+  mock((cmd) => {
+    if (cmd === "list_meetings") return [meeting("지난 회의", "sent")];
+    if (cmd === "plugin:dialog|open") return "/Users/hong/긴 회의.mp3";
+    if (cmd === "import_recording") return new Promise((resolve) => (finish = resolve));
+    if (cmd === "get_meeting") return { meta: meeting("긴 회의", "recorded"), summary: "", sending: false };
+  });
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "녹음 파일 가져오기" }));
+  await act(() => emit("import://progress", { name: "긴 회의.mp3", percent: 42 }));
+
+  // The percent itself springs from 0 on a MotionValue, which jsdom does not run.
+  expect(await screen.findByText("녹음 파일 가져오기")).toBeTruthy();
+  expect(screen.getByText(/긴 회의\.mp3 · 가져오는 중/)).toBeTruthy();
+  expect(screen.getByRole("button", { name: "가져오는 중…" })).toBeTruthy();
+
+  await act(async () => finish(meeting("긴 회의", "recorded")));
+  await waitFor(() => expect(screen.queryByText("녹음 파일 가져오기")).toBeNull());
+});

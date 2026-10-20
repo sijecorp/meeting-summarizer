@@ -13,7 +13,7 @@ import {
   sinceStart,
   useFollow,
 } from "@/components/common";
-import { onRecordingLevel, type MeetingItem, type Progress } from "@/lib/ipc";
+import { onRecordingLevel, type ImportProgress, type MeetingItem, type Progress } from "@/lib/ipc";
 import { dur, spring } from "@/lib/motion";
 
 // The dock (design-system 6.2): the app's one live element, an ink pill at the bottom. It records,
@@ -111,10 +111,10 @@ function jobOf(m: MeetingItem, p: Progress | undefined) {
 
 const ARC = { cx: 12, cy: 12, r: 9, fill: "none", strokeWidth: 2.5 };
 
-/** Processing: a ring and "처리 중 N" over the head of the line. One spring drives the ring and
- * the percent, rendered from the MotionValue without a re-render per frame. Keyed by meeting, so a
- * new one starts from its own value. */
-function Processing({ count, job }: { count: number; job: ReturnType<typeof jobOf> }) {
+/** Processing: a ring and "처리 중 N" (`title`) over the head of the line, or an import's file. One
+ * spring drives the ring and the percent, rendered from the MotionValue without a re-render per
+ * frame. Keyed by meeting or file, so a new one starts from its own value. */
+function Processing({ title, job }: { title: string; job: ReturnType<typeof jobOf> }) {
   const value = useFollow(job.percent ?? 0);
   const length = useTransform(value, (v) => v / 100);
   const text = useTransform(value, (v) => `${Math.round(v)}%`);
@@ -131,7 +131,7 @@ function Processing({ count, job }: { count: number; job: ReturnType<typeof jobO
         )}
       </svg>
       <span className="grid min-w-0 text-left">
-        <span className="text-label">처리 중 {count}</span>
+        <span className="text-label">{title}</span>
         <span className="max-w-64 truncate text-caption text-dock-2">
           {job.name} · {job.step}
           {job.shown && (
@@ -146,10 +146,12 @@ function Processing({ count, job }: { count: number; job: ReturnType<typeof jobO
   );
 }
 
-type Mode = "recording" | "processing" | "idle";
+type Mode = "recording" | "importing" | "processing" | "idle";
 /** Said once per change (politely), never per tick. */
 function announcement(was: Mode, now: Mode) {
   if (now === "recording") return "녹음을 시작했습니다";
+  if (now === "importing") return "녹음 파일을 가져오고 있습니다";
+  if (was === "importing" && now === "idle") return "녹음 파일 가져오기를 마쳤습니다";
   if (was === "recording") return now === "processing" ? "녹음을 마쳤습니다. 처리를 시작합니다" : "녹음을 마쳤습니다";
   return now === "processing" ? "처리를 시작했습니다" : "처리를 마쳤습니다";
 }
@@ -159,6 +161,7 @@ export default function Dock({
   stopping,
   queue,
   progress,
+  imported,
   hidden,
   onRecording,
   onStop,
@@ -171,6 +174,8 @@ export default function Dock({
   /** Meetings being processed first, then the ones waiting, by place in line. */
   queue: MeetingItem[];
   progress: Record<string, Progress>;
+  /** A recording file being imported (REC-12): shown over processing, which it is about to join. */
+  imported?: ImportProgress | null;
   /** The recording screen shows all of this itself. */
   hidden: boolean;
   /** `keyboard`: a key pressed it, so the screen change does not move (design-system 5). */
@@ -179,7 +184,7 @@ export default function Dock({
   onOpen: (meeting: MeetingItem, keyboard: boolean) => void;
 }) {
   // Recording stops every worker (TRN-09), so processing waits behind it.
-  const mode: Mode = live ? "recording" : queue.length ? "processing" : "idle";
+  const mode: Mode = live ? "recording" : imported ? "importing" : queue.length ? "processing" : "idle";
   const [said, setSaid] = useState("");
   const last = useRef(mode);
   useEffect(() => {
@@ -203,18 +208,31 @@ export default function Dock({
           key: "recording",
           body: <Recording startedAt={live.created_at} onOpen={onRecording} onStop={stop} />,
         }
-    : job && {
-        key: "processing",
-        body: (
-          <button
-            aria-label={[`처리 중 ${queue.length}`, job.name, job.shown ? `${job.step} ${job.percent}%` : job.step].join(" · ")}
-            className={`${PART} min-w-0 gap-3 pr-5 pl-3 hover:bg-white/10`}
-            onClick={(e) => onOpen(head, e.detail === 0)}
-          >
-            <Processing key={head.id} count={queue.length} job={job} />
-          </button>
-        ),
-      };
+    : imported
+      ? {
+          key: "importing",
+          body: (
+            <div className={`${PART} min-w-0 gap-3 pr-5 pl-3`}>
+              <Processing
+                key={imported.name}
+                title="녹음 파일 가져오기"
+                job={{ name: imported.name, step: "가져오는 중", percent: imported.percent, shown: true, running: true }}
+              />
+            </div>
+          ),
+        }
+      : job && {
+          key: "processing",
+          body: (
+            <button
+              aria-label={[`처리 중 ${queue.length}`, job.name, job.shown ? `${job.step} ${job.percent}%` : job.step].join(" · ")}
+              className={`${PART} min-w-0 gap-3 pr-5 pl-3 hover:bg-white/10`}
+              onClick={(e) => onOpen(head, e.detail === 0)}
+            >
+              <Processing key={head.id} title={`처리 중 ${queue.length}`} job={job} />
+            </button>
+          ),
+        };
 
   // In App's bottom stack, under a meeting's send bar.
   return (
