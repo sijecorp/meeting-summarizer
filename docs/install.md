@@ -104,7 +104,7 @@ IT 담당자용:
 1. 새 버전이면 먼저 `src-tauri/tauri.conf.json`의 `version`을 올려 master에 push합니다. 파일 이름에 이 버전이 들어갑니다.
 2. 워크플로를 실행합니다. 둘 중 하나입니다.
    - 저장소의 Actions 탭 > 왼쪽 목록의 build > "Run workflow" > 브랜치 master > "Run workflow"
-   - 버전 태그 push: `git tag v0.1.0 && git push origin v0.1.0`
+   - 버전 태그 push: `git tag v1.0.0 && git push origin v1.0.0`
 3. 실행이 끝나면 그 실행 페이지 아래쪽 "Artifacts"에서 `meeting-summarizer-macos-arm64`와 `meeting-summarizer-windows-x64`를 받습니다. zip으로 받아지니 풀어서 `.dmg`와 `-setup.exe`를 꺼냅니다.
 4. 두 파일을 OneDrive 공유 폴더에 올리고 동료들에게 링크와 이 문서를 알립니다.
 
