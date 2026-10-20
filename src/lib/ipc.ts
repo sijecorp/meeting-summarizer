@@ -260,6 +260,9 @@ export type Stopped = { id: string; message: string | null };
 export const startRecording = () => invoke<RecordingState>("start_recording");
 /** REC-12's file picker: the formats the app decodes (audio/import.rs). */
 export const RECORDING_FILES = { name: "녹음 파일", extensions: ["mp3", "m4a", "mp4", "wav", "aac", "flac", "ogg"] };
+/** A path the picker would offer: what a drop on the window is checked against. */
+export const isRecordingFile = (path: string) =>
+  RECORDING_FILES.extensions.includes(path.split(".").pop()?.toLowerCase() ?? "");
 /** REC-12: the picked recording file as a new `recorded` meeting, queued like a finished recording.
  * Resolves once it is decoded (seconds for an hour). */
 export const importRecording = (path: string) => invoke<Meta>("import_recording", { path });

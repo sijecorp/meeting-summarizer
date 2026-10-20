@@ -1,6 +1,6 @@
 import type { InvokeArgs } from "@tauri-apps/api/core";
 import { emit } from "@tauri-apps/api/event";
-import { mockIPC } from "@tauri-apps/api/mocks";
+import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import type * as ipc from "@/lib/ipc";
 import {
   BUILTIN,
@@ -1031,6 +1031,7 @@ function handle(cmd: string, args: Args) {
 export function install(scenario: Scenario) {
   reset(scenario);
   mockIPC((cmd, args?: InvokeArgs) => handle(cmd, (args ?? {}) as Args), { shouldMockEvents: true });
+  mockWindows("main");
   // The mock's unlisten reads `id`, but the API (2.12) sends `eventId`: without this, a listener
   // StrictMode removed stays and every later emit warns about its missing callback.
   const internals = (window as unknown as { __TAURI_INTERNALS__: { invoke: (...a: unknown[]) => unknown } })

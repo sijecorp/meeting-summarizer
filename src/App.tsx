@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent } from "react";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Copy, Minus, Settings as SettingsIcon, Square, X } from "lucide-react";
+import { Copy, FileAudio, Minus, Settings as SettingsIcon, Square, X } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { Banner, MAC, phase, Present, SijeLogo, WIDTH, WINDOWS, withModifier } from "@/components/common";
 import Dock from "@/components/Dock";
@@ -16,12 +17,13 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
-import { bannerVariants, screenVariants, type ScreenMove } from "@/lib/motion";
+import { bannerVariants, dur, screenVariants, type ScreenMove } from "@/lib/motion";
 import { cn } from "@/lib/utils";
 import {
   confirmQuit,
   getMeeting,
   importRecording,
+  isRecordingFile,
   listMeetings,
   onGpuFailed,
   onMeetingProgress,
@@ -250,24 +252,56 @@ export default function App() {
       },
     );
   };
-  // REC-12: a recording made elsewhere joins the line like one just recorded, and its document
-  // opens while Home is still the screen. Held here, so leaving Home neither drops its failure nor
-  // offers a second import meanwhile.
-  const [importing, setImporting] = useState(false);
+  // REC-12: recordings made elsewhere join the line like ones just recorded, picked with Home's
+  // button or dropped anywhere on the window. One alone opens its document while Home is still the
+  // screen. Held here, so leaving Home neither drops a failure nor the busy state. A count: a drop
+  // can come while another import runs.
+  const [importing, setImporting] = useState(0);
+  const importPaths = async (paths: string[], keyboard: boolean) => {
+    setImporting((n) => n + 1);
+    const failed: string[] = [];
+    let last: Meta | null = null;
+    // One after another, so the line keeps the order of one drop.
+    for (const path of paths) {
+      try {
+        last = await importRecording(path);
+      } catch (err) {
+        failed.push(paths.length > 1 ? `${path.split(/[\\/]/).pop()}: ${err}` : String(err));
+      }
+    }
+    setImporting((n) => n - 1);
+    refresh();
+    const opened = last;
+    if (failed.length) setNotice(`녹음 파일을 가져오지 못했습니다: ${failed.join(" / ")}`);
+    else if (opened && paths.length === 1) go((s) => (s.name === "home" ? screenOf(opened) : s), keyboard);
+  };
   const importFile = (e: MouseEvent) => {
     const keyboard = e.detail === 0;
-    open({ filters: [RECORDING_FILES] })
-      .then((path) => {
-        if (typeof path !== "string") return;
-        setImporting(true);
-        return importRecording(path).then((meta) => {
-          refresh();
-          go((s) => (s.name === "home" ? screenOf(meta) : s), keyboard);
-        });
-      })
-      .catch((err) => setNotice(`녹음 파일을 가져오지 못했습니다: ${err}`))
-      .finally(() => setImporting(false));
+    open({ filters: [RECORDING_FILES] }).then(
+      (path) => void (typeof path === "string" && importPaths([path], keyboard)),
+      (err) => setNotice(`녹음 파일을 가져오지 못했습니다: ${err}`),
+    );
   };
+  // Files dragged over the window: it says where they go while any of them is a recording file.
+  const [dragging, setDragging] = useState(false);
+  useEffect(() => {
+    const unlisten = getCurrentWebview().onDragDropEvent(({ payload }) => {
+      if (payload.type === "enter") setDragging(payload.paths.some(isRecordingFile));
+      if (payload.type === "leave") setDragging(false);
+      if (payload.type !== "drop") return;
+      setDragging(false);
+      // Not while a dialog asks something (quitting, deleting): the drop was not meant for it.
+      if (document.querySelector(DIALOG)) return;
+      const files = payload.paths.filter(isRecordingFile);
+      if (files.length) void importPaths(files, false);
+      else if (payload.paths.length)
+        setNotice(`녹음 파일만 가져올 수 있습니다: ${RECORDING_FILES.extensions.join(", ")}`);
+    });
+    unlisten.catch((e) => setNotice(`파일 끌어다 놓기를 준비하지 못했습니다: ${e}`));
+    return () => {
+      unlisten.then((stop) => stop(), () => {});
+    };
+  }, []);
   // From the recording screen it goes on to the meeting; from the dock it stays where it is.
   const stop = () => {
     if (stopAsked.current) return;
@@ -411,7 +445,7 @@ export default function App() {
                   progress={progress}
                   recording={recording}
                   starting={starting}
-                  importing={importing}
+                  importing={importing > 0}
                   morphFrom={from}
                   onChanged={refresh}
                   // Home presses a row's title into its glide only by pointer on an unscrolled page.
@@ -472,6 +506,28 @@ export default function App() {
           />
         )}
       </motion.div>
+
+      {/* REC-12: the whole window takes a drop, so it says so while files are over it. */}
+      <AnimatePresence>
+        {dragging && (
+          <motion.div
+            key="drop"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: dur.small }}
+            className="pointer-events-none fixed inset-0 z-40 bg-paper/90 p-4"
+          >
+            <div className="grid size-full place-items-center rounded-float border-2 border-dashed border-brand/50">
+              <div className="flex flex-col items-center gap-3 text-center">
+                <FileAudio aria-hidden className="size-8 text-brand" />
+                <p className="text-title">놓으면 녹음 파일을 가져옵니다</p>
+                <p className="text-label text-ink-2">{RECORDING_FILES.extensions.join(", ")}</p>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <AlertDialog open={quitAsked} onOpenChange={setQuitAsked}>
         <AlertDialogContent>

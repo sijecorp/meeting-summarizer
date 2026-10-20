@@ -798,3 +798,69 @@ test("REC-12: a cancelled pick does nothing; a file that cannot be read says why
   expect(await screen.findByText("녹음 파일을 가져오지 못했습니다: 지원하지 않는 오디오 형식입니다")).toBeTruthy();
   expect(screen.getByRole("heading", { level: 1, name: "설정" })).toBeTruthy();
 });
+
+// REC-12: what the webview gets when files are dragged over the window and dropped.
+const drag = (type: "enter" | "leave" | "drop", paths: string[] = []) =>
+  act(() => emit(`tauri://drag-${type}`, { paths, position: { x: 0, y: 0 } }));
+
+test("REC-12: a recording file dropped anywhere is imported, and alone opens its document", async () => {
+  const calls: { cmd: string; args: unknown }[] = [];
+  let list = [meeting("지난 회의", "sent")];
+  mock((cmd, args) => {
+    calls.push({ cmd, args });
+    if (cmd === "list_meetings") return list;
+    if (cmd === "import_recording") {
+      list = [meeting("떨어뜨린 회의", "recorded"), ...list];
+      return list[0];
+    }
+    if (cmd === "get_meeting") return { meta: list[0], summary: "", sending: false };
+  });
+
+  render(<App />);
+  await screen.findByRole("button", { name: "녹음 파일 가져오기" });
+  // Not for a document or a picture.
+  await drag("enter", ["/Users/hong/메모.txt"]);
+  expect(screen.queryByText("놓으면 녹음 파일을 가져옵니다")).toBeNull();
+  await drag("enter", ["/Users/hong/메모.txt", "/Users/hong/주간 회의.M4A"]);
+  expect(screen.getByText("놓으면 녹음 파일을 가져옵니다")).toBeTruthy();
+  // Dragged out again: gone, nothing imported.
+  await drag("leave");
+  await waitFor(() => expect(screen.queryByText("놓으면 녹음 파일을 가져옵니다")).toBeNull());
+  expect(calls.map((c) => c.cmd)).not.toContain("import_recording");
+  await drag("enter", ["/Users/hong/주간 회의.M4A"]);
+
+  await drag("drop", ["/Users/hong/메모.txt", "/Users/hong/주간 회의.M4A"]);
+  expect(await screen.findByRole("heading", { level: 1, name: "떨어뜨린 회의" })).toBeTruthy();
+  expect(screen.queryByText("놓으면 녹음 파일을 가져옵니다")).toBeNull();
+  expect(calls.filter((c) => c.cmd === "import_recording").map((c) => c.args)).toEqual([
+    { path: "/Users/hong/주간 회의.M4A" },
+  ]);
+});
+
+test("REC-12: several dropped go in line in order and stay put; failures name their files", async () => {
+  const imported: string[] = [];
+  mock((cmd, args) => {
+    if (cmd === "list_meetings") return [meeting("지난 회의", "sent")];
+    if (cmd !== "import_recording") return;
+    const path = (args as { path: string }).path;
+    if (path.endsWith("깨진.mp3")) throw "지원하지 않는 오디오 형식입니다";
+    imported.push(path);
+    return meeting(path, "recorded");
+  });
+
+  render(<App />);
+  await screen.findByRole("button", { name: "녹음 파일 가져오기" });
+  await drag("drop", ["/a/월요일.wav", "/a/깨진.mp3", "/a/화요일.mp3"]);
+
+  expect(await screen.findByText("녹음 파일을 가져오지 못했습니다: 깨진.mp3: 지원하지 않는 오디오 형식입니다")).toBeTruthy();
+  expect(imported).toEqual(["/a/월요일.wav", "/a/화요일.mp3"]);
+  // Still on Home: several have no one document to open.
+  expect(screen.getByRole("button", { name: "녹음 파일 가져오기" })).toBeTruthy();
+
+  // Only files that are not recordings: said, nothing imported.
+  await drag("drop", ["/a/사진.png"]);
+  expect(
+    await screen.findByText("녹음 파일만 가져올 수 있습니다: mp3, m4a, mp4, wav, aac, flac, ogg"),
+  ).toBeTruthy();
+  expect(imported).toHaveLength(2);
+});
