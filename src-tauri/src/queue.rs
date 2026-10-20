@@ -1766,6 +1766,8 @@ mod tests {
         assert_eq!(job.stop, Some(Stop::Delete));
     }
 
+    /// For the unix tests below, which drive real processes through `sh`.
+    #[cfg(unix)]
     fn job(inner: &Mutex<Inner>, id: &str) {
         let mut inner = lock(inner);
         inner.sched.enqueue(id);
@@ -1773,6 +1775,7 @@ mod tests {
         inner.jobs.insert(id.into(), Job::default());
     }
 
+    #[cfg(unix)]
     fn sh(script: &str) -> Command {
         let mut command = Command::new("sh");
         command.args(["-c", script]);

@@ -27,7 +27,27 @@ fn main() {
         println!("cargo:rustc-link-lib=static=clang_rt.osx");
     }
     sidecar();
-    tauri_build::build()
+    tauri_build::try_build(tauri_build::Attributes::new().windows_attributes(windows_manifest()))
+        .expect("tauri-build failed");
+}
+
+/// Windows (MSVC): the Common Controls v6 manifest goes into every binary through the linker, the
+/// test executables too. tauri-build would put it in the app's resource file, which Cargo links
+/// into the [[bin]] alone: a test exe then loads comctl32 v5, which lacks `TaskDialogIndirect`
+/// (the dialog plugin's), and dies before any test with STATUS_ENTRYPOINT_NOT_FOUND
+/// (tauri-apps/tauri#13419). The manifest is tauri-build 2.7's own.
+fn windows_manifest() -> tauri_build::WindowsAttributes {
+    let target = std::env::var("TARGET").expect("cargo sets TARGET");
+    if !(target.contains("windows") && target.contains("msvc")) {
+        return tauri_build::WindowsAttributes::new();
+    }
+    let manifest =
+        std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets it"))
+            .join("windows-app-manifest.xml");
+    println!("cargo:rerun-if-changed=windows-app-manifest.xml");
+    println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+    println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
+    tauri_build::WindowsAttributes::new_without_app_manifest()
 }
 
 /// The llama-server sidecar (bundle.externalBin, M6.5 plan 5.1, DX2, ENG14). tauri-build fails
