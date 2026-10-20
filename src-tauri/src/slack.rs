@@ -404,7 +404,7 @@ fn classify(status: u16, body: &str) -> Result<Value, Failure> {
 
 /// The company workspace's Slack app (docs/slack-app.md). Not a secret: PKCE stands in for the
 /// client secret a desktop app could not keep.
-const CLIENT_ID: &str = "";
+const CLIENT_ID: &str = "5097318913044.12342682223031";
 /// The sign-in's loopback redirect, registered with the app (docs/slack-app.md): Slack wants it
 /// exactly.
 const PORT: u16 = 47815;
