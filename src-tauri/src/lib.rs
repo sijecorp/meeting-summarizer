@@ -332,6 +332,18 @@ pub fn run() {
             }
             tray.build(app)?;
             refresh_tray(app.handle());
+
+            // Last, once every command's state is managed: the page may call them as it loads. Built
+            // here (`create: false`) so Windows can go without its frame, the app header holding the
+            // window controls there. macOS keeps its traffic lights, over the header
+            // (`titleBarStyle: Overlay`, design-system 6.1).
+            let window = tauri::WebviewWindowBuilder::from_config(
+                app.handle(),
+                &app.config().app.windows[0],
+            )?;
+            #[cfg(windows)]
+            let window = window.decorations(false);
+            window.build()?;
             Ok(())
         })
         // Handles both the app menu and the tray menu.

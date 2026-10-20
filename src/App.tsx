@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent } from "react";
-import { Settings as SettingsIcon } from "lucide-react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { Copy, Minus, Settings as SettingsIcon, Square, X } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
-import { Banner, phase, Present, SijeLogo, WIDTH, withModifier } from "@/components/common";
+import { Banner, MAC, phase, Present, SijeLogo, WIDTH, WINDOWS, withModifier } from "@/components/common";
 import Dock from "@/components/Dock";
 import {
   AlertDialog,
@@ -15,6 +16,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { bannerVariants, screenVariants, type ScreenMove } from "@/lib/motion";
+import { cn } from "@/lib/utils";
 import {
   confirmQuit,
   getMeeting,
@@ -201,7 +203,7 @@ export default function App() {
 
   // Windows has no menu bar, so Ctrl+Q arrives here instead (architecture 8.5).
   useEffect(() => {
-    if (!navigator.userAgent.includes("Windows")) return;
+    if (!WINDOWS) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.code === "KeyQ") {
         e.preventDefault();
@@ -313,7 +315,17 @@ export default function App() {
 
   return (
     <div className="min-h-screen">
-      <header className="sticky top-0 z-10 flex h-12 items-center justify-between gap-4 border-b border-line bg-paper/92 px-6 backdrop-blur-md">
+      {/* The window's title bar too (design-system 6.1): it drags the window where nothing else is
+          under the pointer. macOS draws its traffic lights over the left end; Windows has no frame,
+          so the right end holds the window controls. */}
+      <header
+        data-tauri-drag-region
+        className={cn(
+          "sticky top-0 z-10 flex h-12 items-center justify-between gap-4 border-b border-line bg-paper/92 px-6 backdrop-blur-md",
+          MAC && "pl-24",
+          WINDOWS && "pr-0",
+        )}
+      >
         <button
           className="flex items-center gap-2.5 rounded-md text-body font-semibold"
           onClick={(e) => (screen.name === "meeting" ? leave(screen.id, e) : home(e))}
@@ -322,9 +334,12 @@ export default function App() {
           <span aria-hidden className="h-4 w-px bg-line" />
           회의 요약
         </button>
-        <Button variant="ghost" size="icon" aria-label="설정" onClick={() => go({ name: "settings" })}>
-          <SettingsIcon aria-hidden className="size-5" />
-        </Button>
+        <div className="flex items-center gap-2 self-stretch">
+          <Button variant="ghost" size="icon" aria-label="설정" onClick={() => go({ name: "settings" })}>
+            <SettingsIcon aria-hidden className="size-5" />
+          </Button>
+          {WINDOWS && <WindowControls />}
+        </div>
       </header>
 
       {/* A leaving banner pops out of the flow at once, so the screen's `layout` slides it up in
@@ -449,6 +464,46 @@ export default function App() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+    </div>
+  );
+}
+
+/** Windows only, where the window has no frame: minimize, maximize and close at the header's right
+ * end, full height like the system's. Closing hides the window to the tray like the frame's did
+ * (APP-01). */
+function WindowControls() {
+  const [maximized, setMaximized] = useState(false);
+  useEffect(() => {
+    const win = getCurrentWindow();
+    const sync = () => win.isMaximized().then(setMaximized, () => {});
+    sync();
+    const unlisten = win.onResized(sync);
+    return () => {
+      unlisten.then((stop) => stop(), () => {});
+    };
+  }, []);
+  // The focus ring inside the button: the last one meets the window's edge.
+  const control =
+    "grid w-12 place-items-center text-ink-2 transition-colors duration-150 hover:bg-sunken hover:text-ink focus-visible:-outline-offset-2";
+  return (
+    <div className="flex self-stretch">
+      <button aria-label="최소화" className={control} onClick={() => getCurrentWindow().minimize()}>
+        <Minus aria-hidden className="size-4" />
+      </button>
+      <button
+        aria-label={maximized ? "이전 크기로" : "최대화"}
+        className={control}
+        onClick={() => getCurrentWindow().toggleMaximize()}
+      >
+        {maximized ? <Copy aria-hidden className="size-3.5 -scale-x-100" /> : <Square aria-hidden className="size-3.5" />}
+      </button>
+      <button
+        aria-label="닫기"
+        className={cn(control, "hover:bg-danger-line hover:text-white")}
+        onClick={() => getCurrentWindow().close()}
+      >
+        <X aria-hidden className="size-4" />
+      </button>
     </div>
   );
 }

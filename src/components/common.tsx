@@ -234,7 +234,8 @@ export function RollingTime({ text, className = "" }: { text: string; className?
   );
 }
 
-const MAC = navigator.userAgent.includes("Mac");
+export const MAC = navigator.userAgent.includes("Mac");
+export const WINDOWS = navigator.userAgent.includes("Windows");
 /** The modifier shortcuts use here: ⌘ on macOS, Ctrl elsewhere. */
 export const withModifier = (e: KeyboardEvent) => (MAC ? e.metaKey : e.ctrlKey);
 const shortcut = (key: string) => ({

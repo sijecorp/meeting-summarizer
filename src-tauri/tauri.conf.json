@@ -13,8 +13,16 @@
     "windows": [
       {
         "title": "회의 요약",
-        "width": 800,
-        "height": 600
+        "width": 1040,
+        "height": 720,
+        "minWidth": 720,
+        "minHeight": 520,
+        "center": true,
+        "preventOverflow": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 18, "y": 26 },
+        "create": false
       }
     ],
     "security": {
