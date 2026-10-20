@@ -1493,13 +1493,12 @@ pub(crate) mod tests {
     fn the_server_is_the_bundled_one_and_the_override_is_for_debug_builds_only() {
         let exe = Path::new("/Applications/회의 요약.app/Contents/MacOS/meeting-summarizer");
         let bundled = exe.with_file_name(format!("llama-server{}", std::env::consts::EXE_SUFFIX));
-        let other = Some(OsString::from("/opt/homebrew/bin/llama-server"));
+        // Absolute on this OS: `/opt/homebrew/...` has no drive on Windows, so it is relative there.
+        let elsewhere = std::env::temp_dir().join("llama-server");
+        let other = Some(elsewhere.clone().into_os_string());
         assert_eq!(server_path(exe, true, None), bundled);
         assert_eq!(server_path(exe, false, other.clone()), bundled);
-        assert_eq!(
-            server_path(exe, true, other),
-            PathBuf::from("/opt/homebrew/bin/llama-server")
-        );
+        assert_eq!(server_path(exe, true, other), elsewhere);
         // Relative to where the app runs, not to the models folder the supervisor runs in.
         let relative = server_path(exe, true, Some("fake/llama-server".into()));
         assert!(relative.is_absolute() && relative.ends_with("fake/llama-server"));
