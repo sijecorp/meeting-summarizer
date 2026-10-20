@@ -2,6 +2,17 @@
 
 회의를 녹음하고 전사·요약해서 Slack으로 보내는 데스크톱 앱이다(Tauri 2, React, Rust). 동료용 설치 안내는 [docs/install.md](docs/install.md), 설계는 [docs/architecture.md](docs/architecture.md)에 있다.
 
+## 다운로드
+
+**[최신 버전 받기 (GitHub Releases)](https://github.com/sijecorp/meeting-summarizer/releases/latest)**
+
+| 컴퓨터 | 파일 |
+|---|---|
+| Mac (Apple 실리콘: M1 이후, macOS 14.6 이상) | `meeting-summarizer_<버전>_aarch64.dmg` |
+| Windows 10/11 (64비트) | `meeting-summarizer_<버전>_x64-setup.exe` |
+
+설치와 첫 실행(Mac의 "그래도 열기", Slack 로그인)은 [설치 안내](docs/install.md)를 따른다. 저장소가 비공개라 접근 권한이 있어야 받을 수 있다. 지난 버전은 [모든 릴리스](https://github.com/sijecorp/meeting-summarizer/releases)에 있다.
+
 ## 개발 시작
 
 ### 준비물
