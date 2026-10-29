@@ -7,6 +7,11 @@ on:
   workflow_dispatch:
   push:
     tags: ['v*']
+  # A tag's run reads only its own caches and master's, and a cache unused for 7 days is evicted, so
+  # every new tag built Windows from scratch (about 50 minutes). This run keeps master's caches warm.
+  # Mondays 03:30 KST, off the top of the hour when scheduled runs are delayed most.
+  schedule:
+    - cron: '30 18 * * 0'
 
 permissions:
   contents: read
