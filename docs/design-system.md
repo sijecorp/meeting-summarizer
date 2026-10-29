@@ -22,7 +22,7 @@
 - 카드마다 테두리와 그림자. 경계는 여백과 가는 구분선으로 만든다. 그림자는 떠 있는 층(독, 팝오버, 대화상자)에만 쓴다.
 - 이모지 아이콘. 아이콘은 지금처럼 `lucide-react`만 쓴다(획 두께 1.75로 통일).
 
-**앱 아이콘** (2026-10-29): 회사 심볼(보라색 네 조각, `src-tauri/icons/source/sije-symbol.png`)을 `#D2D6D9` 둥근 사각형 가운데에 둔다. macOS(`icon.icns`)는 Apple 아이콘 틀대로 1024 캔버스에 여백 100의 824 사각형(모서리 185)과 높이 400의 로고, 그 밖의 크기(Windows `icon.ico`, 트레이가 쓰는 PNG)는 여백 없는 1024 사각형(모서리 225)과 높이 500의 로고다. 두 원본은 `src-tauri/icons/source/`에 있고, `bun tauri icon <원본>`이 만든 파일 중 `icon.icns`는 macOS 원본에서, 나머지는 여백 없는 원본에서 가져온다.
+**앱 아이콘** (2026-10-29): 회사 심볼(보라색 네 조각, `src-tauri/icons/source/sije-symbol.png`)을 흰 둥근 사각형 가운데에 둔다. macOS(`icon.icns`)는 Apple 아이콘 틀대로 1024 캔버스에 여백 100의 824 사각형(모서리 185)과 높이 400의 로고, 그 밖의 크기(Windows `icon.ico`, 트레이가 쓰는 PNG)는 여백 없는 1024 사각형(모서리 225)과 높이 500의 로고다. 두 원본은 `src-tauri/icons/source/`에 있고, `bun tauri icon <원본>`이 만든 파일 중 `icon.icns`는 macOS 원본에서, 나머지는 여백 없는 원본에서 가져온다.
 
 ## 2. 타이포그래피
 
