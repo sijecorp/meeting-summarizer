@@ -1156,7 +1156,8 @@ test("a sent meeting's bar offers the other channels, says the summary is fixed 
   fireEvent.click(send);
   expect(await screen.findByRole("button", { name: "#개발로 보냄" })).toBeTruthy();
   expect(screen.getByText("#개발로 보냈습니다")).toBeTruthy();
-  expect(screen.queryByText(/^보낸 요약은 고칠 수 없습니다/)).toBeNull();
+  // The caption fades out, so it can still be in the DOM right after the send.
+  await waitFor(() => expect(screen.queryByText(/^보낸 요약은 고칠 수 없습니다/)).toBeNull());
   expect(calls.find((c) => c.cmd === "send_to_slack")?.args.channel).toEqual(CHANNELS[1]);
   expect(await screen.findByText(`#회의록, #개발로 보냄 · ${hhmm("2026-10-13T05:43:00Z")} · 수정 2곳`)).toBeTruthy();
 
