@@ -1,0 +1,23 @@
+Okay, let's start the weekly sync.
+This week we need to settle the Nuripass 2.4 release date and the billing page bug.
+For the release, I was thinking we ship on Tuesday next week.
+Tuesday works for me. Let's plan the Nuripass 2.4 release for Tuesday then.
+Someone suggested last time that we move this meeting to every other week.
+I don't like that, problems would come up too late.
+Same here. Let's keep meeting every week.
+Okay, so we are not going biweekly.
+Next, the billing page bug. Customers see the wrong currency after they switch plans.
+Daniel, can you fix the currency bug by Friday?
+Sure, I'll have the currency fix ready by Friday.
+Should we ask an outside agency to redesign the billing page?
+No, we decided not to use an agency. We will keep the redesign in house.
+Sarah, please write the release notes for 2.4.
+Okay, I'll write the release notes.
+Wait, the security review only finishes on Wednesday. Tuesday is too early.
+Then let's move the release to Thursday.
+Agreed. The Nuripass 2.4 release is on Thursday, not Tuesday.
+Someone also needs to update the status dashboard before the release.
+We have not decided who takes the dashboard yet.
+One more question: do we still support the old mobile app after the release?
+I don't know. We need to check with the support team first.
+Okay, that's it for today. Thanks everyone.

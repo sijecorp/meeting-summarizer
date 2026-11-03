@@ -33,6 +33,7 @@ import {
   onRecordingStopped,
   onSlackFinished,
   queueState,
+  getSettings,
   RECORDING_FILES,
   requestQuit,
   SCHEMA_VERSION,
@@ -275,12 +276,17 @@ export default function App() {
     setImporting((n) => n + 1);
     const failed: string[] = [];
     let last: Meta | null = null;
+    // Plan 5.6-25: the settings' languages until the import dialog asks.
+    const languages = await getSettings().then(
+      (loaded) => loaded.settings.transcribe_languages,
+      () => ["ko"],
+    );
     // One after another, so the line keeps the order of one drop.
     for (const path of paths) {
       // Its own name from the start, not the last file's 100%.
       setImported({ name: path.split(/[\\/]/).pop() ?? path, percent: 0 });
       try {
-        last = await importRecording(path);
+        last = await importRecording(path, languages);
       } catch (err) {
         failed.push(paths.length > 1 ? `${path.split(/[\\/]/).pop()}: ${err}` : String(err));
       }

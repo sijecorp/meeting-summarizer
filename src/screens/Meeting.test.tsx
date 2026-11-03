@@ -50,6 +50,7 @@ const meta = (patch: Partial<Meta> = {}): Meta => ({
   no_speech: false,
   error: null,
   sent: null,
+  languages: ["ko"],
   ...patch,
 });
 
@@ -80,6 +81,7 @@ const settings = (patch: Partial<Settings> = {}): LoadedSettings => ({
     slack_team: "SIJE",
     last_channel: "C1",
     glossary: [],
+    transcribe_languages: ["ko"],
     ...patch,
   },
 });

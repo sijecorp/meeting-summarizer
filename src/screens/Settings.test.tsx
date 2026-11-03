@@ -72,6 +72,7 @@ const loaded: LoadedSettings = {
     slack_team: null,
     last_channel: null,
     glossary: [],
+    transcribe_languages: ["ko"],
   },
 };
 

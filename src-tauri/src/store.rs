@@ -1,6 +1,7 @@
 use crate::settings::LlmConnection;
 use crate::summarize::split_title;
 use crate::transcribe::engine::Segment;
+use crate::transcribe::lang;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -8,6 +9,16 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// What a meeting's transcription and summary leave in its folder (plan 5.6-6).
+pub const RESULTS: [&str; 6] = [
+    "transcript.partial.jsonl",
+    "transcript.json",
+    "summary.md",
+    "summary.generated.md",
+    "summary.raw.md",
+    "summary.partial.json",
+];
 
 /// The newest `schema_version` this app reads and writes. A meeting is written as 2 only while it
 /// uses a field an older app would drop (`Meta::schema`); newer ones stay read-only (8.2).
@@ -93,6 +104,9 @@ pub struct Meta {
     /// Plan 5.3-8: chunks in its plan, so a paused meeting still draws "구간 3/7" after a restart.
     #[serde(default)]
     pub chunks_total: u32,
+    /// Plan 5.6-2: the languages it is transcribed in, one or more in `lang::LANGS` order.
+    #[serde(default = "lang::default_list")]
+    pub languages: Vec<String>,
 }
 
 /// Plan 5.4, ENG15: the meeting's route does not resolve yet.
@@ -109,7 +123,11 @@ impl Meta {
     /// Plan 5.7-9: 2 only while it uses a 1.1.0 field, so an older app keeps every other meeting
     /// as before and leaves this one read-only instead of dropping the field.
     fn schema(&self) -> u32 {
-        if self.held { 2 } else { 1 }
+        if self.held || !lang::korean_only(&self.languages) {
+            2
+        } else {
+            1
+        }
     }
 
     /// Summarizing has started, so where it goes is settled (SUM-08): a connection was chosen, or
@@ -143,6 +161,11 @@ pub fn can_transition(from: Status, to: Status) -> bool {
             // Plan 5.3-3: "일시정지" of a meeting in line, a retried failure too.
             | (Recorded | Transcribed | TranscribeFailed | SummarizeFailed, Paused)
             | (Review, Sent | Archived)
+            // Plan 5.6-6 (E3): transcribed again in another language.
+            | (
+                Transcribed | Review | SummarizeFailed | Archived | TranscribeFailed | Paused,
+                Recorded
+            )
     )
 }
 
@@ -261,8 +284,9 @@ fn new_meta(
     title: &str,
     status: Status,
     summarize_local: bool,
+    languages: Vec<String>,
 ) -> Meta {
-    Meta {
+    let mut meta = Meta {
         schema_version: 1,
         id: format!(
             "{:04}-{:02}-{:02}T{:02}{:02}-{:04x}",
@@ -290,7 +314,10 @@ fn new_meta(
         wait: None,
         held: false,
         chunks_total: 0,
-    }
+        languages,
+    };
+    meta.schema_version = meta.schema();
+    meta
 }
 
 pub struct Store {
@@ -363,10 +390,23 @@ impl Store {
         write_atomic(&path, &bytes).map_err(|e| format!("meta.json 저장 실패: {e}"))
     }
 
-    /// `summarize_local`: "로컬로 요약" starts as the settings' default (SUM-08).
-    pub fn create(&self, title: &str, summarize_local: bool) -> Result<Meta, String> {
+    /// `summarize_local`: "로컬로 요약" starts as the settings' default (SUM-08), and so do the
+    /// `languages` (plan 5.6-3).
+    pub fn create(
+        &self,
+        title: &str,
+        summarize_local: bool,
+        languages: Vec<String>,
+    ) -> Result<Meta, String> {
         let now = time::OffsetDateTime::now_utc();
-        let meta = new_meta(now, now, title, Status::Recording, summarize_local);
+        let meta = new_meta(
+            now,
+            now,
+            title,
+            Status::Recording,
+            summarize_local,
+            languages,
+        );
         // create_dir (not _all) fails on an id collision instead of reusing a folder.
         fs::create_dir(self.dir_for(&meta.id)?).map_err(|e| format!("회의 폴더 생성 실패: {e}"))?;
         self.write(&meta)?;
@@ -388,9 +428,17 @@ impl Store {
         created_at: time::OffsetDateTime,
         duration_ms: u64,
         summarize_local: bool,
+        languages: Vec<String>,
     ) -> Result<Meta, String> {
         let now = time::OffsetDateTime::now_utc();
-        let mut meta = new_meta(now, created_at, "", Status::Recorded, summarize_local);
+        let mut meta = new_meta(
+            now,
+            created_at,
+            "",
+            Status::Recorded,
+            summarize_local,
+            languages,
+        );
         meta.duration_ms = duration_ms;
         let dir = self.dir_for(&meta.id)?;
         // create_dir (not _all): a folder already there is another meeting's, never cleaned up here.
@@ -471,6 +519,18 @@ impl Store {
         id: &str,
         f: impl FnOnce(&mut Meta) -> Result<(), String>,
     ) -> Result<Meta, String> {
+        self.update_then(id, f, Meta::clone)
+    }
+
+    /// `update`, then `then` with the meta as written, still under the meeting's lock. Plan 5.6-6:
+    /// E3 deletes the old results only once `recorded` is on disk, and lines the meeting up before
+    /// anything else can look at it.
+    pub fn update_then<T>(
+        &self,
+        id: &str,
+        f: impl FnOnce(&mut Meta) -> Result<(), String>,
+        then: impl FnOnce(&Meta) -> T,
+    ) -> Result<T, String> {
         let lock = self.lock_for(id)?;
         let _guard = lock.lock().unwrap();
         let mut meta = self.read(id)?;
@@ -488,7 +548,23 @@ impl Store {
         if meta.status != from {
             log::info!("상태 ({id}): {from:?} -> {:?}", meta.status);
         }
-        Ok(meta)
+        Ok(then(&meta))
+    }
+
+    /// Plan 5.6-6, 5.7-10: the transcript and summary files, so nothing of another language's run
+    /// is ever read or resumed. Every one is tried; an error names the first that stayed.
+    pub fn clear_results(&self, id: &str) -> Result<(), String> {
+        let dir = self.dir_for(id)?;
+        let mut failed = None;
+        for name in RESULTS {
+            match fs::remove_file(dir.join(name)) {
+                Err(e) if e.kind() != ErrorKind::NotFound => {
+                    failed.get_or_insert(format!("{name}을(를) 지우지 못했습니다: {e}"));
+                }
+                _ => {}
+            }
+        }
+        failed.map_or(Ok(()), Err)
     }
 
     /// Plan 5.7-2: a check under the meeting's lock that writes nothing (`update` always writes,
@@ -628,6 +704,11 @@ impl Store {
                 {
                     self.set_status(&meta.id, Status::Paused).map(|_| ())
                 }
+                // Plan 5.7-10: a meeting not yet transcribing has no results. Any found are what
+                // an E3 that stopped halfway left.
+                Recovery::Requeue if meta.status == Status::Recorded => {
+                    self.clear_results(&meta.id)
+                }
                 Recovery::Requeue | Recovery::Nothing => Ok(()),
             };
             if let Err(e) = result {
@@ -762,7 +843,13 @@ mod tests {
 
     /// Writes a meeting in the given state directly, bypassing transitions.
     fn put(store: &Store, status: Status) -> Meta {
-        let meta = store.create("테스트 회의", false).unwrap();
+        let meta = store
+            .create(
+                "테스트 회의",
+                false,
+                crate::transcribe::lang::default_list(),
+            )
+            .unwrap();
         let meta = Meta { status, ..meta };
         store.write(&meta).unwrap();
         meta
@@ -804,6 +891,13 @@ mod tests {
             (SummarizeFailed, Paused),
             (Review, Sent),
             (Review, Archived),
+            // Plan 5.6-6 (E3).
+            (Transcribed, Recorded),
+            (Review, Recorded),
+            (SummarizeFailed, Recorded),
+            (Archived, Recorded),
+            (TranscribeFailed, Recorded),
+            (Paused, Recorded),
         ];
         for from in ALL {
             for to in ALL {
@@ -990,7 +1084,10 @@ mod tests {
     #[test]
     fn only_a_held_meeting_is_written_as_schema_2_and_back_to_1() {
         let (_tmp, store) = store();
-        let id = store.create("", false).unwrap().id;
+        let id = store
+            .create("", false, crate::transcribe::lang::default_list())
+            .unwrap()
+            .id;
         let on_disk = || {
             let bytes = fs::read(meta_path(&store, &id)).unwrap();
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
@@ -1021,6 +1118,85 @@ mod tests {
         assert_eq!(cleared.schema_version, 1);
         assert_eq!(on_disk()["schema_version"], 1);
         assert!(on_disk().get("held").is_none());
+    }
+
+    /// Plan 5.7-9: languages other than Korean alone are a 1.1.0 field too, from creation on.
+    #[test]
+    fn languages_other_than_korean_are_schema_2_and_back_to_1() {
+        let (_tmp, store) = store();
+        let ko_vi = vec!["ko".to_string(), "vi".into()];
+        let meta = store.create("", false, ko_vi.clone()).unwrap();
+        assert_eq!((meta.schema_version, &meta.languages), (2, &ko_vi));
+        assert_eq!(store.get(&meta.id).unwrap().schema_version, 2);
+        let korean = store
+            .update(&meta.id, |m| {
+                m.languages = vec!["ko".into()];
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(korean.schema_version, 1);
+        let english = store
+            .update(&meta.id, |m| {
+                m.languages = vec!["en".into()];
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(english.schema_version, 2);
+    }
+
+    /// Plan 5.6-2: a meeting from before 1.1.0 has no `languages`: it is Korean. Lists go and come
+    /// back as they are.
+    #[test]
+    fn languages_default_to_korean_and_round_trip() {
+        let (_tmp, store) = store();
+        let id = put(&store, Review).id;
+        let path = meta_path(&store, &id);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("languages");
+        fs::write(&path, json.to_string()).unwrap();
+        assert_eq!(store.get(&id).unwrap().languages, ["ko"]);
+        let meta = store
+            .update(&id, |m| {
+                m.languages = vec!["en".into(), "id".into()];
+                Ok(())
+            })
+            .unwrap();
+        let read: Meta = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(read, meta);
+        assert_eq!(read.languages, ["en", "id"]);
+    }
+
+    /// Plan 5.7-10, 5.6-30: an E3 stopped after `recorded` was written, with any of its files
+    /// still there, is finished at the next start; nothing else loses a file.
+    #[test]
+    fn recovery_deletes_what_an_e3_left_only_in_recorded_meetings() {
+        for left in 0..=RESULTS.len() {
+            let (_tmp, store) = store();
+            let recorded = put(&store, Recorded).id;
+            let review = put(&store, Review).id;
+            for id in [&recorded, &review] {
+                let dir = store.dir_for(id).unwrap();
+                for name in &RESULTS[RESULTS.len() - left..] {
+                    fs::write(dir.join(name), "옛 결과").unwrap();
+                }
+                fs::write(dir.join("chunks.json"), "{}").unwrap();
+            }
+            store.recover();
+            let dir = store.dir_for(&recorded).unwrap();
+            assert!(
+                RESULTS.iter().all(|name| !dir.join(name).exists()),
+                "{left}"
+            );
+            // The chunk plan does not depend on the language.
+            assert!(dir.join("chunks.json").exists());
+            let kept = store.dir_for(&review).unwrap();
+            let kept = RESULTS
+                .iter()
+                .filter(|name| kept.join(name).exists())
+                .count();
+            assert_eq!(kept, left);
+        }
     }
 
     /// Plan 5.7-2: a read under the meeting's lock leaves `meta.json` as it was, and waits for a
@@ -1346,7 +1522,10 @@ mod tests {
         let crashed = put(&store, Recording).id;
         let crashed_too = put(&store, Recording).id;
         store.recover();
-        let live = store.create("", false).unwrap().id;
+        let live = store
+            .create("", false, crate::transcribe::lang::default_list())
+            .unwrap()
+            .id;
 
         assert!(store.is_interrupted(&crashed));
         assert!(!store.is_interrupted(&live));

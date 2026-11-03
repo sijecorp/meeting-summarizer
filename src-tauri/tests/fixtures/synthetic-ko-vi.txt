@@ -1,0 +1,16 @@
+[ko] 자 그럼 베트남 법인이랑 같이 하는 주간 회의 시작할게요.
+[ko] 오늘은 누리패스 2.4 현지화 일정이랑 결제 오류 얘기하면 될 것 같아요.
+[vi] Về bản dịch tiếng Việt, nhóm chúng tôi cần thêm một tuần nữa.
+[ko] 한 주 더요? 그럼 베트남어 현지화는 다음 주 금요일까지로 하죠.
+[vi] Vâng, thứ Sáu tuần sau là được.
+[vi] Anh Nguyễn Văn An sẽ phụ trách kiểm tra bản dịch.
+[ko] 좋아요. 결제 오류는 제가 볼게요. 지민이 환불 화면 수정 맡아 주세요.
+[ko] 네 환불 화면은 제가 이번 주 안에 고칠게요.
+[vi] Có nên ra mắt ở Việt Nam cùng lúc với Hàn Quốc không?
+[ko] 동시 출시는 위험해서 안 하기로 해요. 베트남은 한 주 늦게 출시합니다.
+[vi] Đồng ý, Việt Nam ra mắt sau một tuần.
+[vi] Còn việc thanh toán bằng ví MoMo thì chưa biết khi nào hỗ trợ được.
+[ko] MoMo 지원 시점은 아직 모르니까 다음에 다시 보죠.
+[vi] Ai đó cần cập nhật tài liệu hướng dẫn cho khách hàng Việt Nam.
+[ko] 고객 안내 문서는 누가 할지 아직 안 정했어요.
+[ko] 오늘은 여기까지 할게요. 감사합니다.

@@ -95,6 +95,7 @@ const fullSettings = (): Settings => ({
   slack_team: "SIJE",
   last_channel: "C1",
   glossary: ["Tauri", "Whisper", "파일럿"],
+  transcribe_languages: ["ko"],
 });
 
 const MODEL_FILES: Record<string, { file: string; size: number }> = {
@@ -199,6 +200,7 @@ function stored(
     no_speech: false,
     error: null,
     sent: null,
+    languages: ["ko"],
     interrupted: false,
     ...patch,
   };

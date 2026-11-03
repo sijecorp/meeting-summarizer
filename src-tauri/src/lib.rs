@@ -419,6 +419,9 @@ pub fn run() {
             commands::delete_meeting,
             commands::resume_meeting,
             commands::pause_meeting,
+            commands::transcribe_languages,
+            commands::set_meeting_language,
+            commands::retranscribe,
             commands::start_recording,
             commands::stop_recording,
             commands::recording_state,
@@ -575,7 +578,14 @@ mod tests {
     fn confirmed_quit_is_not_blocked_by_a_meeting_that_cannot_be_paused() {
         let tmp = tempfile::tempdir().unwrap();
         let store = store::Store::new(tmp.path().join("meetings")).unwrap();
-        let id = store.create("녹음 중인 회의", false).unwrap().id;
+        let id = store
+            .create(
+                "녹음 중인 회의",
+                false,
+                crate::transcribe::lang::default_list(),
+            )
+            .unwrap()
+            .id;
         // meta.json can no longer be rewritten: the temp file path is taken by a folder.
         std::fs::create_dir(tmp.path().join("meetings").join(&id).join("meta.json.tmp")).unwrap();
 

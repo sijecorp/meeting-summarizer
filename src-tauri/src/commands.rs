@@ -7,6 +7,7 @@ use crate::slack::{self, Channel, Slack};
 use crate::store::{Meta, Status, Store, one_line};
 use crate::summarize::{self, SummaryRoute};
 use crate::transcribe::engine::{Segment, diag_line};
+use crate::transcribe::lang::{self, Lang};
 use crate::transcribe::model::{self, Cancelled, ModelFile, ModelState, Models};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -160,6 +161,63 @@ pub fn pause_meeting(
     paused
 }
 
+/// Plan 5.6-1: the languages a meeting can be transcribed in, in the order the screens show them.
+#[tauri::command]
+pub fn transcribe_languages() -> &'static [Lang] {
+    &lang::LANGS
+}
+
+/// Plan 5.7-8: a new command's start and its result in app.log.
+fn logged<T>(
+    command: &str,
+    id: &str,
+    extra: &str,
+    run: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    log::info!(
+        "{}",
+        diag_line(command, &[("id", id.into()), ("languages", extra.into())])
+    );
+    let result = run();
+    let said = result
+        .as_ref()
+        .map_or_else(|e| format!("err:{e}"), |_| "ok".into());
+    log::info!(
+        "{}",
+        diag_line(command, &[("id", id.into()), ("result", said)])
+    );
+    result
+}
+
+/// Plan 5.6-4: another language for a meeting not transcribed yet, even while it records. Refused
+/// while it runs, and once a chunk or the transcript exists (that is `retranscribe`'s).
+#[tauri::command(async)]
+pub fn set_meeting_language(
+    store: State<'_, Store>,
+    queue: State<'_, Queue>,
+    id: String,
+    languages: Vec<String>,
+) -> Result<Meta, String> {
+    logged("set_meeting_language", &id, &languages.join(","), || {
+        queue.set_language(&store, &id, &languages)
+    })
+}
+
+/// Plan 5.6-6 (E3): transcribed again in other languages, its transcript and summary deleted.
+/// Refused while it runs or its summary is being sent.
+#[tauri::command(async)]
+pub fn retranscribe(
+    store: State<'_, Store>,
+    queue: State<'_, Queue>,
+    slack: State<'_, Slack>,
+    id: String,
+    languages: Vec<String>,
+) -> Result<Meta, String> {
+    logged("retranscribe", &id, &languages.join(","), || {
+        queue.retranscribe(&store, &id, &languages, || slack.is_sending(&id))
+    })
+}
+
 /// Pinned devices come from settings; unreadable settings must not block a recording.
 /// Running transcriptions and local summaries stop inside `Recorder::start` (TRN-09, SUM-09).
 #[tauri::command(async)]
@@ -175,7 +233,11 @@ pub fn start_recording(
         &store,
         settings.input_device,
         settings.output_device,
-        settings.summarize_local_by_default,
+        (
+            settings.summarize_local_by_default,
+            // A list edited by hand into something unknown records as Korean (plan 5.7-7).
+            lang::parse(&settings.transcribe_languages).unwrap_or_else(|_| lang::default_list()),
+        ),
     );
     crate::refresh_tray(&app);
     started
@@ -184,9 +246,14 @@ pub fn start_recording(
 /// REC-12: the recording file at `path` (picked or dropped) as a new `recorded` meeting, queued
 /// like one that just finished recording. "로컬로 요약" starts as for a recording (SUM-08). On a
 /// blocking thread: an hour of audio takes seconds to decode. `import://progress` (`{ name,
-/// percent }`, the file's name) says how far it is.
+/// percent }`, the file's name) says how far it is. `languages`: picked before it starts (plan
+/// 5.6-25).
 #[tauri::command]
-pub async fn import_recording(app: AppHandle, path: String) -> Result<Meta, String> {
+pub async fn import_recording(
+    app: AppHandle,
+    path: String,
+    languages: Vec<String>,
+) -> Result<Meta, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let settings = app
             .state::<SettingsStore>()
@@ -198,7 +265,7 @@ pub async fn import_recording(app: AppHandle, path: String) -> Result<Meta, Stri
         let meta = audio::import::import(
             &app.state::<Store>(),
             path,
-            settings.summarize_local_by_default,
+            (settings.summarize_local_by_default, languages),
             |percent| {
                 let progress = serde_json::json!({ "name": name, "percent": percent });
                 if let Err(e) = app.emit("import://progress", progress) {
@@ -324,11 +391,15 @@ pub enum Scope {
     /// The Whisper and VAD models only, for the 전사 tab.
     Transcription,
     Summary,
+    /// Plan 5.6-15: the language detection model, fetched once a second language is first picked.
+    Lid,
 }
 
 fn scoped(scope: Option<Scope>, settings: &Settings) -> Result<Vec<&'static ModelFile>, String> {
-    if scope == Some(Scope::Summary) {
-        return Ok(vec![&model::SUMMARY]);
+    match scope {
+        Some(Scope::Summary) => return Ok(vec![&model::SUMMARY]),
+        Some(Scope::Lid) => return Ok(vec![model::lid()]),
+        _ => {}
     }
     let mut files = model::needed(&settings.model)?.to_vec();
     if scope != Some(Scope::Transcription) && settings.default_connection().is_none() {
@@ -771,6 +842,8 @@ mod tests {
         assert_eq!(files(Some(Scope::All), Some("클라우드")), transcription);
         assert_eq!(files(Some(Scope::Transcription), None), transcription);
         assert_eq!(files(Some(Scope::Summary), Some("클라우드")), [summary]);
+        // Plan 5.6-15: the detection model alone, `tiny` of the table.
+        assert_eq!(files(Some(Scope::Lid), None), ["ggml-tiny.bin"]);
         // The built-in default however it is spelt (`Settings::default_connection`).
         for builtin in [Some("builtin"), Some("지운 연결")] {
             assert_eq!(
@@ -779,8 +852,9 @@ mod tests {
             );
         }
         assert_eq!(
-            serde_json::from_str::<[Scope; 3]>(r#"["all", "transcription", "summary"]"#).unwrap(),
-            [Scope::All, Scope::Transcription, Scope::Summary]
+            serde_json::from_str::<[Scope; 4]>(r#"["all", "transcription", "summary", "lid"]"#)
+                .unwrap(),
+            [Scope::All, Scope::Transcription, Scope::Summary, Scope::Lid]
         );
     }
 

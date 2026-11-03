@@ -32,13 +32,15 @@ const TOO_LONG: &str = "4시간보다 긴 녹음은 가져올 수 없습니다";
 
 /// `path` as a new `recorded` meeting. Its start is the file's last change (a recorder saves at the
 /// end) less its length, never later than now less its length. `progress` hears how much of the
-/// file is decoded, 0 to 100, each time that changes.
+/// file is decoded, 0 to 100, each time that changes. "로컬로 요약" and the languages start as given.
 pub fn import(
     store: &Store,
     path: &Path,
-    summarize_local: bool,
+    (summarize_local, languages): (bool, Vec<String>),
     progress: impl FnMut(u8),
 ) -> Result<Meta, String> {
+    // Plan 5.7-7: before any decoding.
+    let languages = crate::transcribe::lang::parse(&languages)?;
     let temp = store.import_temp();
     let decoded = decode(path, &temp, progress);
     let samples = match decoded {
@@ -51,7 +53,7 @@ pub fn import(
     let duration_ms = samples * 1000 / u64::from(SPEC.sample_rate);
     let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
     let created_at = started(modified, SystemTime::now(), duration_ms);
-    store.import(&temp, created_at, duration_ms, summarize_local)
+    store.import(&temp, created_at, duration_ms, summarize_local, languages)
 }
 
 /// When the recording began: it ended at the file's last change, or now if that is unknown or in
@@ -276,9 +278,24 @@ mod tests {
         let store = Store::new(tmp.path().join("meetings")).unwrap();
         let src = tmp.path().join("주간 회의.wav");
         tone(&src, 2);
-        let meta = import(&store, &src, true, |_| {}).unwrap();
+        // Plan 5.7-7: a bad list is refused before anything is decoded or made.
+        for bad in [
+            vec![],
+            vec!["ko".to_string(), "ko".into()],
+            vec!["xx".into()],
+        ] {
+            assert!(import(&store, &src, (false, bad), |_| panic!("decoded")).is_err());
+        }
+        assert!(store.list().is_empty());
+        let languages = vec!["vi".to_string(), "ko".into()];
+        let meta = import(&store, &src, (true, languages), |_| {}).unwrap();
         assert_eq!(meta.status, crate::store::Status::Recorded);
         assert!(meta.summarize_local);
+        // Plan 5.6-25: the languages picked, in table order.
+        assert_eq!(
+            (meta.languages.as_slice(), meta.schema_version),
+            (&["ko".to_string(), "vi".into()][..], 2)
+        );
         assert!(
             (1_950..=2_000).contains(&meta.duration_ms),
             "{}",
@@ -294,7 +311,15 @@ mod tests {
         assert_eq!(store.list(), [meta]);
         // A failed upload leaves nothing behind.
         std::fs::write(&src, "x").unwrap();
-        assert!(import(&store, &src, false, |_| {}).is_err());
+        assert!(
+            import(
+                &store,
+                &src,
+                (false, crate::transcribe::lang::default_list()),
+                |_| {}
+            )
+            .is_err()
+        );
         assert_eq!(
             std::fs::read_dir(tmp.path().join("meetings"))
                 .unwrap()

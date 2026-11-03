@@ -100,10 +100,14 @@ fn parse(args: &[OsString]) -> Result<Args, Fail> {
                 let names = value()?.to_string_lossy();
                 parsed.only = Some(names.split(',').map(str::to_string).collect());
             }
+            // Plan 5.6-12: one language or a list (`ko,vi`), as the worker takes it.
             "--lang" => {
                 parsed.lang = value()?
                     .to_str()
-                    .filter(|l| !l.contains('\0') && whisper_rs::get_lang_id(l).is_some())
+                    .filter(|l| {
+                        l.split(',')
+                            .all(|l| !l.contains('\0') && whisper_rs::get_lang_id(l).is_some())
+                    })
                     .ok_or_else(bad)?
                     .into();
             }
@@ -401,6 +405,13 @@ fn measure(
             OsStr::new("--fa"),
             OsStr::new(&fa),
         ];
+        // shortcut: the language detection model is looked for next to the VAD model; give it a
+        // flag of its own if it ever lives elsewhere.
+        let lid = vad.with_file_name(model::needed("tiny").expect("in the table")[0].file);
+        let mut args = args.to_vec();
+        if lang.contains(',') {
+            args.extend([OsStr::new("--lid-model"), lid.as_os_str()]);
+        }
         let run = spawn(exe, &args, work, stall)?;
         measured.wall_s += run.wall_s;
         let mut done = false;
@@ -409,7 +420,8 @@ fn measure(
                 Line::Diag { line } => measured.diags.push(read_diag(&line).1),
                 Line::Result { segments, .. } => {
                     done = true;
-                    for segment in filter::filter(segments) {
+                    let langs: Vec<String> = lang.split(',').map(str::to_string).collect();
+                    for segment in filter::filter(segments, &langs) {
                         measured.text += &segment.text;
                         measured.text.push(' ');
                     }

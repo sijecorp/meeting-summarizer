@@ -1077,6 +1077,7 @@ mod tests {
             wait: None,
             held: false,
             chunks_total: 0,
+            languages: crate::transcribe::lang::default_list(),
         }
     }
 
@@ -1460,7 +1461,10 @@ mod tests {
     fn fixture(stub: &Stub) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(tmp.path().join("meetings")).unwrap();
-        let id = store.create("", false).unwrap().id;
+        let id = store
+            .create("", false, crate::transcribe::lang::default_list())
+            .unwrap()
+            .id;
         store
             .update(&id, |m| {
                 m.status = Status::Review;

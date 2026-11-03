@@ -144,14 +144,15 @@ pub struct Recorder {
 impl Recorder {
     /// REC-01. Creates the meeting and both WAV files, then starts the threads. Opening the
     /// devices happens on the capture thread, so this returns before any permission prompt.
-    /// `summarize_local` is the meeting's "로컬로 요약" to begin with (SUM-08).
+    /// `summarize_local` is the meeting's "로컬로 요약" to begin with (SUM-08), `languages` its
+    /// transcription languages (plan 5.6-3).
     pub fn start(
         &self,
         app: &AppHandle,
         store: &Store,
         input_device: Option<String>,
         output_device: Option<String>,
-        summarize_local: bool,
+        (summarize_local, languages): (bool, Vec<String>),
     ) -> Result<RecordingState, String> {
         // Waits for a `stop` still closing the last recording: its writer tells the queue the
         // recording is over, and that must come before this one says it has begun.
@@ -169,7 +170,7 @@ impl Recorder {
         {
             log::error!("녹음 기록 스레드가 비정상 종료했습니다 ({})", ended.id);
         }
-        let id = store.create("", summarize_local)?.id;
+        let id = store.create("", summarize_local, languages)?.id;
         let dir = store.dir_for(&id)?;
         // A second handle to each file lets the writer fsync after every 5 s flush.
         let open = |name: &str| {

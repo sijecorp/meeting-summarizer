@@ -66,6 +66,9 @@ export type Meta = {
   held?: boolean;
   /** Plan 5.3-8: chunks in its plan, 0 before there is one. */
   chunks_total?: number;
+  /** Plan 5.6-2: the languages it is transcribed in (codes of `transcribeLanguages`), one or more
+   * in that list's order. A meeting from before 1.1.0 reads as `["ko"]`. */
+  languages: string[];
 };
 
 /** `summary_model`: the built-in route needs the summary model (`modelStatus("summary")` tells
@@ -115,6 +118,8 @@ export type Settings = {
   /** The channel id last sent to (SND-04). */
   last_channel: string | null;
   glossary: string[];
+  /** Plan 5.6-2: a new meeting's languages, one or more in `transcribeLanguages` order. */
+  transcribe_languages: string[];
 };
 
 /** `rename`: saved connections whose name the built-in route reserves (`builtin`, "이 PC"): out of
@@ -172,7 +177,8 @@ export const onMicTestLevel = (handler: (level: number) => void) =>
 export const listMeetings = () => invoke<MeetingItem[]>("list_meetings");
 export const getMeeting = (id: string) => invoke<MeetingDetail>("get_meeting", { id });
 /** Times are from the start of the recording (architecture 5.2). */
-export type Segment = { start_ms: number; end_ms: number; text: string };
+/** `lang`: the language it was transcribed in, only in a meeting of two or more (plan 5.6-13). */
+export type Segment = { start_ms: number; end_ms: number; text: string; lang?: string };
 /** `transcript.json` of a transcribed meeting. Plain text: never render it as HTML (10.4). */
 export const getTranscript = (id: string) => invoke<Segment[]>("get_transcript", { id });
 export const deleteMeeting = (id: string) => invoke<void>("delete_meeting", { id });
@@ -181,6 +187,20 @@ export const resumeMeeting = (id: string) => invoke<Meta>("resume_meeting", { id
 /** Plan 5.3-4: `pausing` while its run stops; `already_done` when it finished first. */
 export type PauseResult = "paused" | "pausing" | "already_done";
 export const pauseMeeting = (id: string) => invoke<PauseResult>("pause_meeting", { id });
+/** Plan 5.6-1: a transcription language, `name` as the screens show it. */
+export type Lang = { code: string; name: string };
+/** Every language a meeting can be transcribed in, in the order to show and store them. */
+export const transcribeLanguages = () => invoke<Lang[]>("transcribe_languages");
+/** Plan 5.6-4: another language list before any chunk is done, even while recording. Refused
+ * while it runs ("처리 중에는 바꿀 수 없습니다") and once a chunk or the transcript exists (then
+ * offer `retranscribe`). Resolves to the meeting as written. */
+export const setMeetingLanguage = (id: string, languages: string[]) =>
+  invoke<Meta>("set_meeting_language", { id, languages });
+/** Plan 5.6-6 (E3): deletes the transcript, the summary and review edits and transcribes again in
+ * `languages`. Refused while it runs ("처리 중입니다. 먼저 일시정지해 주세요") or sends
+ * ("보내는 중입니다"). */
+export const retranscribe = (id: string, languages: string[]) =>
+  invoke<Meta>("retranscribe", { id, languages });
 
 // Summaries and review (architecture 6, 10.2).
 
@@ -274,9 +294,10 @@ export const RECORDING_FILES = { name: "녹음 파일", extensions: ["mp3", "m4a
 /** A path the picker would offer: what a drop on the window is checked against. */
 export const isRecordingFile = (path: string) =>
   RECORDING_FILES.extensions.includes(path.split(".").pop()?.toLowerCase() ?? "");
-/** REC-12: the picked recording file as a new `recorded` meeting, queued like a finished recording.
- * Resolves once it is decoded (seconds for an hour). */
-export const importRecording = (path: string) => invoke<Meta>("import_recording", { path });
+/** REC-12: the picked recording file as a new `recorded` meeting in `languages` (plan 5.6-25),
+ * queued like a finished recording. Resolves once it is decoded (seconds for an hour). */
+export const importRecording = (path: string, languages: string[]) =>
+  invoke<Meta>("import_recording", { path, languages });
 /** How far an import has decoded its file: `name` is the file's name, `percent` 0 to 100. */
 export type ImportProgress = { name: string; percent: number };
 export const onImportProgress = (handler: (p: ImportProgress) => void) =>
@@ -330,6 +351,8 @@ export type Progress = {
   /** Why it is slow (plan 5.1-11), judged again every 30 s and at every progress line. Only
    * `saver` while `summarizing`. */
   slow?: SlowReason | null;
+  /** Plan 5.6-27: a mixed meeting's chunk is having its languages told apart ("언어를 가리는 중"). */
+  detecting?: boolean;
 };
 /** `saver`: on battery in a power-saving mode (Windows). `cpu`: automatic or GPU, yet the CPU
  * transcribes; `cpu_nogpu`: there is no GPU. `slow`: slower than the recording all the same. */
@@ -344,8 +367,9 @@ export const onGpuFailed = (handler: (notice: { message: string }) => void) =>
 
 /** What the model commands act on (DX12). `all`, the default: the chosen Whisper model and the VAD
  * model, then the summary model while the built-in LLM is the default (`default_llm` null).
- * `transcription`: the Whisper and VAD models only. `summary`: the summary model only. */
-export type ModelScope = "all" | "transcription" | "summary";
+ * `transcription`: the Whisper and VAD models only. `summary`: the summary model only. `lid`: the
+ * language detection model (78MB), needed only by a meeting of two or more languages (plan 5.6-15). */
+export type ModelScope = "all" | "transcription" | "summary" | "lid";
 /** `received`: bytes in the `.part` file kept for resuming. `downloading`: the running download
  * still has this file to fetch, now or later. */
 export type ModelFileState = {

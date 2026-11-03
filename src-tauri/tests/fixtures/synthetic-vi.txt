@@ -1,0 +1,23 @@
+Chào mọi người, chúng ta bắt đầu cuộc họp tuần nhé.
+Tuần này cần chốt ngày phát hành Nuripass 2.4 và lỗi trang thanh toán.
+Về phát hành, tôi đề xuất phát hành vào thứ Ba tuần sau.
+Thứ Ba được đấy. Vậy dự kiến phát hành Nuripass 2.4 vào thứ Ba.
+Lần trước có người đề nghị chuyển cuộc họp này sang hai tuần một lần.
+Tôi không đồng ý, như vậy vấn đề sẽ được báo quá muộn.
+Tôi cũng vậy. Chúng ta cứ họp hằng tuần.
+Được, vậy không chuyển sang hai tuần một lần.
+Tiếp theo là lỗi trang thanh toán. Khách hàng thấy sai đơn vị tiền tệ sau khi đổi gói.
+Anh Nguyễn Văn An sửa lỗi tiền tệ trước thứ Sáu được không?
+Được, tôi sẽ sửa xong lỗi tiền tệ trước thứ Sáu.
+Có nên thuê công ty bên ngoài thiết kế lại trang thanh toán không?
+Không, chúng ta quyết định không thuê bên ngoài. Nhóm mình sẽ tự thiết kế lại.
+Chị Trần Thị Mai viết ghi chú phát hành cho bản 2.4 nhé.
+Vâng, tôi sẽ viết ghi chú phát hành.
+Khoan đã, đánh giá bảo mật đến thứ Tư mới xong. Thứ Ba thì sớm quá.
+Vậy dời ngày phát hành sang thứ Năm.
+Đồng ý. Nuripass 2.4 phát hành vào thứ Năm, không phải thứ Ba.
+Trước khi phát hành cũng cần ai đó cập nhật bảng điều khiển trạng thái.
+Việc cập nhật bảng điều khiển thì chưa quyết định ai làm.
+Còn một câu hỏi: sau khi phát hành chúng ta có còn hỗ trợ ứng dụng di động cũ không?
+Tôi không biết. Phải hỏi nhóm hỗ trợ trước đã.
+Được rồi, hôm nay đến đây thôi. Cảm ơn mọi người.

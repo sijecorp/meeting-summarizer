@@ -10,6 +10,7 @@ use crate::settings::{BUILTIN, LlmConnection, Settings};
 use crate::sidecar;
 use crate::store::{Meta, Status, Wait, write_atomic};
 use crate::transcribe::engine::Segment;
+use crate::transcribe::lang;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -272,6 +273,70 @@ fn chars(text: &str) -> usize {
 /// common tokenizers, so this is the safe side.
 fn tokens(chars: usize) -> u64 {
     chars as u64
+}
+
+/// Plan 5.6-16: a transcript line as the prompt carries it, with its language in front (`[vi] …`)
+/// in a meeting of two or more.
+pub fn line(text: &str, lang: Option<&str>, languages: &[String]) -> String {
+    match lang {
+        Some(lang) if languages.len() > 1 => format!("[{lang}] {text}"),
+        _ => text.to_string(),
+    }
+}
+
+/// Plan 5.6-17: tokens per character of a transcript, each line by its language (its `[vi]` tag,
+/// or the meeting's one language), so an English meeting is not cut into the 3 to 4 times as
+/// many parts that one token a character would make. 1.0 for Korean, and for a line whose
+/// language is unknown: the safe side.
+fn per_char(lines: &[String], languages: &[String]) -> f64 {
+    let (mut all, mut weighed) = (0, 0.0);
+    for line in lines {
+        let tagged = line
+            .strip_prefix('[')
+            .and_then(|l| l.split_once("] "))
+            .and_then(|(code, _)| lang::get(code));
+        let lang = match languages {
+            [one] => lang::get(one),
+            _ => tagged,
+        };
+        let n = chars(line);
+        all += n;
+        weighed += n as f64 * lang.map_or(1.0, |l| l.tokens_per_char);
+    }
+    if all == 0 { 1.0 } else { weighed / all as f64 }
+}
+
+/// Plan 5.6-16: the prompt for the meeting's languages; Korean alone gets `SYSTEM` as it is.
+fn system(glossary: &[String], languages: &[String]) -> String {
+    let mut system = SYSTEM.to_string();
+    if !lang::korean_only(languages) {
+        let names = lang::names(languages);
+        let (what, rule) = if languages.len() > 1 {
+            let tags: Vec<String> = languages
+                .iter()
+                .filter_map(|c| lang::get(c))
+                .map(|l| format!("[{}] {}", l.code, l.name))
+                .collect();
+            (
+                format!("{names}가 섞인 회의 전사본"),
+                format!(
+                    "전사본 줄 앞의 표시는 그 줄의 언어다({}). 모든 언어의 발언을 빠짐없이 반영해 한국어로만 쓰고, 사람 이름·제품명은 전사본 표기 그대로 쓴다.",
+                    tags.join(", ")
+                ),
+            )
+        } else {
+            (
+                format!("{names} 회의 전사본"),
+                "사람 이름·제품명은 전사본 표기 그대로 쓴다.".to_string(),
+            )
+        };
+        system = system.replacen("한국어 회의 전사본", &what, 1);
+        system += &format!("\n- {rule}");
+    }
+    if !glossary.is_empty() {
+        system += &format!("\n- 용어집의 표기를 따른다: {}", glossary.join(", "));
+    }
+    system
 }
 
 fn message(intro: &str, content: &str) -> String {
@@ -594,10 +659,12 @@ impl<'a> Llm<'a> {
 /// which also gives its failures the built-in words (`engine_failure`). `partial`: where the
 /// partial summaries are kept (`PARTIAL`), so a stopped summary asks only for the rest; gone once
 /// it is done. Returns the summary and its answers' timings.
+#[allow(clippy::too_many_arguments)]
 pub async fn summarize(
     connection: &LlmConnection,
     key: Option<String>,
     glossary: &[String],
+    languages: &[String],
     lines: &[String],
     on_step: impl Fn(u32, u32),
     recover: Option<Recover>,
@@ -609,7 +676,7 @@ pub async fn summarize(
         return Err(Failure::NoKey);
     }
     let summary = match Llm::new(connection, key.as_deref(), recover) {
-        Ok(mut llm) => parts(&mut llm, glossary, lines, on_step, partial)
+        Ok(mut llm) => parts(&mut llm, glossary, languages, lines, on_step, partial)
             .await
             .map(|text| (text, llm.timings)),
         Err(failure) => Err(failure),
@@ -660,14 +727,14 @@ fn part_tokens(budget: u64) -> u64 {
 async fn parts(
     llm: &mut Llm<'_>,
     glossary: &[String],
+    languages: &[String],
     lines: &[String],
     on_step: impl Fn(u32, u32),
     partial: Option<&Path>,
 ) -> Result<String, Failure> {
-    let mut system = SYSTEM.to_string();
-    if !glossary.is_empty() {
-        system += &format!("\n- 용어집의 표기를 따른다: {}", glossary.join(", "));
-    }
+    let system = system(glossary, languages);
+    // Plan 5.6-17: the transcript's tokens by its languages; the prompt and summaries are Korean.
+    let per_char = per_char(lines, languages);
     let context = u64::from(llm.connection.context_tokens);
     let budget = context * 9 / 10;
     let part = part_tokens(budget);
@@ -681,14 +748,19 @@ async fn parts(
             .saturating_sub(chars(&system) + chars(&message(intro, "")))
     };
 
-    let whole = message(WHOLE, &lines.join("\n"));
-    if within(&whole) {
+    let transcript = lines.join("\n");
+    let whole = message(WHOLE, &transcript);
+    let whole_tokens =
+        input(&message(WHOLE, "")) + (chars(&transcript) as f64 * per_char).ceil() as u64;
+    if whole_tokens <= context * 6 / 10 {
         on_step(0, 1);
-        let summary = llm.ask(&system, &whole, last(&whole)).await?;
+        let answer = FINAL_TOKENS.min(budget.saturating_sub(whole_tokens));
+        let summary = llm.ask(&system, &whole, answer).await?;
         on_step(1, 1);
         return Ok(summary);
     }
-    let (part_room, merge_room) = (room(PART, part), room(MERGE, part));
+    let part_room = (room(PART, part) as f64 / per_char) as usize;
+    let merge_room = room(MERGE, part);
     // A request must hold one partial summary at its full length, or merging can never fit.
     if merge_room < part as usize {
         return Err(Failure::TooSmall);
@@ -915,6 +987,7 @@ pub(crate) mod tests {
             connection,
             key.map(String::from),
             &[],
+            &lang::default_list(),
             lines,
             |_, _| {},
             None,
@@ -934,6 +1007,7 @@ pub(crate) mod tests {
             &connection(&format!("{}/", stub.url), "cloud", false),
             Some("sk-test".into()),
             &glossary,
+            &lang::default_list(),
             &lines(&format!("{SPEECH}\n둘째 줄")),
             |_, _| {},
             None,
@@ -1297,6 +1371,165 @@ pub(crate) mod tests {
         );
     }
 
+    fn codes(codes: &[&str]) -> Vec<String> {
+        codes.iter().map(|c| c.to_string()).collect()
+    }
+
+    /// Plan 5.6-16: Korean alone keeps the 1.0 prompt byte for byte; another language names it,
+    /// and two or more also explain the line tags.
+    #[test]
+    fn the_prompt_names_the_languages_and_only_a_mixed_meeting_gets_line_tags() {
+        assert_eq!(system(&[], &codes(&["ko"])), SYSTEM);
+        let english = system(&[], &codes(&["en"]));
+        assert!(english.contains("너는 회의록 작성자다. 영어 회의 전사본을 읽고"));
+        assert!(english.ends_with("사람 이름·제품명은 전사본 표기 그대로 쓴다."));
+        assert!(!english.contains("한국어 회의 전사본") && !english.contains("[en]"));
+        let mixed = system(&["누리패스".into()], &codes(&["ko", "vi"]));
+        assert!(mixed.contains("한국어·베트남어가 섞인 회의 전사본을 읽고"));
+        assert!(mixed.contains("([ko] 한국어, [vi] 베트남어)"));
+        assert!(mixed.contains("모든 언어의 발언을 빠짐없이 반영해 한국어로만 쓰고"));
+        assert!(mixed.ends_with("용어집의 표기를 따른다: 누리패스"));
+
+        assert_eq!(
+            line("Xin chào", Some("vi"), &codes(&["ko", "vi"])),
+            "[vi] Xin chào"
+        );
+        assert_eq!(line("Hello", Some("en"), &codes(&["en"])), "Hello");
+        assert_eq!(line("안녕하세요", None, &codes(&["ko"])), "안녕하세요");
+    }
+
+    /// Plan 5.6-17: tokens per character by each line's language.
+    #[test]
+    fn the_token_estimate_goes_by_language() {
+        let lines = codes(&["Hello there", "Nice to meet you"]);
+        assert_eq!(per_char(&lines, &codes(&["ko"])), 1.0);
+        assert_eq!(per_char(&lines, &codes(&["en"])), 0.3);
+        // A mixed meeting by its tags; a line without one counts as Korean, the safe side.
+        let mixed = codes(&["[en] abcdefgh", "가나"]);
+        let estimate = per_char(&mixed, &codes(&["ko", "en"]));
+        assert!(
+            (estimate - (13.0 * 0.3 + 2.0) / 15.0).abs() < 1e-9,
+            "{estimate}"
+        );
+    }
+
+    /// Plan 5.6-17: an English meeting needs far fewer parts than one token a character makes.
+    #[test]
+    fn an_english_meeting_is_not_cut_into_korean_sized_parts() {
+        let stub = serve(|r| {
+            Some(completion(if r.body["max_tokens"] == PART_TOKENS {
+                "## 결정사항\n- 부분 요약"
+            } else {
+                SUMMARY
+            }))
+        });
+        let small = LlmConnection {
+            context_tokens: 6000,
+            ..connection(&stub.url, "l", true)
+        };
+        let transcript: Vec<String> = (0..40)
+            .map(|i| {
+                format!(
+                    "Item {i}: {}",
+                    "we talked about the release plan. ".repeat(12)
+                )
+            })
+            .collect();
+        let parts = |languages: &[&str]| {
+            let before = stub.requests.lock().unwrap().len();
+            let summary = block_on(summarize(
+                &small,
+                None,
+                &[],
+                &codes(languages),
+                &transcript,
+                |_, _| {},
+                None,
+                None,
+            ));
+            assert_eq!(summary.unwrap().0, SUMMARY);
+            let requests = stub.requests.lock().unwrap();
+            requests[before..]
+                .iter()
+                .filter(|r| {
+                    r.body["messages"][1]["content"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(PART)
+                })
+                .count()
+        };
+        let (korean, english) = (parts(&["ko"]), parts(&["en"]));
+        assert!(
+            english >= 1 && english * 2 <= korean,
+            "{english} / {korean}"
+        );
+    }
+
+    /// Plan 5.6-31: every fixture parses, names valid languages and stays within its part bound
+    /// at the smallest context the app supports (4,096 tokens).
+    #[test]
+    fn eval_fixtures_stay_within_their_part_bounds() {
+        let stub = serve(|_| Some(completion(SUMMARY)));
+        let small = LlmConnection {
+            context_tokens: 4096,
+            ..connection(&stub.url, "l", true)
+        };
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut checked = 0;
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "txt") {
+                continue;
+            }
+            let expected: Expected =
+                serde_json::from_slice(&fs::read(path.with_extension("expected.json")).unwrap())
+                    .unwrap();
+            let languages = match expected.languages {
+                none if none.is_empty() => lang::default_list(),
+                some => lang::parse(&some).unwrap(),
+            };
+            let lines: Vec<String> = fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(String::from)
+                .collect();
+            // A mixed transcript's lines carry their tags, as the queue sends them.
+            if languages.len() > 1 {
+                assert!(
+                    lines.iter().all(|l| l.starts_with('[')),
+                    "{}",
+                    path.display()
+                );
+            }
+            let known = Mutex::new(0);
+            let on_step = |_, k| {
+                let mut known = known.lock().unwrap();
+                if *known == 0 {
+                    *known = k;
+                }
+            };
+            let summary = block_on(summarize(
+                &small,
+                None,
+                &[],
+                &languages,
+                &lines,
+                on_step,
+                None,
+                None,
+            ));
+            assert!(summary.is_ok(), "{}", path.display());
+            let parts = known.into_inner().unwrap().max(2) - 1;
+            if let Some(max) = expected.max_parts {
+                assert!(parts <= max, "{}: {parts} > {max}", path.display());
+            }
+            checked += 1;
+        }
+        assert!(checked >= 4);
+    }
+
     #[test]
     fn token_estimate_is_one_per_character() {
         assert_eq!(tokens(0), 0);
@@ -1332,11 +1565,13 @@ pub(crate) mod tests {
                 start_ms: 5_000,
                 end_ms: 9_000,
                 text: " 시작합니다".into(),
+                lang: None,
             },
             Segment {
                 start_ms: 4_530_000,
                 end_ms: 4_531_000,
                 text: "<b>끝</b>".into(),
+                lang: None,
             },
         ];
         assert_eq!(
@@ -1374,6 +1609,7 @@ pub(crate) mod tests {
             wait: None,
             held: false,
             chunks_total: 0,
+            languages: crate::transcribe::lang::default_list(),
         }
     }
 
@@ -1564,6 +1800,7 @@ pub(crate) mod tests {
             &small,
             None,
             &[],
+            &lang::default_list(),
             &transcript,
             on_step,
             None,
@@ -1628,6 +1865,7 @@ pub(crate) mod tests {
                     &connection,
                     None,
                     &[],
+                    &lang::default_list(),
                     &transcript,
                     |_, _| {},
                     None,
@@ -1656,6 +1894,7 @@ pub(crate) mod tests {
             &connection,
             None,
             &[],
+            &lang::default_list(),
             &transcript,
             on_step,
             None,
@@ -1694,6 +1933,7 @@ pub(crate) mod tests {
                 &connection,
                 None,
                 glossary,
+                &lang::default_list(),
                 &transcript,
                 |_, _| {},
                 None,
@@ -1833,6 +2073,7 @@ pub(crate) mod tests {
             &small,
             None,
             &glossary,
+            &lang::default_list(),
             &talk(60),
             |_, _| {},
             None,
@@ -1927,6 +2168,7 @@ pub(crate) mod tests {
                 &connection,
                 key,
                 &[],
+                &lang::default_list(),
                 lines,
                 |_, _| {},
                 recover,
@@ -2072,6 +2314,7 @@ pub(crate) mod tests {
                 &builtin,
                 None,
                 &glossary,
+                &lang::default_list(),
                 &lines(SPEECH),
                 |_, _| {},
                 Some(recover),
@@ -2128,6 +2371,11 @@ pub(crate) mod tests {
         must_not_in_decisions: Vec<Vec<String>>,
         /// Keyword groups whose action item must have the owner 미정.
         unassigned: Vec<Vec<String>>,
+        /// Plan 5.6-31: the meeting's languages, Korean when left out. A mixed transcript's lines
+        /// carry their `[vi]` tags already, as the queue sends them.
+        languages: Vec<String>,
+        /// Plan 5.6-17: at most this many partial summaries (the token estimate by language).
+        max_parts: Option<u32>,
     }
 
     const SECTIONS: [&str; 4] = ["결정사항", "액션 아이템", "주요 논의", "미해결 질문"];
@@ -2419,13 +2667,23 @@ pub(crate) mod tests {
                 .filter(|l| !l.is_empty())
                 .map(String::from)
                 .collect();
+            let languages = match &expected.languages {
+                none if none.is_empty() => lang::default_list(),
+                some => some.clone(),
+            };
+            // The first step's count: the parts and their merge, or 1 for one request.
+            let planned = std::sync::OnceLock::new();
             let ask = |connection: &LlmConnection, key: Option<String>, recover| {
                 let started = Instant::now();
-                let on_step = |done, known| eprintln!("{name}: 요청 {done}/{known}");
+                let on_step = |done, known: u32| {
+                    planned.get_or_init(|| known);
+                    eprintln!("{name}: 요청 {done}/{known}");
+                };
                 let summary = block_on(summarize(
                     connection,
                     key,
                     &expected.glossary,
+                    &languages,
                     &lines,
                     on_step,
                     recover,
@@ -2483,7 +2741,8 @@ pub(crate) mod tests {
                         timings.predicted_n,
                         speed(timings.predicted_n, timings.predicted_ms)
                     );
-                    let grounded = grounding::check(&summary, &transcript, &expected.glossary);
+                    let grounded =
+                        grounding::check(&summary, &transcript, &expected.glossary, &languages);
                     if grounded.text != summary {
                         eprintln!("=== {name} 근거 검사 뒤 ===\n{}\n", grounded.text);
                     }
@@ -2493,7 +2752,12 @@ pub(crate) mod tests {
                         grounded.replaced,
                         false_undecided(&summary, &transcript, &expected.glossary)
                     );
-                    let failures = check(&summary, &transcript, &expected);
+                    let mut failures = check(&summary, &transcript, &expected);
+                    let parts = planned.get().map_or(1, |&known| known.max(2) - 1);
+                    row += &format!(" · 부분 {parts}개");
+                    if let Some(max) = expected.max_parts.filter(|&max| parts > max) {
+                        failures.push(format!("부분 요약이 {parts}개로 상한 {max}개를 넘었습니다"));
+                    }
                     row += &format!(" · 채점 실패 {}개", failures.len());
                     if !failures.is_empty() {
                         report.push(format!("{name}:\n  {}", failures.join("\n  ")));

@@ -58,6 +58,7 @@ const meeting = (id: string, status: Status, error: string | null = null): Meeti
   no_speech: false,
   error,
   sent: null,
+  languages: ["ko"],
   interrupted: false,
 });
 

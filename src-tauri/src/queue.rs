@@ -17,6 +17,7 @@ use crate::store::{Meta, SCHEMA_VERSION, Status, Store, can_transition, write_at
 use crate::summarize;
 use crate::transcribe::engine::{self, Chunk, Device, Line, Segment};
 use crate::transcribe::filter;
+use crate::transcribe::lang;
 use crate::transcribe::model::{self, Check, Models};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
@@ -47,6 +48,8 @@ fn slots(builtin_ready: bool) -> usize {
 pub(crate) const STALL: Duration = Duration::from_secs(5 * 60);
 const PARTIAL: &str = "transcript.partial.jsonl";
 const GPU_FAILED: &str = "GPU 처리가 불안정해 CPU로 전환했습니다. 처리 시간이 길어집니다";
+/// Plan 5.6-4: `set_meeting_language` after a chunk is done; the screen then offers E3.
+pub const TRANSCRIBED: &str = "이미 전사한 구간이 있어 다시 전사해야 바꿀 수 있습니다";
 
 /// `meeting://progress`, and one entry of `queue_state`. Sent when a meeting joins the line, its
 /// place changes, it starts, a chunk or LLM request moves, its slow reason changes, and when it
@@ -72,6 +75,9 @@ pub struct Progress {
     /// Plan 5.1-11: why it is slow, judged again every `TICK` and at every progress line. Only
     /// `saver` while `summarizing`.
     pub slow: Option<SlowReason>,
+    /// Plan 5.6-27: a chunk's worker is telling the languages of a mixed meeting apart ("언어를
+    /// 가리는 중").
+    pub detecting: bool,
 }
 
 /// Plan 5.1-11: the one reason a running meeting is slow.
@@ -393,6 +399,12 @@ fn first_device(backend: Backend, failed: bool) -> Device {
     }
 }
 
+/// One language, or a list that is not valid and so runs as Korean (`transcribe`): no detection
+/// model needed (plan 5.6-14).
+fn single(languages: &[String]) -> bool {
+    lang::parse(languages).map_or(true, |l| l.len() < 2)
+}
+
 /// Only the summary is left (architecture 8.4): from its status, and for `paused` from
 /// `transcript.json`. Not from the file alone: a `transcribe_failed` meeting whose
 /// `transcript.json` was written before its status could be transcribes again.
@@ -489,6 +501,9 @@ struct ChunkResult {
     start_ms: u64,
     end_ms: u64,
     segments: Vec<Segment>,
+    /// Plan 5.6-7: the languages it was transcribed in. A line from before 1.1.0 was Korean.
+    #[serde(default = "lang::default_list")]
+    languages: Vec<String>,
 }
 
 /// `transcript.json`: every kept segment of the meeting, in order.
@@ -498,8 +513,9 @@ struct Transcript<'a> {
 }
 
 /// STO-03: the finished chunks, in order. Reading stops at the first line that is not the next
-/// chunk of `plan`; that chunk runs again.
-fn read_partial(path: &Path, plan: &[Chunk]) -> Vec<ChunkResult> {
+/// chunk of `plan` in `languages` (plan 5.6-7: never another language's leftover); that chunk
+/// runs again.
+fn read_partial(path: &Path, plan: &[Chunk], languages: &[String]) -> Vec<ChunkResult> {
     let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -510,6 +526,7 @@ fn read_partial(path: &Path, plan: &[Chunk]) -> Vec<ChunkResult> {
         };
         let expected = plan.get(done.len());
         if result.chunk as usize != done.len()
+            || result.languages != languages
             || expected.is_none_or(|c| (c.start_ms, c.end_ms) != (result.start_ms, result.end_ms))
         {
             break;
@@ -957,6 +974,7 @@ impl<R: Runtime> Queue<R> {
                 position: None,
                 engine_since: None,
                 slow: None,
+                detecting: false,
             },
         );
         self.publish_positions(inner);
@@ -1121,6 +1139,78 @@ impl<R: Runtime> Queue<R> {
         Ok(meta)
     }
 
+    /// Plan 5.6-4, 5.7-1: another language list for a meeting not transcribed yet, in the shape
+    /// of `pause`. Refused while it runs (chunk 0 too), and once a chunk or the transcript exists:
+    /// that is E3's (`TRANSCRIBED`). One in line keeps its place: each worker reads `meta.languages`.
+    pub fn set_language(
+        &self,
+        store: &Store,
+        id: &str,
+        languages: &[String],
+    ) -> Result<Meta, String> {
+        let languages = lang::parse(languages)?;
+        let dir = store.dir_for(id)?;
+        store.update(id, |m| {
+            let inner = lock(&self.inner);
+            if inner.sched.running.iter().any(|r| r == id) {
+                return Err("처리 중에는 바꿀 수 없습니다".into());
+            }
+            if m.chunks_done > 0 || dir.join("transcript.json").exists() {
+                return Err(TRANSCRIBED.into());
+            }
+            m.languages = languages;
+            Ok(())
+        })
+    }
+
+    /// Plan 5.6-6 (E3), in one shape of 5.7-1 and in this order: refused while it runs or
+    /// `sending`, else out of line; `meta.json` written `recorded` with the new list and its
+    /// results' fields cleared; the old results deleted; back in line. A file that will not go
+    /// leaves it out of line with the error: the next transcription deletes them first (5.6-7),
+    /// and so does the next start (5.7-10).
+    pub fn retranscribe(
+        &self,
+        store: &Store,
+        id: &str,
+        languages: &[String],
+        sending: impl FnOnce() -> bool,
+    ) -> Result<Meta, String> {
+        let languages = lang::parse(languages)?;
+        let meta = store.update_then(
+            id,
+            |m| {
+                let mut inner = lock(&self.inner);
+                if inner.sched.running.iter().any(|r| r == id) {
+                    return Err("처리 중입니다. 먼저 일시정지해 주세요".into());
+                }
+                if sending() {
+                    return Err("보내는 중입니다".into());
+                }
+                if !can_transition(m.status, Status::Recorded) {
+                    return Err(format!("다시 전사할 수 없는 상태입니다: {:?}", m.status));
+                }
+                inner.sched.waiting.retain(|w| w != id);
+                inner.progress.remove(id);
+                self.publish_positions(&mut inner);
+                (m.status, m.languages, m.chunks_done) = (Status::Recorded, languages, 0);
+                (m.backend, m.error, m.wait) = (None, None, None);
+                (m.grounding_replaced, m.grounding_checked) = (0, None);
+                // "로컬로 요약" may be picked again: the summary goes wherever it is chosen now.
+                m.llm_connection = None;
+                (m.no_speech, m.held) = (false, false);
+                Ok(())
+            },
+            |m| {
+                store.clear_results(id)?;
+                self.line_up(&mut lock(&self.inner), id, m.status);
+                Ok(m.clone())
+            },
+        )?;
+        self.pump();
+        crate::refresh_tray(&self.app);
+        meta
+    }
+
     /// Plan 5.4: the summary model is installed, so the built-in route can summarize.
     pub fn builtin_ready(&self) -> bool {
         self.app.state::<Models>().installed(&model::SUMMARY)
@@ -1132,10 +1222,17 @@ impl<R: Runtime> Queue<R> {
     pub fn pump(&self) {
         let settings = self.settings();
         let store = self.app.state::<Store>();
-        let transcribable = self.app.state::<Models>().ready(&settings.model).is_some();
+        let models = self.app.state::<Models>();
+        let transcribable = models.ready(&settings.model).is_some();
+        // Plan 5.6-14: a meeting of two or more languages also waits for the detection model.
+        let lid = models.installed(model::lid());
         let slots = slots(self.builtin_ready());
-        let can_start =
-            |id: &str| transcribable || store.get(id).is_ok_and(|m| summary_only(&store, &m));
+        let can_start = |id: &str| {
+            transcribable && lid
+                || store.get(id).is_ok_and(|m| {
+                    summary_only(&store, &m) || transcribable && single(&m.languages)
+                })
+        };
         let mut inner = lock(&self.inner);
         if inner.closed {
             return;
@@ -1272,14 +1369,19 @@ impl<R: Runtime> Queue<R> {
 
     /// Why a run failed, for the recorder. A model that would not load is hashed first: a damaged
     /// file is deleted so "다시 받기" fetches it, an intact one points elsewhere (`model_failure`).
-    fn failure(&self, exit: Exit, dir: &Path) -> String {
+    /// `lid`: the worker had the language detection model too.
+    fn failure(&self, exit: Exit, dir: &Path, lid: bool) -> String {
         let why = last_log_line(&dir.join("worker.log"));
         match exit {
             Exit::Input => format!("녹음 파일을 읽을 수 없습니다: {why}"),
-            Exit::Model => model_failure(
-                self.app.state::<Models>().verify(&self.settings().model),
-                &why,
-            ),
+            Exit::Model => {
+                let models = self.app.state::<Models>();
+                let mut check = models.verify(&self.settings().model);
+                if lid && check == Check::Intact {
+                    check = models.check(&[model::lid()]);
+                }
+                model_failure(check, &why)
+            }
             Exit::OutOfMemory => {
                 "메모리가 부족해 전사가 중단되었습니다. 다른 앱을 닫고 다시 시도해 주세요".into()
             }
@@ -1315,7 +1417,7 @@ impl<R: Runtime> Queue<R> {
         })?;
         let plan = match (ended.code, plan) {
             (Some(0), Some(plan)) if !ended.stalled => plan,
-            (_, _) => return Err(End::Failed(self.failure(exit_of(ended, None), dir))),
+            (_, _) => return Err(End::Failed(self.failure(exit_of(ended, None), dir, false))),
         };
         let bytes = serde_json::to_vec(&plan).map_err(|e| End::Failed(e.to_string()))?;
         store
@@ -1334,7 +1436,8 @@ impl<R: Runtime> Queue<R> {
         id: &str,
         dir: &Path,
         chunk: &Chunk,
-        (model, vad): (&Path, &Path),
+        (model, vad, lid): (&Path, &Path, Option<&Path>),
+        languages: &[String],
         mut on_pct: impl FnMut(u8),
     ) -> Result<(Vec<Segment>, Device), End> {
         let settings = self.settings();
@@ -1344,10 +1447,11 @@ impl<R: Runtime> Queue<R> {
         );
         let threads = engine::threads().to_string();
         let version = self.app.package_info().version.to_string();
+        let langs = languages.join(",");
         loop {
             let (start, end) = (chunk.start_ms.to_string(), chunk.end_ms.to_string());
             let fa = u8::from(run.flash_attn).to_string();
-            let args = [
+            let mut args = vec![
                 OsStr::new("--transcribe-worker"),
                 dir.as_os_str(),
                 OsStr::new(&start),
@@ -1357,7 +1461,7 @@ impl<R: Runtime> Queue<R> {
                 vad.as_os_str(),
                 // Plan 5.1-1: the product's values. The GPU is the worker's pick.
                 OsStr::new("--lang"),
-                OsStr::new("ko"),
+                OsStr::new(&langs),
                 OsStr::new("--beam"),
                 OsStr::new("5"),
                 OsStr::new("--threads"),
@@ -1365,10 +1469,15 @@ impl<R: Runtime> Queue<R> {
                 OsStr::new("--fa"),
                 OsStr::new(&fa),
             ];
+            // Plan 5.6-9: only a meeting of two or more languages is given one.
+            if let Some(lid) = lid {
+                args.extend([OsStr::new("--lid-model"), lid.as_os_str()]);
+            }
             let command = self.worker(dir, &args)?;
             let mut result = None;
             let ended = run_worker(&self.inner, id, command, STALL, |line| match line {
                 Line::Progress { pct } => on_pct(pct),
+                Line::Detecting { on } => self.set_progress(id, |p| p.detecting = on),
                 Line::Result { device, segments } => result = Some((device, segments)),
                 Line::Device { device, name } => {
                     if let Some(job) = lock(&self.inner).jobs.get_mut(id) {
@@ -1380,7 +1489,9 @@ impl<R: Runtime> Queue<R> {
                 Line::Plan { .. } => {}
             })?;
             let exit = exit_of(ended, result.as_ref().map(|(device, _)| *device));
-            let segments = result.map(|(_, s)| filter::filter(s)).unwrap_or_default();
+            let segments = result
+                .map(|(_, s)| filter::filter(s, languages))
+                .unwrap_or_default();
             let abnormal = matches!(exit, Exit::Done(_))
                 .then(|| filter::abnormal(&segments, chunk.speech_ms))
                 .flatten();
@@ -1410,21 +1521,50 @@ impl<R: Runtime> Queue<R> {
                         },
                     );
                 }
-                Next::Fail => return Err(End::Failed(self.failure(exit, dir))),
+                Next::Fail => return Err(End::Failed(self.failure(exit, dir, lid.is_some()))),
             }
         }
     }
 
     fn transcribe(&self, store: &Store, id: &str) -> End {
         let settings = self.settings();
-        let Some((model, vad)) = self.app.state::<Models>().ready(&settings.model) else {
+        let models = self.app.state::<Models>();
+        let Some((model, vad)) = models.ready(&settings.model) else {
             return End::Requeue;
         };
+        let lid = models
+            .installed(model::lid())
+            .then(|| models.dir.join(model::lid().file));
+        let (mut languages, mut waits) = (lang::default_list(), false);
         let started = store.update(id, |m| {
             // `transcribing` itself too: the queue runs a meeting once at a time, so that is a
             // stop whose `paused` could not be written. Recovery would pause it at the next start.
             if m.status != Status::Transcribing && !can_transition(m.status, Status::Transcribing) {
                 return Err(format!("전사할 수 없는 상태입니다: {:?}", m.status));
+            }
+            // Plan 5.7-7: checked again before a worker gets it. A bad list becomes Korean for
+            // good, so the meeting does not fail over and over.
+            languages = lang::parse(&m.languages).unwrap_or_else(|why| {
+                let line = engine::diag_line(
+                    "languages_reset",
+                    &[
+                        ("id", id.into()),
+                        ("was", m.languages.join(",")),
+                        ("why", why),
+                    ],
+                );
+                log::warn!("{line}");
+                lang::default_list()
+            });
+            m.languages = languages.clone();
+            // Plan 5.6-14: as for a missing model, it waits, never fails.
+            if languages.len() > 1 && lid.is_none() {
+                waits = true;
+                return Ok(());
+            }
+            // Plan 5.6-7: nothing a run in another language left is resumed or shown.
+            if m.status == Status::Recorded {
+                store.clear_results(id)?;
             }
             m.status = Status::Transcribing;
             m.error = None;
@@ -1433,6 +1573,10 @@ impl<R: Runtime> Queue<R> {
         if let Err(e) = started {
             return End::Skipped(e);
         }
+        if waits {
+            return End::Requeue;
+        }
+        let lid = lid.filter(|_| languages.len() > 1);
         // Before any worker: a plain failure, not a crash that counts toward `gpu_failed`.
         #[cfg(target_arch = "x86_64")]
         if let Some(why) = cpu_failure(&[
@@ -1457,7 +1601,7 @@ impl<R: Runtime> Queue<R> {
             Err(end) => return end,
         };
         let partial = dir.join(PARTIAL);
-        let mut done = read_partial(&partial, &plan.chunks);
+        let mut done = read_partial(&partial, &plan.chunks, &languages);
         let chunks = plan.chunks.len() as u32;
         let done_ms =
             |done: &[ChunkResult]| -> u64 { done.iter().map(|r| r.end_ms - r.start_ms).sum() };
@@ -1499,7 +1643,8 @@ impl<R: Runtime> Queue<R> {
             let (segments, device) = if chunk.speech_ms == 0 {
                 (Vec::new(), None)
             } else {
-                match self.chunk(id, &dir, chunk, (&model, &vad), report) {
+                let models = (model.as_path(), vad.as_path(), lid.as_deref());
+                match self.chunk(id, &dir, chunk, models, &languages, report) {
                     Ok((segments, device)) => (segments, Some(device)),
                     Err(end) => return end,
                 }
@@ -1509,6 +1654,7 @@ impl<R: Runtime> Queue<R> {
                 start_ms: chunk.start_ms,
                 end_ms: chunk.end_ms,
                 segments,
+                languages: languages.clone(),
             });
             let saved = store.update(id, |m| {
                 write_partial(&partial, &done).map_err(|e| format!("{PARTIAL} 저장 실패: {e}"))?;
@@ -1633,6 +1779,7 @@ impl<R: Runtime> Queue<R> {
                 engine_since: None,
                 // Plan 5.1-12: only `saver` goes on into the summary.
                 slow: p.slow.filter(|s| *s == SlowReason::Saver),
+                detecting: false,
             };
         });
     }
@@ -1646,13 +1793,26 @@ impl<R: Runtime> Queue<R> {
             Ok(dir) => dir,
             Err(e) => return End::Failed(e),
         };
-        let lines = store.transcript(id).map(|segments| {
+        // Running, so its languages cannot change under it (`set_language`, `retranscribe`).
+        let languages = store
+            .get(id)
+            .map_or_else(|_| lang::default_list(), |m| m.languages);
+        let segments = store.transcript(id).map(|segments| {
             segments
                 .into_iter()
-                .map(|s| s.text.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<String>>()
+                .map(|s| (s.text.trim().to_string(), s.lang))
+                .filter(|(t, _)| !t.is_empty())
+                .collect::<Vec<_>>()
         });
+        let lines = segments
+            .as_ref()
+            .map(|segments| {
+                segments
+                    .iter()
+                    .map(|(text, _)| text.clone())
+                    .collect::<Vec<String>>()
+            })
+            .map_err(String::clone);
         // `summary`: the LLM's text and what the grounding check made of it.
         let review = |summary: Option<(&str, &grounding::Grounded)>| {
             store.update(id, |m| {
@@ -1734,7 +1894,14 @@ impl<R: Runtime> Queue<R> {
         };
         let (cloud, builtin) = (!connection.is_local, recover.is_some());
         let (transcript, glossary) = (lines.join("\n"), settings.glossary);
+        // Plan 5.6-16: the prompt's lines carry their language in a mixed meeting.
+        let tagged: Vec<String> = segments
+            .unwrap_or_default()
+            .iter()
+            .map(|(text, lang)| summarize::line(text, lang.as_deref(), &languages))
+            .collect();
         let (app, run_id, asked) = (self.app.clone(), id.to_string(), glossary.clone());
+        let spoken = languages.clone();
         let partial = dir.join(summarize::PARTIAL);
         let task = async move {
             let on_step = |done: u32, known: u32| {
@@ -1745,7 +1912,17 @@ impl<R: Runtime> Queue<R> {
                 });
             };
             let partial = Some(partial.as_path());
-            summarize::summarize(&connection, key, &asked, &lines, on_step, recover, partial).await
+            summarize::summarize(
+                &connection,
+                key,
+                &asked,
+                &spoken,
+                &tagged,
+                on_step,
+                recover,
+                partial,
+            )
+            .await
         };
         let (summary, timings) = match self.request(id, cloud, task) {
             Ok(Ok(done)) => done,
@@ -1761,7 +1938,7 @@ impl<R: Runtime> Queue<R> {
                 timings.predicted_ms / 1000.0
             );
         }
-        let grounded = grounding::check(&summary, &transcript, &glossary);
+        let grounded = grounding::check(&summary, &transcript, &glossary, &languages);
         if !grounded.checked {
             log::warn!("요약의 액션 아이템을 읽지 못해 근거 검사를 하지 못했습니다 ({id})");
         }
@@ -1926,6 +2103,7 @@ impl<R: Runtime> Queue<R> {
             p.status = status;
             p.eta_secs = None;
             p.slow = None;
+            p.detecting = false;
             if !waiting {
                 // Out of line, even if a recording put it back before this run could stop.
                 p.position = None;
@@ -2231,31 +2409,50 @@ mod tests {
                 start_ms: c.start_ms,
                 end_ms: c.end_ms,
                 text: format!("구간 {index}"),
+                lang: None,
             }],
+            languages: vec!["ko".into()],
         }
     }
 
     #[test]
     fn resumes_after_the_last_finished_chunk() {
+        let ko = vec!["ko".to_string()];
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(PARTIAL);
         let plan = [chunk(0, 10), chunk(10, 20), chunk(20, 30)];
-        assert!(read_partial(&path, &plan).is_empty());
+        assert!(read_partial(&path, &plan, &ko).is_empty());
 
         write_partial(&path, &[result(0, &plan[0]), result(1, &plan[1])]).unwrap();
-        assert_eq!(read_partial(&path, &plan).len(), 2);
+        assert_eq!(read_partial(&path, &plan, &ko).len(), 2);
 
         // A torn last line (an older appending writer, a disk error) is redone, not trusted.
         let mut text = fs::read_to_string(&path).unwrap();
         text.truncate(text.len() - 10);
         fs::write(&path, text).unwrap();
-        assert_eq!(read_partial(&path, &plan), [result(0, &plan[0])]);
+        assert_eq!(read_partial(&path, &plan, &ko), [result(0, &plan[0])]);
 
         // Lines that do not match the plan stop the resume there.
         write_partial(&path, &[result(0, &plan[0]), result(1, &chunk(10, 25))]).unwrap();
-        assert_eq!(read_partial(&path, &plan).len(), 1);
+        assert_eq!(read_partial(&path, &plan, &ko).len(), 1);
         write_partial(&path, &[result(1, &plan[1])]).unwrap();
-        assert!(read_partial(&path, &plan).is_empty());
+        assert!(read_partial(&path, &plan, &ko).is_empty());
+    }
+
+    /// Plan 5.6-7: a chunk stamped with other languages (left by an E3 whose deletion failed) is
+    /// never resumed; a line from before 1.1.0, without a stamp, was Korean.
+    #[test]
+    fn a_leftover_in_other_languages_is_not_resumed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(PARTIAL);
+        let plan = [chunk(0, 10), chunk(10, 20)];
+        write_partial(&path, &[result(0, &plan[0]), result(1, &plan[1])]).unwrap();
+        let ko_vi = vec!["ko".to_string(), "vi".into()];
+        assert!(read_partial(&path, &plan, &ko_vi).is_empty());
+        let old = r#"{"chunk":0,"start_ms":0,"end_ms":10,"segments":[]}"#;
+        fs::write(&path, format!("{old}\n")).unwrap();
+        assert_eq!(read_partial(&path, &plan, &["ko".into()]).len(), 1);
+        assert!(read_partial(&path, &plan, &["en".into()]).is_empty());
     }
 
     #[test]
@@ -2706,7 +2903,10 @@ mod tests {
     /// A meeting in `status` (`engine_queue`'s store).
     fn meeting(app: &tauri::App<tauri::test::MockRuntime>, status: Status) -> String {
         let store = app.state::<Store>();
-        let id = store.create("", false).unwrap().id;
+        let id = store
+            .create("", false, crate::transcribe::lang::default_list())
+            .unwrap()
+            .id;
         store
             .update(&id, |m| {
                 m.status = status;
@@ -3025,7 +3225,11 @@ mod tests {
             }
 
             fn recorded(&self) -> String {
-                let id = self.store().create("", false).unwrap().id;
+                let id = self
+                    .store()
+                    .create("", false, crate::transcribe::lang::default_list())
+                    .unwrap()
+                    .id;
                 self.store().finish_recording(&id, 0, vec![]).unwrap();
                 id
             }
@@ -3110,7 +3314,11 @@ mod tests {
 
             /// A meeting that waits with its transcript, as one transcribed before would.
             fn transcribed(&self, summarize_local: bool, pinned: Option<&str>) -> String {
-                let id = self.store().create("", summarize_local).unwrap().id;
+                let id = self
+                    .store()
+                    .create("", summarize_local, crate::transcribe::lang::default_list())
+                    .unwrap()
+                    .id;
                 self.store().finish_recording(&id, 0, vec![]).unwrap();
                 let segments = serde_json::json!({"segments": [
                     {"start_ms": 0, "end_ms": 10000, "text": "이번 주 배포는 목요일 오후에 하고 릴리스 노트는 민수 씨가 금요일까지 씁니다"}
@@ -3183,7 +3391,8 @@ mod tests {
                 [Segment {
                     start_ms: 0,
                     end_ms: 10000,
-                    text: "구간 0".into()
+                    text: "구간 0".into(),
+                    lang: None,
                 }]
             );
             assert_eq!(f.runs(&id), ["gpu"]);
@@ -4123,6 +4332,336 @@ mod tests {
                 (Status::SummarizeFailed, Some("앞의 실패"), None)
             );
             assert_eq!(f.asked(), 0);
+        }
+
+        /// The worker waits for `meetings/go` before it answers.
+        const GATED: &str = r#"while [ ! -e "$2/../go" ]; do sleep 0.05; done; "#;
+
+        fn codes(codes: &[&str]) -> Vec<String> {
+            codes.iter().map(|c| c.to_string()).collect()
+        }
+
+        fn header(f: &Fixture, id: &str) -> String {
+            let log = f.store().dir_for(id).unwrap().join("worker.log");
+            fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .filter(|l| l.starts_with("--- --transcribe-worker"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        /// Plan 5.6-6, 5.6-30 (E3): `recorded` with the new languages and the old results' fields
+        /// cleared ("로컬로 요약" unpinned), every old file gone before a worker runs, the chunk
+        /// plan kept, then transcribed again in the new language.
+        #[cfg(unix)]
+        #[test]
+        fn e3_clears_the_results_resets_the_meeting_and_transcribes_it_again() {
+            let f = fixture(&format!("{GATED}{RESULT}"), Backend::Cpu);
+            let id = f.transcribed(true, Some("cloud"));
+            let dir = f.store().dir_for(&id).unwrap();
+            for name in crate::store::RESULTS {
+                fs::write(dir.join(name), "옛 결과").unwrap();
+            }
+            fs::write(dir.join("chunks.json"), PLAN).unwrap();
+            f.store()
+                .update(&id, |m| {
+                    m.status = Status::Review;
+                    m.title = "주간 회의".into();
+                    (m.backend, m.chunks_done, m.chunks_total) = (Some("gpu".into()), 2, 2);
+                    (m.grounding_replaced, m.grounding_checked) = (1, Some(true));
+                    m.no_speech = true;
+                    Ok(())
+                })
+                .unwrap();
+            let meta = f
+                .queue()
+                .retranscribe(&f.store(), &id, &codes(&["en"]), || false)
+                .unwrap();
+            assert_eq!(
+                (meta.status, meta.languages.as_slice(), meta.chunks_done),
+                (Status::Recorded, &codes(&["en"])[..], 0)
+            );
+            assert_eq!(
+                (meta.backend, meta.llm_connection, meta.error),
+                (None, None, None)
+            );
+            assert_eq!((meta.grounding_replaced, meta.grounding_checked), (0, None));
+            assert!(!meta.no_speech && !meta.held);
+            // The title, the plan and "로컬로 요약" stay.
+            assert_eq!((meta.title.as_str(), meta.chunks_total), ("주간 회의", 2));
+            assert!(meta.summarize_local);
+            f.wait("transcribing", || f.transcribing(&id));
+            assert!(
+                crate::store::RESULTS
+                    .iter()
+                    .all(|name| !dir.join(name).exists())
+            );
+            assert!(dir.join("chunks.json").exists());
+            fs::write(dir.parent().unwrap().join("go"), "").unwrap();
+            f.wait("done", || f.queue().snapshot().is_empty());
+            assert_eq!(f.status(&id), Status::Review);
+            // Only the English list filters now: the Korean phrase stays (plan 5.6-13).
+            assert_eq!(
+                f.transcript(&id),
+                serde_json::json!({"segments": [
+                    {"start_ms": 0, "end_ms": 10000, "text": "구간 0"},
+                    {"start_ms": 0, "end_ms": 10000, "text": "시청해주셔서 감사합니다."}
+                ]})
+            );
+            let header = header(&f, &id);
+            assert!(
+                header.contains("--lang en ") && !header.contains("--lid-model"),
+                "{header}"
+            );
+        }
+
+        /// Plan 5.6-6, 5.7-7: refused while it runs or sends, before it was transcribed, once it
+        /// was sent, and for a bad list or id. Nothing changes then.
+        #[cfg(unix)]
+        #[test]
+        fn e3_is_refused_while_running_sending_or_out_of_its_states() {
+            let f = fixture(&format!("{GATED}{RESULT}"), Backend::Cpu);
+            let (queue, store) = (f.queue(), f.store());
+            let e3 = |id: &str, codes: &[String], sending: bool| {
+                queue.retranscribe(&store, id, codes, || sending)
+            };
+            let review = f.transcribed(false, None);
+            store.set_status(&review, Status::Summarizing).unwrap();
+            store.set_status(&review, Status::Review).unwrap();
+            let before = store.get(&review).unwrap();
+            let sending = e3(&review, &codes(&["en"]), true).unwrap_err();
+            assert_eq!(sending, "보내는 중입니다");
+            for bad in [vec![], codes(&["en", "en"]), codes(&["ja"])] {
+                assert!(e3(&review, &bad, false).is_err(), "{bad:?}");
+            }
+            assert!(e3("../meetings", &codes(&["en"]), false).is_err());
+            assert_eq!(store.get(&review).unwrap(), before);
+
+            let recorded = f.recorded();
+            let refused = e3(&recorded, &codes(&["en"]), false).unwrap_err();
+            assert!(refused.contains("다시 전사할 수 없는 상태"), "{refused}");
+            let sent = f.transcribed(false, None);
+            store
+                .update(&sent, |m| {
+                    m.status = Status::Sent;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(e3(&sent, &codes(&["en"]), false).is_err());
+
+            // Running: E3 and a language change both wait for "일시정지".
+            queue.enqueue(&recorded, Status::Recorded);
+            f.wait("transcribing", || f.transcribing(&recorded));
+            let running = e3(&recorded, &codes(&["en"]), false).unwrap_err();
+            assert_eq!(running, "처리 중입니다. 먼저 일시정지해 주세요");
+            let changed = queue.set_language(&store, &recorded, &codes(&["en"]));
+            assert_eq!(changed.unwrap_err(), "처리 중에는 바꿀 수 없습니다");
+            fs::write(
+                store
+                    .dir_for(&recorded)
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("go"),
+                "",
+            )
+            .unwrap();
+            f.wait("done", || queue.snapshot().is_empty());
+            assert_eq!(store.get(&recorded).unwrap().languages, ["ko"]);
+        }
+
+        /// Plan 5.6-4, 5.6-5: the languages change while it records and stay through its end;
+        /// once a chunk or the transcript exists, only E3 changes them.
+        #[test]
+        fn languages_change_until_a_chunk_is_done_and_survive_the_recording_end() {
+            let f = fixture(RESULT, Backend::Cpu);
+            let (queue, store) = (f.queue(), f.store());
+            let id = store
+                .create("", false, crate::transcribe::lang::default_list())
+                .unwrap()
+                .id;
+            let meta = queue
+                .set_language(&store, &id, &codes(&["vi", "ko"]))
+                .unwrap();
+            assert_eq!(
+                (meta.status, meta.languages),
+                (Status::Recording, codes(&["ko", "vi"]))
+            );
+            store.finish_recording(&id, 1_000, vec![]).unwrap();
+            assert_eq!(store.get(&id).unwrap().languages, ["ko", "vi"]);
+            for bad in [vec![], codes(&["ko", "ko"]), codes(&["xx"])] {
+                assert!(queue.set_language(&store, &id, &bad).is_err(), "{bad:?}");
+            }
+            assert!(queue.set_language(&store, "../x", &codes(&["ko"])).is_err());
+
+            store
+                .update(&id, |m| {
+                    m.chunks_done = 1;
+                    Ok(())
+                })
+                .unwrap();
+            let refused = queue
+                .set_language(&store, &id, &codes(&["en"]))
+                .unwrap_err();
+            assert_eq!(refused, TRANSCRIBED);
+            let id = f.transcribed(false, None);
+            let refused = queue
+                .set_language(&store, &id, &codes(&["en"]))
+                .unwrap_err();
+            assert_eq!(refused, TRANSCRIBED);
+        }
+
+        /// Plan 5.6-14: without the detection model a Korean meeting runs and a mixed one waits
+        /// in line, never failing; once the model arrives it runs with `--lid-model`.
+        #[cfg(unix)]
+        #[test]
+        fn a_mixed_meeting_waits_for_the_detection_model_and_a_korean_one_does_not() {
+            let f = fixture(RESULT, Backend::Cpu);
+            let models = f.app.state::<Models>().dir.clone();
+            let medium = model::needed("medium-q5_0").unwrap()[0];
+            let sparse = |file: &str, size: u64| {
+                fs::File::create(models.join(file))
+                    .unwrap()
+                    .set_len(size)
+                    .unwrap();
+            };
+            sparse(medium.file, medium.size);
+            fs::remove_file(models.join(model::lid().file)).unwrap();
+            let settings = Settings {
+                model: "medium-q5_0".into(),
+                backend: Backend::Cpu,
+                ..Settings::default()
+            };
+            f.app.state::<SettingsStore>().save(settings).unwrap();
+            let mixed = f.recorded();
+            f.queue()
+                .set_language(&f.store(), &mixed, &codes(&["ko", "vi"]))
+                .unwrap();
+            let korean = f.recorded();
+            f.queue().enqueue_pending();
+            f.wait("korean", || f.status(&korean) == Status::Review);
+            assert_eq!(f.status(&mixed), Status::Recorded);
+            let waiting = f.queue().snapshot();
+            assert!(
+                waiting
+                    .iter()
+                    .any(|p| p.id == mixed && p.position == Some(1))
+            );
+            assert!(!header(&f, &korean).contains("--lid-model"));
+
+            sparse(model::lid().file, model::lid().size);
+            f.queue().pump();
+            f.wait("mixed", || f.status(&mixed) == Status::Review);
+            let header = header(&f, &mixed);
+            let lid = format!("--lid-model {}", models.join(model::lid().file).display());
+            assert!(
+                header.contains("--lang ko,vi ") && header.contains(&lid),
+                "{header}"
+            );
+        }
+
+        /// Plan 5.6-7: a `recorded` meeting starts without what another run left: the partial
+        /// transcript is not resumed and the edited summary is gone.
+        #[cfg(unix)]
+        #[test]
+        fn a_recorded_meeting_starts_without_what_another_run_left() {
+            let f = fixture(RESULT, Backend::Cpu);
+            let id = f.recorded();
+            let dir = f.store().dir_for(&id).unwrap();
+            fs::write(dir.join("chunks.json"), PLAN).unwrap();
+            let old = r#"{"chunk":0,"start_ms":0,"end_ms":10000,"segments":[{"start_ms":0,"end_ms":10000,"text":"옛 언어"}],"languages":["ko"]}"#;
+            fs::write(dir.join(PARTIAL), format!("{old}\n")).unwrap();
+            fs::write(dir.join("summary.md"), "옛 요약").unwrap();
+            f.queue().enqueue_pending();
+            f.wait("done", || f.queue().snapshot().is_empty());
+            assert_eq!(f.runs(&id), ["cpu"]);
+            assert_eq!(f.transcript(&id)["segments"][0]["text"], "구간 0");
+            assert!(!dir.join("summary.md").exists());
+        }
+
+        /// Plan 5.6-27: the worker's detection shows on the meeting's progress while it lasts.
+        #[cfg(unix)]
+        #[test]
+        fn detection_shows_on_the_progress_while_it_lasts() {
+            let script = format!(
+                r#"echo '{{"type":"detecting","on":true}}'; {GATED}echo '{{"type":"detecting","on":false}}'; {RESULT}"#
+            );
+            let f = fixture(&script, Backend::Cpu);
+            let id = f.recorded();
+            f.queue().enqueue_pending();
+            let detecting = || {
+                f.queue()
+                    .snapshot()
+                    .iter()
+                    .any(|p| p.id == id && p.detecting)
+            };
+            f.wait("detecting", detecting);
+            let dir = f.store().dir_for(&id).unwrap();
+            fs::write(dir.parent().unwrap().join("go"), "").unwrap();
+            f.wait("done", || f.queue().snapshot().is_empty());
+            let events = f.events.lock().unwrap();
+            let last = events.last().unwrap();
+            assert_eq!(
+                (&last["status"], &last["detecting"]),
+                (&serde_json::json!("review"), &serde_json::json!(false))
+            );
+        }
+
+        /// Plan 5.7-7: a list on disk that is not valid is written back as Korean and runs so,
+        /// instead of failing again at every start.
+        #[cfg(unix)]
+        #[test]
+        fn languages_that_are_not_valid_on_disk_run_as_korean() {
+            let f = fixture(RESULT, Backend::Cpu);
+            let id = f.recorded();
+            f.store()
+                .update(&id, |m| {
+                    m.languages = codes(&["ko", "xx"]);
+                    Ok(())
+                })
+                .unwrap();
+            f.queue().enqueue_pending();
+            f.wait("done", || f.queue().snapshot().is_empty());
+            let meta = f.store().get(&id).unwrap();
+            assert_eq!(
+                (meta.status, meta.languages),
+                (Status::Review, codes(&["ko"]))
+            );
+            let header = header(&f, &id);
+            assert!(
+                header.contains("--lang ko ") && !header.contains("--lid-model"),
+                "{header}"
+            );
+        }
+
+        /// Plan 5.6-6, 5.7-1: the line read at the same time never runs the meeting before its
+        /// old results are gone, nor twice.
+        #[cfg(unix)]
+        #[test]
+        fn e3_beside_the_line_runs_the_meeting_once() {
+            let f = fixture(RESULT, Backend::Cpu);
+            let id = f.transcribed(false, None);
+            f.store().set_status(&id, Status::Summarizing).unwrap();
+            f.store().set_status(&id, Status::Review).unwrap();
+            let app = f.app.handle().clone();
+            thread::scope(|s| {
+                s.spawn(move || {
+                    for _ in 0..50 {
+                        app.state::<Mock>().enqueue_pending();
+                    }
+                });
+                f.queue()
+                    .retranscribe(&f.store(), &id, &codes(&["en"]), || false)
+                    .unwrap();
+            });
+            f.wait("done", || f.queue().snapshot().is_empty());
+            assert_eq!(f.runs(&id), ["cpu"]);
+            let meta = f.store().get(&id).unwrap();
+            assert_eq!(
+                (meta.status, meta.languages),
+                (Status::Review, codes(&["en"]))
+            );
         }
     }
 }

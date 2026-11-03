@@ -1,16 +1,23 @@
 //! Hallucination filter (TRN-08, architecture 5.5) and the abnormal-result check (TRN-07).
 
 use super::engine::Segment;
+use super::lang::LANGS;
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-/// Built in: a new list ships with a new build, like every other change during the pilot.
-static PHRASES: LazyLock<HashSet<String>> = LazyLock::new(|| {
-    include_str!("../resources/hallucinations.ko.txt")
-        .lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .map(normalize)
-        .filter(|l| !l.is_empty())
+/// Built in: a new list ships with a new build, like every other change during the pilot. One per
+/// language of `LANGS`, lowercase so Latin script matches whatever its case (plan 5.6-13).
+static PHRASES: LazyLock<Vec<HashSet<String>>> = LazyLock::new(|| {
+    LANGS
+        .iter()
+        .map(|l| {
+            l.hallucinations
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .map(|l| normalize(l).to_lowercase())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
         .collect()
 });
 /// TRN-07: this much speech by VAD with no text means the chunk failed.
@@ -34,12 +41,19 @@ pub fn normalize(text: &str) -> String {
 
 /// Drops a segment only when its whole normalized text is a listed phrase, never on a partial
 /// or similar match. A segment with no letters left (only "♪" or "...") goes too: it has no words.
-pub fn filter(segments: Vec<Segment>) -> Vec<Segment> {
+/// Only the lists of the chunk's `languages` apply.
+pub fn filter(segments: Vec<Segment>, languages: &[String]) -> Vec<Segment> {
+    let lists: Vec<&HashSet<String>> = LANGS
+        .iter()
+        .zip(PHRASES.iter())
+        .filter(|(l, _)| languages.iter().any(|c| c == l.code))
+        .map(|(_, phrases)| phrases)
+        .collect();
     segments
         .into_iter()
         .filter(|s| {
-            let text = normalize(&s.text);
-            !text.is_empty() && !PHRASES.contains(&text)
+            let text = normalize(&s.text).to_lowercase();
+            !text.is_empty() && !lists.iter().any(|p| p.contains(&text))
         })
         .collect()
 }
@@ -75,7 +89,12 @@ mod tests {
             start_ms: 0,
             end_ms: 1_000,
             text: text.into(),
+            lang: None,
         }
+    }
+
+    fn langs(codes: &[&str]) -> Vec<String> {
+        codes.iter().map(|c| c.to_string()).collect()
     }
 
     fn texts(segments: Vec<Segment>) -> Vec<String> {
@@ -98,16 +117,19 @@ mod tests {
 
     #[test]
     fn removes_only_exact_matches_after_normalizing() {
-        let kept = filter(vec![
-            seg(" 시청해주셔서 감사합니다."),
-            seg("시청해 주셔서 감사합니다!"),
-            seg("다음 영상에서 만나요~"),
-            seg("♪♪"),
-            // Similar or containing a listed phrase: real speech, kept.
-            seg("오늘 회의에 참석해 주셔서 감사합니다."),
-            seg("시청해주셔서 감사합니다. 그럼 시작하겠습니다."),
-            seg("다음 영상에서 만나요 라고 하면 안 됩니다"),
-        ]);
+        let kept = filter(
+            vec![
+                seg(" 시청해주셔서 감사합니다."),
+                seg("시청해 주셔서 감사합니다!"),
+                seg("다음 영상에서 만나요~"),
+                seg("♪♪"),
+                // Similar or containing a listed phrase: real speech, kept.
+                seg("오늘 회의에 참석해 주셔서 감사합니다."),
+                seg("시청해주셔서 감사합니다. 그럼 시작하겠습니다."),
+                seg("다음 영상에서 만나요 라고 하면 안 됩니다"),
+            ],
+            &langs(&["ko"]),
+        );
         assert_eq!(
             texts(kept),
             [
@@ -120,8 +142,39 @@ mod tests {
 
     #[test]
     fn list_comments_and_blank_lines_are_not_phrases() {
-        assert!(!PHRASES.is_empty());
-        assert!(PHRASES.iter().all(|p| !p.is_empty() && !p.contains("TRN")));
+        assert_eq!(PHRASES.len(), LANGS.len());
+        for list in PHRASES.iter() {
+            assert!(!list.is_empty());
+            assert!(list.iter().all(|p| !p.is_empty() && !p.contains("TRN")));
+        }
+    }
+
+    /// Plan 5.6-13: Latin script in any case, and only the lists of the meeting's languages.
+    #[test]
+    fn latin_phrases_match_in_any_case_and_only_for_their_language() {
+        let segments = || {
+            vec![
+                seg("THANK YOU FOR WATCHING!"),
+                seg("Cảm ơn các bạn đã theo dõi."),
+                seg("시청해주셔서 감사합니다"),
+                seg("Thank you for watching the demo."),
+            ]
+        };
+        assert_eq!(
+            texts(filter(segments(), &langs(&["en", "vi"]))),
+            [
+                "시청해주셔서 감사합니다",
+                "Thank you for watching the demo."
+            ]
+        );
+        assert_eq!(
+            texts(filter(segments(), &langs(&["ko"]))),
+            [
+                "THANK YOU FOR WATCHING!",
+                "Cảm ơn các bạn đã theo dõi.",
+                "Thank you for watching the demo."
+            ]
+        );
     }
 
     #[test]

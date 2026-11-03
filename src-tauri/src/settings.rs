@@ -86,6 +86,8 @@ pub struct Settings {
     /// The channel id last sent to (SND-04).
     pub last_channel: Option<String>,
     pub glossary: Vec<String>,
+    /// Plan 5.6-2: a new meeting's languages, in `lang::LANGS` order.
+    pub transcribe_languages: Vec<String>,
 }
 
 impl Default for Settings {
@@ -110,6 +112,7 @@ impl Default for Settings {
             slack_team: None,
             last_channel: None,
             glossary: Vec::new(),
+            transcribe_languages: crate::transcribe::lang::default_list(),
         }
     }
 }
@@ -142,6 +145,8 @@ fn fill_timeouts(settings: &mut Settings) {
 }
 
 fn validate(settings: &Settings) -> Result<(), String> {
+    // Plan 5.7-7.
+    crate::transcribe::lang::parse(&settings.transcribe_languages)?;
     let mut seen = HashSet::new();
     for c in &settings.llm_connections {
         let name = &c.name;
@@ -220,6 +225,9 @@ impl SettingsStore {
     }
 
     pub fn save(&self, mut settings: Settings) -> Result<(), String> {
+        // Plan 5.6-2: stored in table order.
+        settings.transcribe_languages =
+            crate::transcribe::lang::parse(&settings.transcribe_languages)?;
         let _guard = self.lock.lock().unwrap();
         let stored = fs::read(&self.path)
             .ok()
@@ -522,6 +530,26 @@ mod tests {
         let err = store.save(with(|c| c.timeout_secs = 0)).unwrap_err();
         assert!(err.contains("응답 시간 제한"), "{err}");
         assert!(!store.path.exists());
+    }
+
+    /// Plan 5.6-2, 5.7-7: known codes only, none twice, one or more, stored in table order.
+    #[test]
+    fn transcribe_languages_are_checked_and_kept_in_table_order() {
+        let (_tmp, store) = store();
+        let with = |codes: &[&str]| Settings {
+            transcribe_languages: codes.iter().map(|c| c.to_string()).collect(),
+            ..Settings::default()
+        };
+        for bad in [&[][..], &["ko", "ko"], &["xx"]] {
+            assert!(store.save(with(bad)).is_err(), "{bad:?}");
+        }
+        assert!(!store.path.exists());
+        assert_eq!(store.load().unwrap().settings.transcribe_languages, ["ko"]);
+        store.save(with(&["vi", "ko"])).unwrap();
+        assert_eq!(
+            store.load().unwrap().settings.transcribe_languages,
+            ["ko", "vi"]
+        );
     }
 
     #[test]

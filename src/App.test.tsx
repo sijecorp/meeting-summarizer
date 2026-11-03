@@ -75,6 +75,7 @@ const loaded: LoadedSettings = {
     slack_team: "SIJE",
     last_channel: "C1",
     glossary: [],
+    transcribe_languages: ["ko"],
   },
 };
 
@@ -174,6 +175,7 @@ const meeting = (id: string, status: Status, interrupted = false): MeetingItem =
   no_speech: false,
   error: null,
   sent: null,
+  languages: ["ko"],
   interrupted,
 });
 
@@ -770,7 +772,7 @@ test("REC-12: a picked recording file becomes a meeting, and its document opens"
   fireEvent.click(await screen.findByRole("button", { name: "녹음 파일 가져오기" }));
 
   expect(await screen.findByRole("heading", { level: 1, name: "가져온 회의" })).toBeTruthy();
-  expect(calls.find((c) => c.cmd === "import_recording")?.args).toEqual({ path });
+  expect(calls.find((c) => c.cmd === "import_recording")?.args).toEqual({ path, languages: ["ko"] });
   expect(calls.find((c) => c.cmd === "plugin:dialog|open")?.args).toMatchObject({
     options: { filters: [{ extensions: expect.arrayContaining(["mp3", "m4a", "wav"]) }] },
   });
@@ -833,7 +835,7 @@ test("REC-12: a recording file dropped anywhere is imported, and alone opens its
   expect(await screen.findByRole("heading", { level: 1, name: "떨어뜨린 회의" })).toBeTruthy();
   expect(screen.queryByText("놓으면 녹음 파일을 가져옵니다")).toBeNull();
   expect(calls.filter((c) => c.cmd === "import_recording").map((c) => c.args)).toEqual([
-    { path: "/Users/hong/주간 회의.M4A" },
+    { path: "/Users/hong/주간 회의.M4A", languages: ["ko"] },
   ]);
 });
 

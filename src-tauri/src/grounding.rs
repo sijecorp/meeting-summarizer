@@ -109,9 +109,17 @@ pub struct Grounded {
     pub checked: bool,
 }
 
-/// Checks the action items of `summary` against `transcript`, with the glossary's names.
-pub fn check(summary: &str, transcript: &str, glossary: &[String]) -> Grounded {
+/// Checks the action items of `summary` against `transcript`, with the glossary's names. Plan
+/// 5.6-18: dates are read only in Korean, so a meeting in any other language too keeps its
+/// deadlines unjudged.
+pub fn check(
+    summary: &str,
+    transcript: &str,
+    glossary: &[String],
+    languages: &[String],
+) -> Grounded {
     let heard = Heard::new(transcript);
+    let dates = languages.iter().all(|l| l == "ko");
     let unchecked = || Grounded {
         text: summary.into(),
         replaced: 0,
@@ -131,7 +139,7 @@ pub fn check(summary: &str, transcript: &str, glossary: &[String]) -> Grounded {
                 ..
             } if actions => {
                 // The due date first: it comes after the owner, so the owner's place stays put.
-                if let Some(due) = due.filter(|d| d != UNDECIDED && !dated(d, &heard)) {
+                if let Some(due) = due.filter(|d| dates && d != UNDECIDED && !dated(d, &heard)) {
                     let at = line.rfind('(').expect("a parsed due date") + 1;
                     line.replace_range(at..at + due.len(), UNDECIDED);
                     replaced += 1;
@@ -184,10 +192,7 @@ impl Heard {
     pub fn new(transcript: &str) -> Self {
         let words = transcript
             .split_whitespace()
-            .map(|w| {
-                w.trim_matches(|c: char| !c.is_alphanumeric())
-                    .to_lowercase()
-            })
+            .map(|w| plain(w.trim_matches(|c: char| !c.is_alphanumeric())).to_lowercase())
             .filter(|w| !w.is_empty())
             .collect();
         Self {
@@ -241,7 +246,7 @@ pub fn named(name: &str, heard: &Heard, glossary: &[String]) -> bool {
 /// A name as it is looked for: no spaces, lowercase, without titles after it while two characters
 /// are left ("김 과장님" is 김과장, not 김).
 fn person(name: &str) -> String {
-    let mut name = squash(name).to_lowercase();
+    let mut name = plain(&squash(name)).to_lowercase();
     while let Some(rest) = TITLES
         .iter()
         .find_map(|t| name.strip_suffix(t))
@@ -250,6 +255,30 @@ fn person(name: &str) -> String {
         name = rest.to_string();
     }
     name
+}
+
+/// Plan 5.6-18: Latin letters without their tone and accent marks ("Nguyễn" is "Nguyen"), so a
+/// name is found however the model wrote it. Other scripts stay as they are: Hangul is never
+/// decomposed.
+fn plain(text: &str) -> String {
+    let nfd = icu_normalizer::DecomposingNormalizerBorrowed::new_nfd();
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            'đ' => out.push('d'),
+            'Đ' => out.push('D'),
+            '\u{C0}'..='\u{24F}' | '\u{1E00}'..='\u{1EFF}' => {
+                out.extend(
+                    nfd.normalize(c.encode_utf8(&mut [0; 4]))
+                        .chars()
+                        .filter(|c| !('\u{300}'..='\u{36F}').contains(c)),
+                );
+            }
+            '\u{300}'..='\u{36F}' => {}
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Month (when named) and day.
@@ -380,8 +409,19 @@ mod tests {
 
     /// `items` checked against `transcript`.
     fn heard_as(transcript: &str, items: &str, glossary: &[&str]) -> (String, u32, bool) {
+        heard_in(&["ko"], transcript, items, glossary)
+    }
+
+    /// `heard_as` for a meeting in `languages`.
+    fn heard_in(
+        languages: &[&str],
+        transcript: &str,
+        items: &str,
+        glossary: &[&str],
+    ) -> (String, u32, bool) {
         let glossary: Vec<String> = glossary.iter().map(|g| g.to_string()).collect();
-        let g = check(&actions(items), transcript, &glossary);
+        let languages: Vec<String> = languages.iter().map(|l| l.to_string()).collect();
+        let g = check(&actions(items), transcript, &glossary, &languages);
         let items = g.text.split("## 액션 아이템\n").nth(1).unwrap();
         let items = items.split("\n## 미해결 질문").next().unwrap();
         (items.to_string(), g.replaced, g.checked)
@@ -551,11 +591,41 @@ mod tests {
         assert_eq!(ground("- [민수] 결제 (2026-11-20)", &[]).1, 1);
     }
 
+    /// Plan 5.6-18: with a language other than Korean, no deadline is judged.
+    #[test]
+    fn dates_are_left_alone_when_another_language_is_in_the_meeting() {
+        let items = "- [민수] 발표 (10월 18일)\n- [민수] 정리 (내일)";
+        for languages in [&["en"][..], &["ko", "vi"]] {
+            assert_eq!(
+                heard_in(languages, "민수 씨가 11월 18일에 발표합니다", items, &[]),
+                (items.into(), 0, true)
+            );
+        }
+    }
+
+    /// Plan 5.6-18: Latin names match without tone and accent marks, either way round.
+    #[test]
+    fn latin_names_match_without_diacritics() {
+        let items = "- [Nguyen Van An] 보고\n- [Đặng] 검토";
+        assert_eq!(
+            heard_in(&["vi"], "Anh Nguyễn Văn An và chị Dang sẽ làm", items, &[]),
+            (items.into(), 0, true)
+        );
+        let items = "- [Nguyễn Văn An] 보고";
+        assert_eq!(
+            heard_in(&["vi"], "nguyen van an sẽ báo cáo", items, &[]),
+            (items.into(), 0, true)
+        );
+        assert_eq!(heard_in(&["vi"], "Trần sẽ báo cáo", items, &[]).1, 1);
+        // Hangul is never taken apart.
+        assert_eq!(plain("김민수 Café"), "김민수 Cafe");
+    }
+
     /// Only the action items: 결정사항's "[철수] … (내일)" stays.
     #[test]
     fn other_sections_are_left_alone() {
         let summary = actions("- [철수] 노트 (내일)");
-        let g = check(&summary, HEARD, &[]);
+        let g = check(&summary, HEARD, &[], &["ko".into()]);
         assert!(g.text.contains("- [철수] 결정은 그대로 (내일)"));
         assert_eq!(
             g.text,
@@ -572,7 +642,7 @@ mod tests {
             "- [철수] 노트\n  - 세부 항목",
         ] {
             let summary = actions(items);
-            let g = check(&summary, HEARD, &[]);
+            let g = check(&summary, HEARD, &[], &["ko".into()]);
             assert_eq!(
                 g,
                 Grounded {
@@ -584,12 +654,13 @@ mod tests {
             );
         }
         let none = "# 회의\n## 결정사항\n- [철수] 노트 (내일)\n## 할 일\n- [철수] 노트";
-        assert!(!check(none, HEARD, &[]).checked);
+        assert!(!check(none, HEARD, &[], &["ko".into()]).checked);
         // Empty and 없음 lines are read; a heading spelled with other spaces is still the heading.
         let g = check(
             "# 회의\n###  액션아이템 \n- 없음\n\n- [철수] 노트",
             HEARD,
             &[],
+            &["ko".into()],
         );
         assert_eq!((g.replaced, g.checked), (1, true));
     }

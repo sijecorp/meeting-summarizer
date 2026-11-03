@@ -30,8 +30,8 @@ pub struct ModelFile {
 
 /// `settings.model` → file. Hashes checked on Hugging Face on 2026-10-13 (architecture 5.1); the
 /// revisions are the commits `main` pointed at on 2026-10-16, where each file has these hashes.
-/// `tiny` is for development only (try the pipeline without an 874 MB download); the settings
-/// screen never offers it.
+/// `tiny` is for development (try the pipeline without an 874 MB download), and the language
+/// detection model of a mixed meeting (`lid`); the settings screen never offers it as a model.
 const WHISPER: [(&str, ModelFile); 4] = [
     (
         "large-v3-turbo-q8_0",
@@ -116,6 +116,12 @@ pub fn needed(model: &str) -> Result<[&'static ModelFile; 2], String> {
         .find(|(name, _)| *name == model)
         .ok_or_else(|| format!("알 수 없는 모델입니다: {model}"))?;
     Ok([whisper, &VAD])
+}
+
+/// Plan 5.6-9, 5.6-14: the model that tells a meeting's languages apart (`tiny`), needed only by a
+/// meeting of two or more. Not in `needed`: Korean-only meetings run without it.
+pub fn lid() -> &'static ModelFile {
+    needed("tiny").expect("tiny is in the table")[0]
 }
 
 /// `model://download`, about once per percent of the file being fetched and every `TICK` while
