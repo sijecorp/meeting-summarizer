@@ -27,6 +27,7 @@ import {
   setSummarizeLocal,
   STATUS_LABEL,
   summaryRoute,
+  type Lang,
   type Meta,
   type ModelDownload,
   type Progress,
@@ -300,17 +301,35 @@ export function progressText(p: Progress) {
   return { text, label, bar: !summarizing || p.chunks > 1 };
 }
 
-/** A transcript with `mm:ss` times. Plain text nodes only (architecture 10.4). */
-export function TranscriptList({ segments }: { segments: Segment[] }) {
+/** A transcript with `mm:ss` times. Plain text nodes only (architecture 10.4). Each line has its
+ * language as `lang`, for screen readers; a mixed meeting also names it on its first line and
+ * wherever it changes (plan 5.6-28, d11a). */
+export function TranscriptList({
+  segments,
+  languages = [],
+  langs = null,
+}: {
+  segments: Segment[];
+  /** The meeting's languages. */
+  languages?: string[];
+  langs?: Lang[] | null;
+}) {
   if (segments.length === 0) return <p className="text-muted-foreground">전사된 말이 없습니다</p>;
+  const mixed = languages.length > 1;
   return (
     <ol className="space-y-2 text-base">
-      {segments.map((s, i) => (
-        <li key={i} className="grid grid-cols-[auto_1fr] gap-x-4">
-          <span className="text-muted-foreground tabular-nums">{mmss(s.start_ms)}</span>
-          <span>{s.text}</span>
-        </li>
-      ))}
+      {segments.map((s, i) => {
+        const named = mixed && s.lang && s.lang !== segments[i - 1]?.lang && langs?.find((l) => l.code === s.lang);
+        return (
+          <li key={i} className="grid grid-cols-[auto_1fr] gap-x-4">
+            <span className="text-muted-foreground tabular-nums">{mmss(s.start_ms)}</span>
+            <span>
+              {named && <span className="block text-caption text-ink-2">{named.name}</span>}
+              <span lang={s.lang ?? (mixed ? undefined : languages[0])}>{s.text}</span>
+            </span>
+          </li>
+        );
+      })}
     </ol>
   );
 }

@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent } from "react";
 import { createPortal } from "react-dom";
-import { Archive, ArrowLeft, Check, Copy, Ellipsis, FileDown, RotateCcw, Trash2 } from "lucide-react";
+import { Archive, ArrowLeft, Check, Copy, Ellipsis, FileDown, Languages, RotateCcw, Trash2 } from "lucide-react";
 import { AnimatePresence, motion, useIsPresent, useReducedMotion } from "motion/react";
 import {
   Banner,
@@ -15,8 +15,10 @@ import {
   ro,
   RouteNotice,
   SelectField,
+  stopping,
   useSummaryModel,
 } from "@/components/common";
+import { languageNames, transcribedIn, useLanguages } from "@/components/Languages";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -64,6 +66,7 @@ import {
   type Settings,
   type Status,
   type Channel,
+  type Meta,
 } from "@/lib/ipc";
 import { swapVariants, TITLE_GLIDE_MS, titleMove } from "@/lib/motion";
 import { cn } from "@/lib/utils";
@@ -72,6 +75,7 @@ import {
   caretRect,
   DocView,
   Grow,
+  LanguageDialog,
   SendBar,
   Skeleton,
   Steps,
@@ -194,7 +198,7 @@ export default function Meeting({
   const [sentHere, setSentHere] = useState(false);
   // SUM-06: the connection picked for 요약 다시 실행, until then the default.
   const [chosen, setChosen] = useState("");
-  const [asking, setAsking] = useState<"archive" | "delete" | null>(null);
+  const [asking, setAsking] = useState<"archive" | "delete" | "language" | null>(null);
   // The summary arrived while open: it comes in once, read-only, before it can be edited.
   const [reveal, setReveal] = useState(false);
   // REV-01: the summary reads as a document; a click on a line or 고치기 swaps the editor in
@@ -205,6 +209,7 @@ export default function Meeting({
   const [panel, setPanel] = useState({ open: false, instant: false });
   const [segments, setSegments] = useState<Segment[] | null>(null);
   const [transcriptError, setTranscriptError] = useState("");
+  const langs = useLanguages();
   const timer = useRef(0);
   const fields = useRef(false);
   const latest = useRef(0);
@@ -482,6 +487,20 @@ export default function Meeting({
       },
       (e) => setError(String(e)),
     );
+  // Plan 5.6-24: in other languages. Transcribed again (E3), its summary, review edits and
+  // transcript are gone: nothing of them stays on screen or waits to be saved.
+  const relanguaged = (next: Meta) => {
+    s.pending = null;
+    s.latest++;
+    fields.current = false;
+    seen.current = next.status;
+    setLoaded(false);
+    setSaveState("");
+    setSaveError("");
+    setSegments(null);
+    setPanel({ open: false, instant: true });
+    setDetail((d) => d && { ...d, meta: next, summary: "" });
+  };
   // Plan 5.3-11: whatever it did (`already_done` too), the meeting is read again, without a banner.
   const pause = () => {
     setError("");
@@ -560,6 +579,12 @@ export default function Meeting({
     .map((line) => line.trim())
     .filter((line) => line.includes("미정"));
   const c = meta?.llm_connection;
+  // Plan 5.6: its languages, named once the table is read.
+  const named = languageNames(langs, meta?.languages ?? []);
+  const korean = meta?.languages.join() === "ko";
+  // Plan 5.6-24: not once sent, nor while recording (the recording screen changes it then).
+  const relanguage =
+    !!meta && !newer && !(["sent", "recording", "deleting", "unknown"] as Status[]).includes(meta.status);
 
   // The meta line (`caption`): when, how long, who recorded, where it was summarized (SUM-07),
   // where it went, and the autosave.
@@ -576,6 +601,7 @@ export default function Meeting({
             : meta.summarize_local
               ? `이 PC에서 ${c}${ro(c)} 요약함`
               : `${c}${ro(c)} 보내 요약함`),
+        !korean && named.length > 0 && transcribedIn(named),
         meta.status === "sent" && meta.sent && (
           <>
             <Check aria-hidden className="size-3.5 text-ok-line" />
@@ -641,13 +667,20 @@ export default function Meeting({
                     </DropdownMenuItem>
                   </>
                 )}
+                {/* Focusable while it runs too: the dialog says why it cannot change then. */}
+                {relanguage && (
+                  <DropdownMenuItem disabled={inFlight} onSelect={() => setAsking("language")}>
+                    <Languages aria-hidden />
+                    전사 언어 바꾸기…
+                  </DropdownMenuItem>
+                )}
                 {meta.status === "review" && !newer && (
                   <DropdownMenuItem disabled={inFlight} onSelect={() => setAsking("archive")}>
                     <Archive aria-hidden />
                     전송 안 함
                   </DropdownMenuItem>
                 )}
-                {(text || (meta.status === "review" && !newer)) && <DropdownMenuSeparator />}
+                {(text || relanguage) && <DropdownMenuSeparator />}
                 <DropdownMenuItem disabled={inFlight} onSelect={() => setAsking("delete")}>
                   <Trash2 aria-hidden className="text-danger-line" />
                   삭제
@@ -838,6 +871,9 @@ export default function Meeting({
                 )}
               </AnimatePresence>
             </div>
+            {/* Plan 5.6-18: dates are read in Korean only, so another language leaves them unchecked,
+                with "미정" lines or without. */}
+            {!korean && <p className="text-label text-ink-2">이 회의의 날짜는 확인하지 않았습니다</p>}
             {/* For screen readers above all: the marks are only drawn. Typed into, so not live. */}
             {undecided.length > 0 && (
               <details className="text-label">
@@ -867,6 +903,7 @@ export default function Meeting({
                 progress={progress}
                 failed={transcribeFailed || summaryFailed}
                 recording={recording}
+                named={named}
                 onPause={pause}
                 onResume={() => queued(resumeMeeting(id))}
               />
@@ -972,6 +1009,8 @@ export default function Meeting({
         open={panel.open && present}
         instant={panel.instant}
         segments={segments}
+        languages={meta?.languages ?? []}
+        langs={langs}
         error={transcriptError}
         copied={copied?.at === "transcript" ? copied.text : ""}
         onCopy={() =>
@@ -996,6 +1035,19 @@ export default function Meeting({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+      {meta && (
+        <LanguageDialog
+          meta={meta}
+          open={asking === "language"}
+          running={now === "running"}
+          stopping={stopping(meta, progress)}
+          transcribed={meta.chunks_done > 0 || hasTranscript}
+          onOpenChange={(open) => !open && setAsking(null)}
+          onCloseAutoFocus={focusMore}
+          onPause={pause}
+          onChanged={relanguaged}
+        />
+      )}
       <DeleteDialog
         id={id}
         open={asking === "delete"}

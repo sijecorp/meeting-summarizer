@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { BatteryLow, Check, ChevronRight, CircleAlert, Copy, Cpu, Lock, Send, X } from "lucide-react";
+import { BatteryLow, Check, ChevronRight, CircleAlert, Copy, Cpu, Lock, RotateCcw, Send, X } from "lucide-react";
 import { AnimatePresence, motion, useTransform, type Variants } from "motion/react";
 import {
   Bars,
@@ -15,11 +15,24 @@ import {
   TranscriptList,
   useFollow,
 } from "@/components/common";
+import { LanguageChecks, transcribedIn, useLanguages, useLid } from "@/components/Languages";
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
+  retranscribe,
+  setMeetingLanguage,
   SLACK_MAX,
   type Channel,
+  type Lang,
   type Meta,
   type Progress,
   type Segment,
@@ -331,12 +344,15 @@ export function Steps({
   progress: p,
   failed,
   recording = false,
+  named = [],
   onPause,
   onResume,
 }: {
   meta: Meta;
   progress?: Progress;
   failed: boolean;
+  /** The names of its languages, in table order (plan 5.6-27). */
+  named?: string[];
   /** A recording runs: nothing starts until it ends (TRN-09). */
   recording?: boolean;
   onPause?: () => void;
@@ -360,6 +376,9 @@ export function Steps({
   const line = now === "running" && p ? progressText(p) : null;
   // Plan 5.1-12: only saver goes on into the summary.
   const slow = now === "running" && p?.slow && (!summary || p.slow === "saver") ? p.slow : null;
+  // Plan 5.6-27: a mixed meeting waits in line for the detection model.
+  const lid = useLid(now === "waiting" && meta.languages.length > 1);
+  const chunking = transcribing && p?.status === "transcribing";
   // Plan 5.3-12: where it stopped, from `meta.json`, so a restart draws it too.
   const stoppedIn = summary
     ? "요약 중 멈춤 · 끝난 부분부터 이어서 합니다"
@@ -373,7 +392,11 @@ export function Steps({
         now === "waiting" && recording && "녹음이 끝나면 처리합니다",
         counted && `구간 ${Math.min(p.chunk + 1, p.chunks)}/${p.chunks}`,
         counted && p.eta_secs != null && remaining(p.eta_secs),
-        transcribing && p?.status === "transcribing" && !counted && "구간 나누는 중",
+        chunking && !counted && "구간 나누는 중",
+        // Every meeting's first chunk says its languages, so a wrong pick shows early.
+        chunking && p.chunk === 0 && named.length > 0 && transcribedIn(named),
+        chunking && p.detecting && "언어를 가리는 중",
+        lid && (lid.failure || "언어 판별 모델을 받는 중"),
         // The reason says the CPU already.
         slow !== "cpu" && slow !== "cpu_nogpu" && meta.backend && `처리 장치 ${meta.backend.toUpperCase()}`,
       ]
@@ -438,6 +461,12 @@ export function Steps({
         )}
       </div>
       {note && <p className="text-caption text-ink-2 tabular-nums">{note}</p>}
+      {lid?.failure && (
+        <Button variant="outline" size="sm" onClick={lid.retry}>
+          <RotateCcw aria-hidden />
+          다시 시도
+        </Button>
+      )}
       <AnimatePresence initial={false} mode="wait">
         {slow && (
           <motion.p
@@ -526,12 +555,17 @@ const PANEL: Variants = {
 
 function PanelBody({
   segments,
+  languages,
+  langs,
   error,
   copied,
   onCopy,
   onClose,
 }: {
   segments: Segment[] | null;
+  /** The meeting's, and the table that names them (plan 5.6-28). */
+  languages: string[];
+  langs: Lang[] | null;
   error: string;
   copied: string;
   onCopy: () => void;
@@ -565,7 +599,7 @@ function PanelBody({
         {error ? (
           <p className="text-ink-2">{error}</p>
         ) : segments ? (
-          <TranscriptList segments={segments} />
+          <TranscriptList segments={segments} languages={languages} langs={langs} />
         ) : (
           <p aria-busy className="text-ink-2">
             읽는 중…
@@ -785,5 +819,103 @@ export function SendBar({
         </motion.div>
       )}
     </AnimatePresence>
+  );
+}
+
+const same = (a: string[], b: string[]) => a.join() === b.join();
+// queue::TRANSCRIBED: a chunk finished while the dialog was open (plan 5.7-6).
+const TRANSCRIBED_REFUSAL = "이미 전사한 구간이 있어 다시 전사해야 바꿀 수 있습니다";
+
+/** Plan 5.6-24 (design-system 8.7): "전사 언어 바꾸기". While it runs it only says why, with
+ * 일시정지, and is drawn again once it stops. Before any chunk is done it just changes the list;
+ * after, it deletes the results and transcribes again (E3). Unchanged, neither can be pressed. */
+export function LanguageDialog({
+  meta,
+  open,
+  running,
+  stopping,
+  transcribed,
+  onOpenChange,
+  onCloseAutoFocus,
+  onPause,
+  onChanged,
+}: {
+  meta: Meta;
+  open: boolean;
+  running: boolean;
+  /** Paused, its run not ended yet. */
+  stopping: boolean;
+  /** A chunk is done or the transcript exists. */
+  transcribed: boolean;
+  onOpenChange: (open: boolean) => void;
+  onCloseAutoFocus: (event: Event) => void;
+  onPause: () => void;
+  onChanged: (meta: Meta) => void;
+}) {
+  const langs = useLanguages();
+  const [draft, setDraft] = useState(meta.languages);
+  // Rust found a chunk done since it opened: redrawn as E3 instead of an error.
+  const [late, setLate] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    if (!open) return;
+    setDraft(meta.languages);
+    setLate(false);
+    setError("");
+  }, [open]);
+  const redo = transcribed || late;
+  const confirm = () => {
+    setBusy(true);
+    setError("");
+    (redo ? retranscribe : setMeetingLanguage)(meta.id, draft)
+      .then(
+        (next) => {
+          onOpenChange(false);
+          onChanged(next);
+        },
+        (e) => (!redo && String(e).includes(TRANSCRIBED_REFUSAL) ? setLate(true) : setError(String(e))),
+      )
+      .finally(() => setBusy(false));
+  };
+  return (
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
+      <AlertDialogContent
+        onCloseAutoFocus={onCloseAutoFocus}
+        // Before any chunk is done it has nothing to warn of.
+        {...(running || redo ? {} : { "aria-describedby": undefined })}
+      >
+        <AlertDialogHeader>
+          <AlertDialogTitle>전사 언어 바꾸기</AlertDialogTitle>
+          {(running || redo) && (
+            <AlertDialogDescription>
+              {running ? "처리 중에는 바꿀 수 없습니다" : "전사본과 요약, 검토에서 고친 내용이 지워집니다"}
+            </AlertDialogDescription>
+          )}
+        </AlertDialogHeader>
+        {!running && langs && <LanguageChecks langs={langs} value={draft} onChange={setDraft} />}
+        {error && <p className="text-caption text-danger-line">{error}</p>}
+        <AlertDialogFooter>
+          <AlertDialogCancel>취소</AlertDialogCancel>
+          {running ? (
+            <Button
+              aria-disabled={stopping || undefined}
+              className="aria-disabled:opacity-50"
+              onClick={() => !stopping && onPause()}
+            >
+              {stopping ? PAUSE.stopping : PAUSE.pause}
+            </Button>
+          ) : (
+            <Button
+              variant={redo ? "destructive" : "default"}
+              disabled={busy || same(draft, meta.languages)}
+              onClick={confirm}
+            >
+              {redo ? "지우고 다시 전사" : "바꾸기"}
+            </Button>
+          )}
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   );
 }

@@ -6,6 +6,7 @@ import { Copy, FileAudio, Minus, Settings as SettingsIcon, Square, X } from "luc
 import { AnimatePresence, motion } from "motion/react";
 import { Banner, MAC, phase, Present, SijeLogo, WIDTH, WINDOWS, withModifier } from "@/components/common";
 import Dock from "@/components/Dock";
+import { ImportLanguages } from "@/components/Languages";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -272,15 +273,17 @@ export default function App() {
   useEffect(() => {
     if (!importing) setImported(null);
   }, [importing]);
-  const importPaths = async (paths: string[], keyboard: boolean) => {
+  // Plan 5.6-25 (d10a): the files waiting for their languages, asked with the settings' ones.
+  const [asked, setAsked] = useState<{ paths: string[]; keyboard: boolean; languages: string[] } | null>(null);
+  const askImport = (paths: string[], keyboard: boolean) =>
+    getSettings().then(
+      (loaded) => setAsked({ paths, keyboard, languages: loaded.settings.transcribe_languages }),
+      () => setAsked({ paths, keyboard, languages: ["ko"] }),
+    );
+  const importPaths = async (paths: string[], languages: string[], keyboard: boolean) => {
     setImporting((n) => n + 1);
     const failed: string[] = [];
     let last: Meta | null = null;
-    // Plan 5.6-25: the settings' languages until the import dialog asks.
-    const languages = await getSettings().then(
-      (loaded) => loaded.settings.transcribe_languages,
-      () => ["ko"],
-    );
     // One after another, so the line keeps the order of one drop.
     for (const path of paths) {
       // Its own name from the start, not the last file's 100%.
@@ -300,7 +303,7 @@ export default function App() {
   const importFile = (e: MouseEvent) => {
     const keyboard = e.detail === 0;
     open({ filters: [RECORDING_FILES] }).then(
-      (path) => void (typeof path === "string" && importPaths([path], keyboard)),
+      (path) => void (typeof path === "string" && askImport([path], keyboard)),
       (err) => setNotice(`녹음 파일을 가져오지 못했습니다: ${err}`),
     );
   };
@@ -315,7 +318,7 @@ export default function App() {
       // Not while a dialog asks something (quitting, deleting): the drop was not meant for it.
       if (document.querySelector(DIALOG)) return;
       const files = payload.paths.filter(isRecordingFile);
-      if (files.length) void importPaths(files, false);
+      if (files.length) void askImport(files, false);
       else if (payload.paths.length)
         setNotice(`녹음 파일만 가져올 수 있습니다: ${RECORDING_FILES.extensions.join(", ")}`);
     });
@@ -481,6 +484,8 @@ export default function App() {
               {screen.name === "recording" && (
                 <Recording
                   startedAt={live?.created_at}
+                  languages={live?.languages}
+                  onChanged={refresh}
                   stopping={ending}
                   onHome={home}
                   onStop={stop}
@@ -553,6 +558,15 @@ export default function App() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      <ImportLanguages
+        initial={asked?.languages ?? null}
+        onImport={(languages) => {
+          setAsked(null);
+          if (asked) void importPaths(asked.paths, languages, asked.keyboard);
+        }}
+        onCancel={() => setAsked(null)}
+      />
 
       <AlertDialog open={quitAsked} onOpenChange={setQuitAsked}>
         <AlertDialogContent>

@@ -18,11 +18,13 @@ function Preview() {
   const [run, setRun] = useState(0);
   const pick = async (next: Scenario) => {
     reset(next);
-    // ipc.ts keeps one download for the app: the last one settles first. 설정 없음 and 요약 모델 받는
-    // 중 are mid-download, started before the App so Home and the settings tabs follow it.
+    // ipc.ts keeps one download for the app: the last one settles first. 설정 없음, 요약 모델 받는
+    // 중 and 판별 모델 받는 중 are mid-download, started before the App so Home and the settings
+    // tabs follow it.
     await modelDownload();
     if (next === "setup") void startModelDownload();
     if (next === "summaryDownloading") void startModelDownload("summary");
+    if (next === "languagesLid") void startModelDownload("lid");
     setScenario(next);
     setRun((n) => n + 1);
   };

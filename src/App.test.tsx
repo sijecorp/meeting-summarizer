@@ -28,13 +28,27 @@ const models = (installed: boolean): ModelState => ({
   downloading: false,
 });
 
+const LANGS = [
+  { code: "ko", name: "한국어" },
+  { code: "en", name: "영어" },
+  { code: "vi", name: "베트남어" },
+  { code: "id", name: "인도네시아어" },
+];
+const LID: ModelState = {
+  files: [{ file: "ggml-tiny.bin", size: 77_691_713, installed: true, received: 0, downloading: false }],
+  downloading: false,
+};
+
 // What App asks on every start, unless the handler says otherwise: complete settings, installed
-// models and an empty line, so no setup card shows by accident.
+// models and an empty line, so no setup card shows by accident. The language detection model is
+// installed whatever the handler says of the others.
 const mock = (handler: (cmd: string, args: Record<string, unknown>) => unknown) =>
   mockIPC(
     (cmd, args) => {
+      if (cmd === "model_status" && (args as { scope?: string }).scope === "lid") return LID;
       const defaults: Record<string, unknown> = {
         get_settings: loaded,
+        transcribe_languages: LANGS,
         model_status: models(true),
         list_connections: [
           { name: "회사 클라우드", label: "회사 클라우드", host: "api.example.com", is_local: false, builtin: false },
@@ -753,6 +767,15 @@ test("a shortcut waits while a select is open", async () => {
   expect(calls).not.toContain("start_recording");
 });
 
+/** Plan 5.6-25: a picked or dropped file waits for its languages, the settings' ones picked. */
+const importDialog = async () => within(await screen.findByRole("alertdialog", { name: "녹음 파일 가져오기" }));
+const confirmImport = async () => {
+  const dialog = await importDialog();
+  await dialog.findByRole("checkbox", { name: /한국어/ });
+  fireEvent.click(dialog.getByRole("button", { name: "가져와서 전사" }));
+  await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+};
+
 test("REC-12: a picked recording file becomes a meeting, and its document opens", async () => {
   const path = "/Users/hong/Downloads/주간 회의.m4a";
   const calls: { cmd: string; args: unknown }[] = [];
@@ -770,6 +793,7 @@ test("REC-12: a picked recording file becomes a meeting, and its document opens"
 
   render(<App />);
   fireEvent.click(await screen.findByRole("button", { name: "녹음 파일 가져오기" }));
+  await confirmImport();
 
   expect(await screen.findByRole("heading", { level: 1, name: "가져온 회의" })).toBeTruthy();
   expect(calls.find((c) => c.cmd === "import_recording")?.args).toEqual({ path, languages: ["ko"] });
@@ -795,6 +819,7 @@ test("REC-12: a cancelled pick does nothing; a file that cannot be read says why
 
   picked = "/Users/hong/notes.mp3";
   fireEvent.click(screen.getByRole("button", { name: "녹음 파일 가져오기" }));
+  await confirmImport();
   // Off to settings meanwhile: the failure follows.
   fireEvent.click(screen.getByRole("button", { name: "설정" }));
   expect(await screen.findByText("녹음 파일을 가져오지 못했습니다: 지원하지 않는 오디오 형식입니다")).toBeTruthy();
@@ -832,6 +857,7 @@ test("REC-12: a recording file dropped anywhere is imported, and alone opens its
   await drag("enter", ["/Users/hong/주간 회의.M4A"]);
 
   await drag("drop", ["/Users/hong/메모.txt", "/Users/hong/주간 회의.M4A"]);
+  await confirmImport();
   expect(await screen.findByRole("heading", { level: 1, name: "떨어뜨린 회의" })).toBeTruthy();
   expect(screen.queryByText("놓으면 녹음 파일을 가져옵니다")).toBeNull();
   expect(calls.filter((c) => c.cmd === "import_recording").map((c) => c.args)).toEqual([
@@ -853,6 +879,8 @@ test("REC-12: several dropped go in line in order and stay put; failures name th
   render(<App />);
   await screen.findByRole("button", { name: "녹음 파일 가져오기" });
   await drag("drop", ["/a/월요일.wav", "/a/깨진.mp3", "/a/화요일.mp3"]);
+  // One question for one drop.
+  await confirmImport();
 
   expect(await screen.findByText("녹음 파일을 가져오지 못했습니다: 깨진.mp3: 지원하지 않는 오디오 형식입니다")).toBeTruthy();
   expect(imported).toEqual(["/a/월요일.wav", "/a/화요일.mp3"]);
@@ -878,6 +906,7 @@ test("REC-12: the dock shows the file being imported and how far, then lets go",
 
   render(<App />);
   fireEvent.click(await screen.findByRole("button", { name: "녹음 파일 가져오기" }));
+  await confirmImport();
   await act(() => emit("import://progress", { name: "긴 회의.mp3", percent: 42 }));
 
   // The percent itself springs from 0 on a MotionValue, which jsdom does not run.
@@ -887,6 +916,45 @@ test("REC-12: the dock shows the file being imported and how far, then lets go",
 
   await act(async () => finish(meeting("긴 회의", "recorded")));
   await waitFor(() => expect(screen.queryByText("녹음 파일 가져오기")).toBeNull());
+});
+
+// Plan 5.6-25 (d10a): before a picked or dropped file is processed, its languages are asked, the
+// settings' ones checked. Cancelled, nothing is imported.
+test("an imported file asks its languages first, the settings' picked; 취소 imports nothing", async () => {
+  const calls: { cmd: string; args: unknown }[] = [];
+  const twoLanguages = { ...loaded, settings: { ...loaded.settings, transcribe_languages: ["ko", "vi"] } };
+  mock((cmd, args) => {
+    calls.push({ cmd, args });
+    if (cmd === "get_settings") return twoLanguages;
+    if (cmd === "list_meetings") return [meeting("지난 회의", "sent")];
+    if (cmd === "plugin:dialog|open") return "/a/월요일.wav";
+    if (cmd === "import_recording") return meeting("화요일", "recorded");
+    if (cmd === "get_meeting") return { meta: meeting("화요일", "recorded"), summary: "", sending: false };
+  });
+  const imports = () => calls.filter((c) => c.cmd === "import_recording").map((c) => c.args);
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "녹음 파일 가져오기" }));
+  let dialog = await importDialog();
+  await dialog.findByRole("checkbox", { name: "영어" });
+  const checked = () =>
+    (dialog.getAllByRole("checkbox") as HTMLInputElement[]).filter((c) => c.checked).map((c) => c.parentElement!.textContent);
+  expect(checked()).toEqual(["한국어", "베트남어"]);
+  expect(dialog.getByText("여러 언어를 고르면 전사가 더 걸립니다")).toBeTruthy();
+  fireEvent.click(dialog.getByRole("button", { name: "취소" }));
+  await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  expect(imports()).toEqual([]);
+
+  // Dropped, the same question; what is picked there goes with the file.
+  await drag("drop", ["/a/화요일.mp3"]);
+  dialog = await importDialog();
+  fireEvent.click(await dialog.findByRole("checkbox", { name: "베트남어" }));
+  fireEvent.click(dialog.getByRole("checkbox", { name: "인도네시아어" }));
+  expect(checked()).toEqual(["한국어", "인도네시아어"]);
+  fireEvent.click(dialog.getByRole("button", { name: "가져와서 전사" }));
+  expect(await screen.findByRole("heading", { level: 1, name: "화요일" })).toBeTruthy();
+  expect(imports()).toEqual([{ path: "/a/화요일.mp3", languages: ["ko", "id"] }]);
+  expect(screen.queryByRole("alertdialog")).toBeNull();
 });
 
 // Plan 5.3-14: a meeting whose pause still stops is counted until its run ends; a paused one is

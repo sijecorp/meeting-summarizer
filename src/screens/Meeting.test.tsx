@@ -14,6 +14,7 @@ import type {
   Progress,
   Segment,
   Settings,
+  Status,
 } from "../lib/ipc";
 import Meeting from "./Meeting";
 import { parseDoc } from "./MeetingParts";
@@ -99,6 +100,14 @@ const progress = (patch: Partial<Progress>): Progress => ({
 
 type Call = { cmd: string; args: Record<string, unknown> };
 
+// `transcribe_languages`, in Rust's table order.
+const LANGS = [
+  { code: "ko", name: "한국어" },
+  { code: "en", name: "영어" },
+  { code: "vi", name: "베트남어" },
+  { code: "id", name: "인도네시아어" },
+];
+
 const CHANNELS: Channel[] = [
   { id: "C1", name: "회의록", private: false },
   { id: "C2", name: "개발", private: false },
@@ -117,7 +126,11 @@ const mock = (
     (cmd, args) => {
       calls.push({ cmd, args: args as Call["args"] });
       if (cmd === "get_meeting") return { sending: false, ...detail };
-      const fallback: Record<string, unknown> = { get_settings: settings(), slack_channels: CHANNELS };
+      const fallback: Record<string, unknown> = {
+        get_settings: settings(),
+        slack_channels: CHANNELS,
+        transcribe_languages: LANGS,
+      };
       return handler(cmd, args as Call["args"]) ?? fallback[cmd];
     },
     { shouldMockEvents: true },
@@ -351,7 +364,7 @@ test("미정 is marked on a hidden mirror of the text, without touching the fiel
 });
 
 // SUM-10, eng review D8. REV-01: the transcript can still be read.
-test("no speech: a warning and no editor or send; only 전송 안 함 and 삭제 remain", async () => {
+test("no speech: a warning and no editor or send; only 전사 언어 바꾸기…, 전송 안 함 and 삭제 remain", async () => {
   mock({ meta: meta({ no_speech: true, llm_connection: null, title: "" }), summary: "" });
 
   render(<Meeting id={id} {...props} />);
@@ -360,7 +373,7 @@ test("no speech: a warning and no editor or send; only 전송 안 함 and 삭제
   expect(screen.queryByRole("textbox")).toBeNull();
   expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual(["홈으로", "전사본", ""]);
   expect(screen.queryByRole("button", { name: /보내기$/ })).toBeNull();
-  expect((await menu()).getAllByRole("menuitem").map((i) => i.textContent)).toEqual(["전송 안 함", "삭제"]);
+  expect((await menu()).getAllByRole("menuitem").map((i) => i.textContent)).toEqual(["전사 언어 바꾸기…", "전송 안 함", "삭제"]);
 });
 
 test("the 미정 list holds only the lines with 미정, and follows edits", async () => {
@@ -1480,4 +1493,275 @@ test("the pause button is hidden while it waits for a route, failed or in review
   render(<Meeting id={id} {...props} />);
   expect(await screen.findByText("목요일에 배포한다")).toBeTruthy();
   expect(screen.queryByRole("button", { name: /일시정지|이어서 처리|멈추는 중/ })).toBeNull();
+});
+
+// Plan 5.6-24 (design-system 8.7): a meeting's languages change from ⋯ until it is sent; the
+// recording screen changes a recording's, and a deleting or newer meeting is not this app's to change.
+test("전사 언어 바꾸기… is in ⋯ until the meeting is sent, never while recording, deleting or unknown", async () => {
+  const shown: Status[] = ["recorded", "transcribing", "transcribed", "paused", "review", "archived", "transcribe_failed"];
+  const hidden: Status[] = ["sent", "recording", "deleting", "unknown"];
+  const cases = [
+    ...shown.map((status) => [meta({ status, title: "" }), true] as const),
+    ...hidden.map((status) => [meta({ status, title: "" }), false] as const),
+    [meta({ schema_version: 99 }), false] as const,
+  ];
+  for (const [m, offered] of cases) {
+    mock({ meta: m, summary: "" });
+    render(<Meeting id={id} {...props} />);
+    await screen.findByRole("button", { name: "더보기" });
+    const items = (await menu()).getAllByRole("menuitem").map((i) => i.textContent);
+    expect([m.status, items.includes("전사 언어 바꾸기…")]).toEqual([m.status, offered]);
+    cleanup();
+  }
+});
+
+const languageDialog = async () => {
+  await pick("전사 언어 바꾸기…");
+  return within(await screen.findByRole("alertdialog", { name: "전사 언어 바꾸기" }));
+};
+
+// Plan 5.6-24: before any chunk is done the list just changes; nothing to warn of.
+test("before transcription, 바꾸기 sets the languages once the list changed, and focus goes back to ⋯", async () => {
+  const calls = mock({ meta: meta({ status: "recorded", title: "", llm_connection: null }), summary: "" }, (cmd, args) =>
+    cmd === "set_meeting_language" ? meta({ status: "recorded", title: "", languages: args.languages as string[] }) : undefined,
+  );
+  render(<Meeting id={id} {...props} />);
+  await screen.findByRole("button", { name: "더보기" });
+
+  const dialog = await languageDialog();
+  expect(dialog.queryByText(/지워집니다|바꿀 수 없습니다/)).toBeNull();
+  const confirm = dialog.getByRole("button", { name: "바꾸기" }) as HTMLButtonElement;
+  await dialog.findByRole("checkbox", { name: "베트남어" });
+  expect(confirm.disabled).toBe(true);
+  fireEvent.click(dialog.getByRole("checkbox", { name: "베트남어" }));
+  expect(confirm.disabled).toBe(false);
+  fireEvent.click(dialog.getByRole("checkbox", { name: "베트남어" }));
+  expect(confirm.disabled).toBe(true);
+  fireEvent.click(dialog.getByRole("checkbox", { name: "베트남어" }));
+  fireEvent.click(confirm);
+
+  await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  expect(calls.filter((c) => c.cmd === "set_meeting_language").map((c) => c.args)).toEqual([
+    { id, languages: ["ko", "vi"] },
+  ]);
+  expect(calls.map((c) => c.cmd)).not.toContain("retranscribe");
+  expect(document.activeElement).toBe(screen.getByRole("button", { name: "더보기" }));
+  // The meta line says them now.
+  expect(await screen.findByText("한국어·베트남어로 전사")).toBeTruthy();
+
+  // 취소 too.
+  const again = await languageDialog();
+  fireEvent.click(again.getByRole("button", { name: "취소" }));
+  await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  expect(document.activeElement).toBe(screen.getByRole("button", { name: "더보기" }));
+});
+
+// Plan 5.6-24 (E3): once transcribed, changing them deletes the results and transcribes again.
+test("after transcription, 지우고 다시 전사 warns what goes and transcribes again", async () => {
+  const calls = mock({ meta: meta(), summary: "## 결정사항\n- 목요일에 배포한다" }, (cmd, args) =>
+    cmd === "retranscribe" ? meta({ status: "recorded", title: "", languages: args.languages as string[] }) : undefined,
+  );
+  render(<Meeting id={id} {...props} />);
+  expect(await screen.findByText("목요일에 배포한다")).toBeTruthy();
+
+  const dialog = await languageDialog();
+  expect(dialog.getByText("전사본과 요약, 검토에서 고친 내용이 지워집니다")).toBeTruthy();
+  const confirm = dialog.getByRole("button", { name: "지우고 다시 전사" }) as HTMLButtonElement;
+  expect(confirm.disabled).toBe(true);
+  fireEvent.click(await dialog.findByRole("checkbox", { name: "영어" }));
+  fireEvent.click(confirm);
+
+  await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  expect(calls.filter((c) => c.cmd === "retranscribe").map((c) => c.args)).toEqual([{ id, languages: ["ko", "en"] }]);
+  expect(calls.map((c) => c.cmd)).not.toContain("set_meeting_language");
+  // Its summary is gone from the screen.
+  expect(screen.queryByText("목요일에 배포한다")).toBeNull();
+});
+
+// Plan 5.7-6: a chunk finished while the dialog was open: Rust refuses, and the dialog becomes E3.
+test("a change refused for a chunk done meanwhile redraws as E3, without an error; another error shows inside", async () => {
+  let refusal = "이미 전사한 구간이 있어 다시 전사해야 바꿀 수 있습니다";
+  const calls = mock({ meta: meta({ status: "paused", title: "", llm_connection: null }), summary: "" }, (cmd) => {
+    if (cmd === "set_meeting_language") throw refusal;
+    if (cmd === "retranscribe") throw "보내는 중입니다";
+  });
+  render(<Meeting id={id} {...props} />);
+  await screen.findByRole("button", { name: "더보기" });
+
+  let dialog = await languageDialog();
+  fireEvent.click(await dialog.findByRole("checkbox", { name: "베트남어" }));
+  fireEvent.click(dialog.getByRole("button", { name: "바꾸기" }));
+  expect(await dialog.findByText("전사본과 요약, 검토에서 고친 내용이 지워집니다")).toBeTruthy();
+  expect(screen.queryByText(refusal)).toBeNull();
+  // The pick stays.
+  expect((dialog.getByRole("checkbox", { name: "베트남어" }) as HTMLInputElement).checked).toBe(true);
+  fireEvent.click(dialog.getByRole("button", { name: "지우고 다시 전사" }));
+  expect(await dialog.findByText("보내는 중입니다")).toBeTruthy();
+  expect(calls.filter((c) => c.cmd === "retranscribe").map((c) => c.args)).toEqual([{ id, languages: ["ko", "vi"] }]);
+  fireEvent.click(dialog.getByRole("button", { name: "취소" }));
+  await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+
+  // Any other refusal is one line inside, the mode unchanged.
+  refusal = "보내는 중입니다";
+  dialog = await languageDialog();
+  fireEvent.click(await dialog.findByRole("checkbox", { name: "영어" }));
+  fireEvent.click(dialog.getByRole("button", { name: "바꾸기" }));
+  expect(await dialog.findByText("보내는 중입니다")).toBeTruthy();
+  expect(dialog.getByRole("button", { name: "바꾸기" })).toBeTruthy();
+  expect(dialog.queryByText(/지워집니다/)).toBeNull();
+});
+
+// Plan 5.6-24: while it runs the item still opens, to say why and offer 일시정지; paused, it asks.
+test("while it runs, the dialog only offers 일시정지, and redraws with the checks once paused", async () => {
+  const running = progress({ status: "transcribing", chunk: 2, chunks: 7, percent: 30 });
+  const detail = {
+    meta: meta({ status: "transcribing", title: "", chunks_done: 2, chunks_total: 7, llm_connection: null }),
+    summary: "",
+  };
+  const calls = mock(detail, (cmd) => {
+    if (cmd === "pause_meeting") {
+      detail.meta = { ...detail.meta, held: true };
+      return "pausing";
+    }
+  });
+  const { rerender } = render(<Meeting id={id} {...props} progress={running} />);
+  const more = await screen.findByRole("button", { name: "더보기" });
+  more.focus();
+  const item = (await menu()).getByRole("menuitem", { name: "전사 언어 바꾸기…" });
+  expect(disabled(item)).toBe(false);
+  fireEvent.keyDown(item, { key: "ArrowDown" });
+  fireEvent.keyDown(item, { key: "ArrowUp" });
+  await waitFor(() => expect(document.activeElement).toBe(item));
+  fireEvent.keyDown(item, { key: "Enter" });
+
+  const dialog = within(await screen.findByRole("alertdialog", { name: "전사 언어 바꾸기" }));
+  expect(dialog.getByText("처리 중에는 바꿀 수 없습니다")).toBeTruthy();
+  expect(dialog.queryByRole("checkbox")).toBeNull();
+  expect(dialog.queryByRole("button", { name: /바꾸기|다시 전사/ })).toBeNull();
+  fireEvent.click(dialog.getByRole("button", { name: "일시정지" }));
+  await waitFor(() => expect(calls.filter((c) => c.cmd === "pause_meeting")).toEqual([{ cmd: "pause_meeting", args: { id } }]));
+  expect(disabled(await dialog.findByRole("button", { name: "멈추는 중…" }))).toBe(true);
+
+  // The run ends `paused`: a chunk is done, so it is E3.
+  detail.meta = { ...detail.meta, status: "paused" };
+  rerender(<Meeting id={id} {...props} progress={progress({ status: "paused" })} />);
+  expect(await dialog.findByText("전사본과 요약, 검토에서 고친 내용이 지워집니다")).toBeTruthy();
+  expect(dialog.getAllByRole("checkbox")).toHaveLength(4);
+  expect((dialog.getByRole("button", { name: "지우고 다시 전사" }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+// Plan 5.6-27: the meta line names the languages unless it is Korean alone.
+test("the meta line says the languages it is transcribed in, unless only Korean", async () => {
+  const cases = [
+    [["ko", "vi"], "한국어·베트남어로 전사"],
+    [["en"], "영어로 전사"],
+  ] as const;
+  for (const [languages, line] of cases) {
+    mock({ meta: meta({ languages: [...languages] }), summary: "요약" });
+    render(<Meeting id={id} {...props} />);
+    expect(await screen.findByText(line)).toBeTruthy();
+    cleanup();
+  }
+  const calls = mock({ meta: meta(), summary: "요약" });
+  render(<Meeting id={id} {...props} />);
+  expect(await screen.findByText("녹음 홍길동")).toBeTruthy();
+  await waitFor(() => expect(calls.map((c) => c.cmd)).toContain("transcribe_languages"));
+  await act(async () => {});
+  expect(screen.queryByText(/로 전사$/)).toBeNull();
+});
+
+// Plan 5.6-18: dates are read in Korean only, so another language leaves them unchecked.
+test("a meeting in another language says its dates were not checked, with no 미정 line too", async () => {
+  mock({ meta: meta({ languages: ["ko", "vi"] }), summary: "## 결정사항\n- 목요일에 배포한다" });
+  render(<Meeting id={id} {...props} />);
+  expect(await screen.findByText("목요일에 배포한다")).toBeTruthy();
+  expect(screen.getByText("이 회의의 날짜는 확인하지 않았습니다")).toBeTruthy();
+  cleanup();
+
+  mock({ meta: meta(), summary: "## 결정사항\n- 목요일에 배포한다" });
+  render(<Meeting id={id} {...props} />);
+  expect(await screen.findByText("목요일에 배포한다")).toBeTruthy();
+  expect(screen.queryByText("이 회의의 날짜는 확인하지 않았습니다")).toBeNull();
+});
+
+// Plan 5.6-28 (d11a): a mixed transcript names its language on the first line and wherever it
+// changes; every line carries `lang` for screen readers.
+test("a mixed transcript names the language where it changes; a single one names none", async () => {
+  const segments: Segment[] = [
+    { start_ms: 3_000, end_ms: 4_000, text: "안녕하세요", lang: "ko" },
+    { start_ms: 5_000, end_ms: 6_000, text: "시작합시다", lang: "ko" },
+    { start_ms: 7_000, end_ms: 8_000, text: "Xin chào", lang: "vi" },
+    { start_ms: 9_000, end_ms: 10_000, text: "Cảm ơn", lang: "vi" },
+    { start_ms: 11_000, end_ms: 12_000, text: "네", lang: "ko" },
+  ];
+  const open = async (languages: string[], segs: Segment[]) => {
+    mock({ meta: meta({ languages }), summary: "요약" }, (cmd) => (cmd === "get_transcript" ? segs : undefined));
+    render(<Meeting id={id} {...props} />);
+    await screen.findByText("녹음 홍길동");
+    fireEvent.click(await screen.findByRole("button", { name: "전사본" }));
+    const panel = within(await screen.findByRole("complementary", { name: "전사본" }));
+    await panel.findByText(segs[0].text);
+    return panel;
+  };
+
+  let panel = await open(["ko", "vi"], segments);
+  await waitFor(() =>
+    expect(panel.getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "00:03한국어안녕하세요",
+      "00:05시작합시다",
+      "00:07베트남어Xin chào",
+      "00:09Cảm ơn",
+      "00:11한국어네",
+    ]),
+  );
+  expect(segments.map((s) => panel.getByText(s.text).getAttribute("lang"))).toEqual(["ko", "ko", "vi", "vi", "ko"]);
+  cleanup();
+
+  const single = [
+    { start_ms: 3_000, end_ms: 4_000, text: "Hello" },
+    { start_ms: 5_000, end_ms: 6_000, text: "Let's start" },
+  ];
+  panel = await open(["en"], single);
+  expect(panel.getAllByRole("listitem").map((li) => li.textContent)).toEqual(["00:03Hello", "00:05Let's start"]);
+  expect(single.map((s) => panel.getByText(s.text).getAttribute("lang"))).toEqual(["en", "en"]);
+});
+
+// Plan 5.6-27: the first chunk says the languages, so a wrong pick shows early; a mixed chunk
+// being told apart says so.
+test("the first chunk's memo says its languages, and a mixed chunk says it is being told apart", async () => {
+  const korean = meta({ status: "transcribing", title: "" });
+  mock({ meta: korean, summary: "" });
+  const first = progress({ status: "transcribing", chunk: 0, chunks: 5, percent: 3 });
+  const { rerender } = render(<Meeting id={id} {...props} progress={first} />);
+  expect(await screen.findByText("구간 1/5 · 한국어로 전사")).toBeTruthy();
+  rerender(<Meeting id={id} {...props} progress={{ ...first, chunk: 1, percent: 21 }} />);
+  expect(await screen.findByText("구간 2/5")).toBeTruthy();
+  expect(screen.queryByText(/한국어로 전사/)).toBeNull();
+  cleanup();
+
+  mock({ meta: meta({ status: "transcribing", title: "", languages: ["ko", "vi"] }), summary: "" });
+  render(<Meeting id={id} {...props} progress={{ ...first, detecting: true }} />);
+  expect(await screen.findByText("구간 1/5 · 한국어·베트남어로 전사 · 언어를 가리는 중")).toBeTruthy();
+});
+
+// Plan 5.6-27: a mixed meeting in line without the detection model fetches it, and says so.
+test("a mixed meeting waiting without the detection model says it is being fetched", async () => {
+  let installed = false;
+  let finish = () => {};
+  const calls = mock({ meta: meta({ status: "recorded", title: "", llm_connection: null, languages: ["ko", "vi"] }), summary: "" }, (cmd, args) => {
+    if (cmd === "model_status" && args.scope === "lid") {
+      return {
+        files: [{ file: "ggml-tiny.bin", size: 77_691_713, installed, received: 0, downloading: false }],
+        downloading: false,
+      };
+    }
+    if (cmd === "download_models") return new Promise<void>((resolve) => (finish = resolve));
+  });
+  render(<Meeting id={id} {...props} progress={progress({ status: "recorded", position: 1 })} />);
+
+  expect(await screen.findByText(/언어 판별 모델을 받는 중/)).toBeTruthy();
+  expect(calls.filter((c) => c.cmd === "download_models").map((c) => c.args)).toEqual([{ scope: "lid" }]);
+  installed = true;
+  await act(async () => finish());
+  await waitFor(() => expect(screen.queryByText(/언어 판별 모델을 받는 중/)).toBeNull());
 });

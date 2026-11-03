@@ -1,7 +1,7 @@
 import { useState, type ComponentProps } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { emit } from "@tauri-apps/api/event";
-import { mockIPC } from "@tauri-apps/api/mocks";
+import { mockIPC as tauriMockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, expect, test, vi } from "vitest";
 import {
   cancelModelDownload,
@@ -15,6 +15,25 @@ import {
   type ModelState,
 } from "../lib/ipc";
 import SettingsScreen from "./Settings";
+
+// The 전사 tab also reads the language detection model (plan 5.6-15): installed, unless a test
+// answers it through `tauriMockIPC`. The language table answers unless a test does.
+const LID: ModelState = {
+  files: [{ file: "ggml-tiny.bin", size: 77_691_713, installed: true, received: 0, downloading: false }],
+  downloading: false,
+};
+const LANGS = [
+  { code: "ko", name: "한국어" },
+  { code: "en", name: "영어" },
+  { code: "vi", name: "베트남어" },
+  { code: "id", name: "인도네시아어" },
+];
+const mockIPC: typeof tauriMockIPC = (cb, options) =>
+  tauriMockIPC((cmd, args) => {
+    if (cmd === "model_status" && (args as { scope?: string }).scope === "lid") return LID;
+    const answer = cb(cmd, args);
+    return answer === undefined && cmd === "transcribe_languages" ? LANGS : answer;
+  }, options);
 
 // Like App: the save bar goes into a slot of the bottom stack.
 function Settings(props: ComponentProps<typeof SettingsScreen>) {
@@ -540,7 +559,8 @@ test("전사 tab: file states, download progress from events, and a quiet cancel
   render(<Settings tab="transcription" onHome={() => {}} />);
 
   expect(await screen.findByText("없음 · 437/874MB 받아 둠")).toBeTruthy();
-  expect(screen.getByText("설치됨")).toBeTruthy();
+  // The VAD model and the language detection model.
+  expect(screen.getAllByText("설치됨")).toHaveLength(2);
   // `tiny` is development only.
   expect(screen.getByRole("combobox", { name: "모델" }).textContent).toBe("기본: large-v3-turbo q8_0 (874MB)");
 
@@ -749,13 +769,14 @@ test("the 전사 tab offers 취소 only while one of its files is still to come"
   void startModelDownload();
   const first = render(<Settings tab="transcription" onHome={() => {}} />);
   // Read before the chain moved on. Answered null, the tab reads again and lets the button go.
+  // Both files, and the language detection model's.
   fireEvent.click(await screen.findByRole("button", { name: "취소" }));
-  await waitFor(() => expect(screen.getAllByText("설치됨")).toHaveLength(2));
+  await waitFor(() => expect(screen.getAllByText("설치됨")).toHaveLength(3));
   expect(screen.queryByRole("button", { name: "취소" })).toBeNull();
   first.unmount();
 
   render(<Settings tab="transcription" onHome={() => {}} />);
-  await waitFor(() => expect(screen.getAllByText("설치됨")).toHaveLength(2));
+  await waitFor(() => expect(screen.getAllByText("설치됨")).toHaveLength(3));
   expect(screen.queryByRole("button", { name: "취소" })).toBeNull();
 });
 
@@ -1325,7 +1346,9 @@ test("직접 가져오기 stays offered when the model status cannot be read", a
   render(<Settings tab="transcription" onHome={() => {}} />);
 
   expect((await screen.findByRole("alert")).textContent).toMatch(/모델 폴더를 읽지 못했습니다/);
-  expect((screen.getByRole("button", { name: "직접 가져오기" }) as HTMLButtonElement).disabled).toBe(false);
+  // The language detection model's row too.
+  const imports = screen.getAllByRole("button", { name: "직접 가져오기" }) as HTMLButtonElement[];
+  expect(imports.map((b) => b.disabled)).toEqual([false, false]);
   expect(screen.queryByRole("button", { name: "다운로드" })).toBeNull();
 });
 
@@ -1535,4 +1558,65 @@ test("a failed Slack sign-in says why, and 로그아웃 signs out", async () => 
   expect(screen.getByText("Slack 계정")).toBeTruthy();
   expect(cmds.filter((c) => c === "slack_sign_out")).toHaveLength(1);
   expect(unsaved()).toBeNull();
+});
+
+// Plan 5.6-15, 5.6-20 (design-system 8.7): new meetings' languages are a setting like the others,
+// saved with 저장, and the detection model they may need is a row of the 전사 tab.
+test("기본 전사 언어 edits the draft, which 저장 saves; the detection model has its own row", async () => {
+  const calls: Call[] = [];
+  mockIPC((cmd, args) => {
+    calls.push({ cmd, args: args as Call["args"] });
+    if (cmd === "get_settings") return loaded;
+    if (cmd === "has_secret") return true;
+    if (cmd === "model_status") return models({ installed: true });
+  });
+  render(<Settings tab="transcription" onHome={() => {}} />);
+
+  expect(await screen.findByText("언어 판별 모델 (78MB)")).toBeTruthy();
+  const trigger = await screen.findByRole("button", { name: "기본 전사 언어: 한국어" });
+  await waitFor(() => expect((trigger as HTMLButtonElement).disabled).toBe(false));
+  fireEvent.click(trigger);
+  const popover = within(await screen.findByRole("dialog", { name: "기본 전사 언어" }));
+  fireEvent.click(popover.getByRole("checkbox", { name: "베트남어" }));
+  fireEvent.click(popover.getByRole("button", { name: "적용" }));
+
+  expect(await screen.findByRole("button", { name: "기본 전사 언어: 한국어, 베트남어" })).toBeTruthy();
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(screen.getByText("저장 안 한 변경 1개")).toBeTruthy();
+  expect(calls.map((c) => c.cmd)).not.toContain("save_settings");
+  fireEvent.click(screen.getByRole("button", { name: "저장" }));
+  const saved = () => calls.filter((c) => c.cmd === "save_settings").map((c) => c.args.value);
+  await waitFor(() => expect(saved()).toHaveLength(1));
+  expect(saved()[0]).toMatchObject({ transcribe_languages: ["ko", "vi"] });
+});
+
+// Plan 5.6-15: a second language picked for the first time fetches the detection model, if missing.
+test("picking a second language starts the detection model's download when it is missing", async () => {
+  const calls: Call[] = [];
+  tauriMockIPC(
+    (cmd, args) => {
+      calls.push({ cmd, args: args as Call["args"] });
+      if (cmd === "get_settings") return loaded;
+      if (cmd === "has_secret") return true;
+      if (cmd === "transcribe_languages") return LANGS;
+      if (cmd === "model_status") {
+        return (args as { scope: string }).scope === "lid"
+          ? { ...LID, files: [{ ...LID.files[0], installed: false }] }
+          : models({ installed: true });
+      }
+      if (cmd === "download_models") return new Promise((resolve) => (release = () => resolve(undefined)));
+    },
+    { shouldMockEvents: true },
+  );
+  render(<Settings tab="transcription" onHome={() => {}} />);
+  const trigger = await screen.findByRole("button", { name: "기본 전사 언어: 한국어" });
+  await waitFor(() => expect((trigger as HTMLButtonElement).disabled).toBe(false));
+  fireEvent.click(trigger);
+  const popover = within(await screen.findByRole("dialog", { name: "기본 전사 언어" }));
+  expect(calls.map((c) => c.cmd)).not.toContain("download_models");
+
+  fireEvent.click(popover.getByRole("checkbox", { name: "영어" }));
+  await waitFor(() =>
+    expect(calls.filter((c) => c.cmd === "download_models").map((c) => c.args)).toEqual([{ scope: "lid" }]),
+  );
 });

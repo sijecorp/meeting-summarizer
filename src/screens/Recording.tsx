@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
 import { ArrowLeft, Square } from "lucide-react";
 import { Banner, clock, hhmm, Kbd, RollingTime, RouteNotice, SHORTCUT, sinceStart } from "@/components/common";
+import { LanguagePicker } from "@/components/Languages";
 import { Button } from "@/components/ui/button";
-import { onRecordingLevel, onRecordingWarning, recordingState, type Warning } from "@/lib/ipc";
+import { onRecordingLevel, onRecordingWarning, recordingState, setMeetingLanguage, type Warning } from "@/lib/ipc";
 
 /** -50 dBFS, the silence threshold (REC-05). Louder system audio counts as heard (REC-10). */
 const HEARD_RMS = 0.0032;
@@ -55,17 +56,23 @@ function Track({
 
 export default function Recording({
   startedAt,
+  languages,
   stopping,
   onHome,
   onStop,
+  onChanged,
   onSetup,
 }: {
   /** The recording meeting's `created_at`, when the list has it. */
   startedAt?: string;
+  /** Its languages, when the list has it (plan 5.6-22). */
+  languages?: string[];
   /** A stop was asked (App.tsx stops, as ⌘. and the dock do). */
   stopping: boolean;
   onHome: () => void;
   onStop: () => void;
+  /** Its languages changed: the list reads it again. */
+  onChanged?: () => void;
   /** Opens the 요약(LLM) tab, where the summary model downloads. */
   onSetup?: () => void;
 }) {
@@ -76,6 +83,8 @@ export default function Recording({
   const [warnings, setWarnings] = useState<Warning[]>([]);
   const [heardSystem, setHeardSystem] = useState(false);
   const [error, setError] = useState("");
+  // Applied here, until the list has it too.
+  const [applied, setApplied] = useState<string[] | null>(null);
   const micBars = useRef<HTMLDivElement>(null);
   const micMeter = useRef<HTMLSpanElement>(null);
   const systemBars = useRef<HTMLDivElement>(null);
@@ -168,6 +177,24 @@ export default function Recording({
             </div>
             <div className="flex w-full max-w-doc flex-col items-center gap-3">
               <RouteNotice id={id} center onSetup={onSetup} />
+              {/* Plan 5.6-22: opens upward, away from the stop button, which stays pressable. */}
+              {(applied ?? languages) && (
+                <div className="flex items-center gap-1 text-caption text-ink-2">
+                  전사 언어
+                  <LanguagePicker
+                    label="전사 언어"
+                    value={applied ?? languages!}
+                    small
+                    side="top"
+                    onApply={(next) =>
+                      setMeetingLanguage(id, next).then((meta) => {
+                        setApplied(meta.languages);
+                        onChanged?.();
+                      })
+                    }
+                  />
+                </div>
+              )}
               {heardSystem && (
                 <p className="text-sm text-ink-2">
                   스피커 소리가 마이크에 다시 녹음되면 전사가 부정확해질 수 있습니다. 헤드폰을 쓰는 것을

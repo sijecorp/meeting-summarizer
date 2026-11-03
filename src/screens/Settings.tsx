@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { AnimatePresence, motion, useIsPresent, type Transition } from "motion/react";
 import { Check, ChevronDown, CircleAlert, Download, FolderOpen, Plus, RotateCcw, Trash2, TriangleAlert } from "lucide-react";
 import { Banner, downloadNote, Field, host, Page, Present } from "@/components/common";
+import { LanguagePicker } from "@/components/Languages";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -95,6 +96,7 @@ const MODELS = [
 // `model_status` lists the Whisper model, then the VAD model; `summary` the summary model alone.
 const MODEL_FILES = ["전사 모델", "음성 구간 감지(VAD) 모델"];
 const SUMMARY_FILES = ["요약 모델"];
+const LID_FILES = ["언어 판별 모델 (78MB)"];
 type Scope = Exclude<ModelScope, "all">;
 // One decimal below 10 MB, for the 0.9 MB VAD file.
 const mb = (bytes: number) => (bytes < 1e7 ? (bytes / 1e6).toFixed(1) : Math.round(bytes / 1e6));
@@ -212,6 +214,8 @@ export default function Settings({
   const [models, setModels] = useState<ModelState | null>(null);
   // The 요약(LLM) tab's summary model (plan 5.8), read when that tab opens: null until then.
   const [summary, setSummary] = useState<ModelState | null>(null);
+  // Plan 5.6-15: the language detection model, a row of the 전사 tab's own.
+  const [lid, setLid] = useState<ModelState | null>(null);
   const summaryRead = useRef(false);
   const [received, setReceived] = useState<Record<string, ModelDownload>>({});
   // The file of the last `model://download`: the one in flight.
@@ -258,9 +262,10 @@ export default function Settings({
 
   // The 전사 tab's files only; the summary model belongs to the 요약(LLM) tab (plan 5.8).
   const readModels = () =>
-    modelStatus("transcription").then(
-      (state) => {
+    Promise.all([modelStatus("transcription"), modelStatus("lid")]).then(
+      ([state, detection]) => {
         setModels(state);
+        setLid(detection);
         setStatusError("");
       },
       (e) => setStatusError(String(e)),
@@ -280,7 +285,9 @@ export default function Settings({
 
   // The download lives in ipc.ts, so this also picks up one started before the screen opened. Its
   // failure goes to the tab of its scope: the summary model's, else the 전사 tab (Home's `all`).
+  const followed = useRef<Promise<void> | null>(null);
   const follow = (running: Promise<void>) => {
+    followed.current = running;
     setModelBusy("download");
     running.then(() => {
       setModelBusy(null);
@@ -304,6 +311,10 @@ export default function Settings({
       setLatest(d.file);
       setModels(fetching(d));
       setSummary(fetching(d));
+      setLid(fetching(d));
+      // One started elsewhere meanwhile, like the detection model's as a second language is picked.
+      const running = modelDownload();
+      if (running && running !== followed.current) follow(running);
     });
     unlisten.catch((e) => setStatusError(`다운로드 진행률을 받지 못했습니다: ${e}`));
     // 25 times a second, straight to the DOM: no React state (design-system 5).
@@ -472,6 +483,7 @@ export default function Settings({
   const changes =
     FIELDS.filter((k) => now[k] !== then[k]).length +
     Number(terms(glossary).join("\n") !== persisted.glossary.join("\n")) +
+    Number(draft.transcribe_languages.join() !== persisted.transcribe_languages.join()) +
     entryChanges(draft.llm_connections, persisted.llm_connections) +
     Object.values(secretDrafts).filter(Boolean).length +
     orphans.length;
@@ -612,7 +624,7 @@ export default function Settings({
         if (!path) return;
         setModelBusy("import");
         return importModel(path, scope)
-          .then(scope === "summary" ? setSummary : setModels)
+          .then(scope === "summary" ? setSummary : scope === "lid" ? setLid : setModels)
           .finally(() => setModelBusy(null));
       })
       .then(
@@ -860,6 +872,18 @@ export default function Settings({
               >
                 {unsaved && <p className={HELP}>바꾼 모델과 주소는 저장한 뒤에 받거나 가져올 수 있습니다</p>}
               </ModelFiles>
+              <ModelFiles
+                labels={LID_FILES}
+                models={lid}
+                received={received}
+                latest={latest}
+                busy={modelBusy}
+                blocked={addressUnsaved}
+                unreadable={!!statusError}
+                onDownload={() => startDownload("lid")}
+                onCancel={() => cancel("lid")}
+                onImport={() => importFile("lid")}
+              />
               <Row label="모델 다운로드 주소" help="사내 미러가 있으면 바꿉니다">
                 <Input
                   className={CONTROL}
@@ -875,6 +899,14 @@ export default function Settings({
                   value={draft.backend}
                   options={BACKENDS}
                   onChange={(backend) => edit({ backend })}
+                />
+              </Row>
+              <Row label="기본 전사 언어">
+                <LanguagePicker
+                  label="기본 전사 언어"
+                  value={draft.transcribe_languages}
+                  className={CONTROL}
+                  onApply={async (transcribe_languages) => edit({ transcribe_languages })}
                 />
               </Row>
               {/* 5.4: only automatic mode falls back; choosing GPU and saving clears it. */}

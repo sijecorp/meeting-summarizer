@@ -42,6 +42,12 @@ export const SCENARIOS = {
   pause: "일시정지",
   // Plan 5.3-12: resumed while recording, it waits for the recording to end.
   pauseRecording: "녹음 중 이어서 처리",
+  // Plan 5.7-15 언어: every picker, the dialog's three modes, a mixed transcript, the date notice.
+  languages: "전사 언어",
+  // The recording screen's trigger in two languages, its first apply failing.
+  languagesRecording: "녹음 중 전사 언어",
+  // A mixed meeting waits for the detection model while a Korean one runs past it.
+  languagesLid: "판별 모델 받는 중",
 } as const;
 export type Scenario = keyof typeof SCENARIOS;
 
@@ -105,6 +111,15 @@ const MODEL_FILES: Record<string, { file: string; size: number }> = {
 };
 const VAD = { file: "ggml-silero-v6.2.0.bin", size: 885_098 };
 const SUMMARY_MODEL = { file: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf", size: 2_497_281_120 };
+const LID = { file: "ggml-tiny.bin", size: 77_691_713 };
+
+// lang.rs's table, in its order (plan 5.6-1).
+const LANGS: ipc.Lang[] = [
+  { code: "ko", name: "한국어" },
+  { code: "en", name: "영어" },
+  { code: "vi", name: "베트남어" },
+  { code: "id", name: "인도네시아어" },
+];
 
 const DEVICES: AudioDevices = {
   inputs: [
@@ -130,6 +145,36 @@ const TRANSCRIPT: Segment[] = (
     [72_000, "녹음 파일을 며칠 보관할지는 다음 주에 다시 이야기하죠."],
   ] as const
 ).map(([start_ms, text]) => ({ start_ms, end_ms: start_ms + 6_000, text }));
+
+// A Korean and Vietnamese meeting (plan 5.6-28): each line's `lang`, switching a few times.
+const MIXED: Segment[] = (
+  [
+    [0, "ko", "그럼 시작할게요. 오늘은 호치민 공장 라인 증설 일정부터 보겠습니다."],
+    [7_200, "ko", "투안 씨, 지난주에 말씀하신 설비 반입 날짜 한 번 더 확인 부탁드려요."],
+    [14_800, "vi", "Dạ, thiết bị sẽ được giao vào ngày 15 tháng 11, sớm hơn kế hoạch ba ngày."],
+    [22_400, "vi", "Nhưng đội lắp đặt chỉ có thể bắt đầu từ ngày 18 vì còn phải chờ giấy phép."],
+    [30_100, "ko", "그러면 시운전은 원래대로 25일에 하는 걸로 두죠."],
+    [37_600, "ko", "현지 인력은 열 명 더 뽑는 거 맞죠?"],
+    [44_900, "vi", "Vâng, chúng tôi đã phỏng vấn mười hai người và chọn được mười người."],
+    [52_300, "vi", "Tuần sau họ sẽ bắt đầu đào tạo an toàn."],
+    [59_800, "ko", "좋습니다. 안전 교육 자료는 본사에서 베트남어로 번역해서 보내 드릴게요."],
+    [68_000, "vi", "Cảm ơn anh. Em sẽ gửi danh sách nhân viên mới qua email trong hôm nay."],
+    [75_400, "ko", "네, 그럼 오늘은 여기까지 하겠습니다."],
+  ] as const
+).map(([start_ms, lang, text]) => ({ start_ms, end_ms: start_ms + 6_000, text, lang }));
+
+// Its summary has no "미정": the date notice stands alone (plan 5.6-18).
+const MIXED_SUMMARY = `## 결정사항
+- 호치민 공장 설비는 11월 15일에 들어오고, 설치는 허가가 나오는 18일부터 시작한다
+- 시운전은 예정대로 11월 25일에 한다
+- 현지 인력 10명을 새로 뽑았고, 다음 주부터 안전 교육을 시작한다
+## 액션 아이템
+- [본사 교육팀] 안전 교육 자료 베트남어 번역본 발송 (11월 14일)
+- [투안] 신규 인력 명단 이메일로 공유 (11월 3일)
+## 주요 논의
+- 설비 반입은 계획보다 사흘 빨라졌지만 설치는 허가 때문에 18일까지 기다려야 한다
+## 미해결 질문
+- 설치 허가가 18일보다 늦어지면 시운전 날짜를 어떻게 할지 정하지 못했다`;
 
 // The prompt's format (architecture 6.2), without the `# 제목` line that became `meta.title`.
 const SUMMARY = `## 결정사항
@@ -213,6 +258,12 @@ const summarized = (title: string, status: Status, when: Date, patch: Partial<Me
     { title, backend: "gpu", chunks_done: 5, llm_connection: CLOUD.name, ...patch },
     { summary: SUMMARY, generated: SUMMARY, transcript: TRANSCRIPT },
   );
+const mixedSummarized = (title: string, status: Status, when: Date, patch: Partial<MeetingItem> = {}): Stored => ({
+  ...summarized(title, status, when, { languages: ["ko", "vi"], ...patch }),
+  summary: MIXED_SUMMARY,
+  generated: MIXED_SUMMARY,
+  transcript: MIXED,
+});
 
 const progressOf = (id: string, patch: Partial<Progress>): Progress => ({
   id,
@@ -244,6 +295,8 @@ let timers: ReturnType<typeof setInterval>[] = [];
 let downloading: { cancelled: boolean; done: () => void; chain: ModelFileState[] } | null = null;
 /** An audio check is running: like check.rs, a second one is refused. */
 let checking = false;
+/** The meeting whose next `set_meeting_language` fails once (design-system 8.7 적용 실패). */
+let flaky: string | null = null;
 
 const find = (id: unknown) => {
   const m = meetings.find((x) => x.meta.id === id);
@@ -255,24 +308,32 @@ const send = (event: string, payload?: unknown) => void emit(event, payload);
 const RUNNING: Status[] = ["transcribing", "summarizing"];
 const isRunning = (p: Progress) => RUNNING.includes(p.status);
 
-/** Every model file, the summary model last; `model_status` shows a scope of them. */
-function modelState(installed: boolean, received = 0, summary = { installed, received: 0 }): ModelState {
+/** Every model file, the summary model and then the detection model last; `model_status` shows a
+ * scope of them. */
+function modelState(
+  installed: boolean,
+  received = 0,
+  summary = { installed, received: 0 },
+  lid = { installed, received: 0 },
+): ModelState {
   const whisper = MODEL_FILES[settings.model] ?? MODEL_FILES["large-v3-turbo-q8_0"];
   return {
     files: [
       { ...whisper, installed, received, downloading: false },
       { ...VAD, installed, received: 0, downloading: false },
       { ...SUMMARY_MODEL, ...summary, downloading: false },
+      { ...LID, ...lid, downloading: false },
     ],
     downloading: false,
   };
 }
 
 /** Like `scoped` in commands.rs: `all` has the summary model while the built-in LLM is the default
- * (`defaultConnection`). */
+ * (`defaultConnection`), and never the detection model (plan 5.6-14). */
 function scoped(scope: unknown) {
-  const [whisper, vad, summary] = models.files;
+  const [whisper, vad, summary, lid] = models.files;
   if (scope === "summary") return [summary];
+  if (scope === "lid") return [lid];
   return scope === "transcription" || defaultConnection() ? [whisper, vad] : [whisper, vad, summary];
 }
 
@@ -291,6 +352,7 @@ export function reset(scenario: Scenario) {
   downloading = null;
   checking = false;
   recording = null;
+  flaky = null;
   serial = done = 0;
   settings = fullSettings();
   secrets = new Set([`llm:${CLOUD.name}`, `llm:${GATEWAY.name}`]);
@@ -537,6 +599,69 @@ export function reset(scenario: Scenario) {
     line = [progressOf(resumed.meta.id, { status: "paused", position: 1 })];
   }
 
+  // 설정 and the import dialog start from all four ("한국어 외 3개").
+  if (scenario === "languages" || scenario === "languagesRecording")
+    settings.transcribe_languages = LANGS.map((l) => l.code);
+
+  // Its dialog in each mode: blocked while it runs, before any chunk (one language: the last check
+  // is blocked), and E3 once transcribed. The sent one's meta line has its languages and channel.
+  if (scenario === "languages") {
+    const detecting = stored("transcribing", at(0, 14, 0), {
+      duration_ms: 48 * 60_000,
+      backend: "gpu",
+      languages: ["ko", "vi"],
+    });
+    // "영어로 전사" on its first chunk.
+    const english = stored("transcribing", at(0, 13, 0), { duration_ms: 35 * 60_000, backend: "gpu", languages: ["en"] });
+    // Two run, so it keeps waiting a while.
+    const waiting = stored("recorded", at(0, 15, 10), { duration_ms: 22 * 60_000 });
+    meetings = [
+      detecting,
+      english,
+      waiting,
+      mixedSummarized("호치민 공장 주간 회의", "review", at(0, 10, 0), { duration_ms: 46 * 60_000 }),
+      mixedSummarized("호치민 공장 주간 회의", "sent", at(7, 10, 0), {
+        duration_ms: 51 * 60_000,
+        sent: { channel: "#베트남법인", at: at(7, 11, 5).toISOString(), edit_count: 2 },
+      }),
+      summarized("주간 제품 회의", "review", at(1, 10, 0)),
+    ];
+    line = [
+      progressOf(detecting.meta.id, { status: "transcribing", chunk: 0, chunks: 4, percent: 3, detecting: true }),
+      progressOf(english.meta.id, { status: "transcribing", chunk: 0, chunks: 3, percent: 12, eta_secs: 600 }),
+      progressOf(waiting.meta.id, { status: "recorded", position: 1 }),
+    ];
+  }
+
+  if (scenario === "languagesRecording") {
+    const started = Date.now() - 8 * 60_000;
+    const live = stored("recording", new Date(started), { duration_ms: 0, languages: ["ko", "vi"] });
+    recording = { id: live.meta.id, startedAt: started };
+    flaky = live.meta.id;
+    meetings = [live, mixedSummarized("호치민 공장 주간 회의", "review", at(1, 10, 0))];
+  }
+
+  // Without the detection model (78 MB, 15 MB kept; main.tsx starts it), the mixed meeting waits
+  // in line and the Korean one behind it runs. Once the model is in, its first chunk tells the
+  // languages apart.
+  if (scenario === "languagesLid") {
+    settings.transcribe_languages = ["ko", "vi"];
+    models = modelState(true, 0, undefined, { installed: false, received: 15_000_000 });
+    const mixed = stored("recorded", at(0, 14, 0), { duration_ms: 40 * 60_000, languages: ["ko", "vi"] });
+    const korean = stored("recorded", at(0, 15, 0), { duration_ms: 18 * 60_000 });
+    meetings = [
+      mixed,
+      korean,
+      summarized("주간 제품 회의", "sent", at(1, 10, 0), {
+        sent: { channel: "#회의록", at: at(1, 10, 50).toISOString(), edit_count: 0 },
+      }),
+    ];
+    line = [
+      progressOf(mixed.meta.id, { status: "recorded", position: 1 }),
+      progressOf(korean.meta.id, { status: "recorded", position: 2 }),
+    ];
+  }
+
   timers.push(setInterval(tick, 700), setInterval(levels, 40));
 }
 
@@ -550,9 +675,17 @@ function tick() {
   // TRN-09: a recording holds the line.
   if (recording) return;
   for (const p of line.filter(isRunning)) advance(p);
-  while (line.filter(isRunning).length < 2 && line.some((p) => p.position != null))
-    start(line.find((p) => p.position === 1)!);
+  while (line.filter(isRunning).length < 2) {
+    const next = line.find((p) => p.position != null && canStart(find(p.id)));
+    if (!next) break;
+    start(next);
+  }
 }
+
+const lidReady = () => models.files.some((f) => f.file === LID.file && f.installed);
+/** queue.rs `can_start`: a mixed meeting still to transcribe waits for the detection model, out of
+ * the way of the ones behind it (plan 5.6-14). */
+const canStart = (m: Stored) => !!m.transcript || m.meta.languages.length < 2 || lidReady();
 
 function advance(p: Progress) {
   const m = find(p.id);
@@ -566,10 +699,12 @@ function advance(p: Progress) {
     p.percent = Math.min(100, p.percent + 1);
     p.chunk = Math.min(p.chunks, Math.floor(p.percent / (100 / p.chunks)));
     p.eta_secs = p.percent > 3 ? (100 - p.percent) * 4 : null;
+    // Plan 5.6-27: "언어를 가리는 중" through a mixed meeting's first chunk.
+    if (m.meta.languages.length > 1) p.detecting = p.chunk === 0;
     m.meta.chunks_done = p.chunk;
     m.meta.backend ??= "gpu";
     if (p.percent === 100) {
-      m.transcript = TRANSCRIPT;
+      m.transcript = m.meta.languages.length > 1 ? MIXED : TRANSCRIPT;
       const to = route(m.meta);
       if (!to) {
         // No route yet: it waits here, out of line, saying why (plan 5.4).
@@ -597,7 +732,8 @@ function advance(p: Progress) {
     p.percent = Math.min(100, p.percent + 5);
     p.chunk = Math.floor((p.percent / 100) * p.chunks);
     if (p.percent === 100) {
-      Object.assign(m, { summary: SUMMARY, generated: SUMMARY });
+      const summary = m.meta.languages.length > 1 ? MIXED_SUMMARY : SUMMARY;
+      Object.assign(m, { summary, generated: summary });
       m.meta.title = TITLES[done++ % TITLES.length];
       m.meta.status = p.status = "review";
       return finish(p);
@@ -814,6 +950,9 @@ type Commands = {
   delete_meeting: typeof ipc.deleteMeeting;
   resume_meeting: typeof ipc.resumeMeeting;
   pause_meeting: typeof ipc.pauseMeeting;
+  transcribe_languages: typeof ipc.transcribeLanguages;
+  set_meeting_language: typeof ipc.setMeetingLanguage;
+  retranscribe: typeof ipc.retranscribe;
   summary_route: typeof ipc.summaryRoute;
   set_summarize_local: typeof ipc.setSummarizeLocal;
   save_summary: typeof ipc.saveSummary;
@@ -939,6 +1078,43 @@ const handlers: Handlers = {
     return "pausing";
   },
 
+  transcribe_languages: () => clone(LANGS),
+  // Plan 5.6-4 (queue.rs `set_language`): not while it runs, nor once a chunk is done.
+  set_meeting_language: (a) => {
+    const m = find(a.id);
+    if (line.some((p) => p.id === m.meta.id && isRunning(p))) throw "처리 중에는 바꿀 수 없습니다";
+    if (m.meta.chunks_done > 0 || m.transcript) throw "이미 전사한 구간이 있어 다시 전사해야 바꿀 수 있습니다";
+    if (flaky === m.meta.id) {
+      flaky = null;
+      throw "meta.json 저장 실패: 다른 프로세스가 파일을 사용 중이기 때문에 프로세스가 액세스할 수 없습니다. (os error 32)";
+    }
+    m.meta.languages = a.languages as string[];
+    return clone(m.meta);
+  },
+  // Plan 5.6-6 (E3, queue.rs `retranscribe`): its results gone, `recorded` and back in line.
+  retranscribe: (a) => {
+    const m = find(a.id);
+    if (line.some((p) => p.id === m.meta.id && isRunning(p))) throw "처리 중입니다. 먼저 일시정지해 주세요";
+    if (m.sending) throw "보내는 중입니다";
+    const from: Status[] = ["transcribed", "review", "summarize_failed", "archived", "transcribe_failed", "paused"];
+    if (!from.includes(m.meta.status)) throw `다시 전사할 수 없는 상태입니다: ${m.meta.status}`;
+    line = line.filter((p) => p.id !== m.meta.id);
+    Object.assign(m.meta, {
+      status: "recorded",
+      languages: a.languages as string[],
+      chunks_done: 0,
+      backend: null,
+      error: null,
+      llm_connection: null,
+      no_speech: false,
+      held: false,
+    });
+    delete m.meta.wait;
+    Object.assign(m, { summary: "", generated: "", transcript: null });
+    enqueue(m);
+    return clone(m.meta);
+  },
+
   summary_route: (a) => summaryRoute(find(a.id).meta),
   set_summarize_local: (a) => {
     const m = find(a.id);
@@ -1036,6 +1212,7 @@ const handlers: Handlers = {
     const m = stored("recording", new Date(), {
       duration_ms: 0,
       summarize_local: settings.summarize_local_by_default,
+      languages: [...settings.transcribe_languages],
     });
     meetings.push(m);
     recording = { id: m.meta.id, startedAt: Date.now() };
@@ -1067,8 +1244,10 @@ const handlers: Handlers = {
           downloading = null;
           return cancelled ? reject("다운로드를 취소했습니다") : resolve();
         }
-        // About 32 MB/s: slow enough to watch the progress in the settings and on Home.
-        file.received = Math.min(file.size, file.received + 8_000_000);
+        // About 32 MB/s: slow enough to watch the progress in the settings and on Home. The 78 MB
+        // detection model at 2 MB/s, or its states would be gone before they are seen.
+        const step = file.file === LID.file ? 500_000 : 8_000_000;
+        file.received = Math.min(file.size, file.received + step);
         const all = chain.reduce((sum, f) => sum + f.size, 0);
         const done = chain.reduce((sum, f) => sum + (f.installed ? f.size : f.received), 0);
         send("model://download", {
@@ -1078,7 +1257,7 @@ const handlers: Handlers = {
           all_received: done,
           all_total: all,
           // Like the app: no speed for the download's first 10 s (plan 5.2-3).
-          bps: Date.now() - started < 10_000 ? null : 32_000_000,
+          bps: Date.now() - started < 10_000 ? null : step * 4,
         });
         if (file.received === file.size) {
           Object.assign(file, { installed: true, received: 0 });
@@ -1116,6 +1295,7 @@ const handlers: Handlers = {
         const m = stored("recorded", new Date(Date.now() - 38 * 60_000), {
           duration_ms: 37 * 60_000,
           summarize_local: settings.summarize_local_by_default,
+          languages: a.languages as string[],
         });
         meetings.push(m);
         enqueue(m);
