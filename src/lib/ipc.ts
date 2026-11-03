@@ -299,8 +299,8 @@ export const onOpenMeeting = (handler: (id: string) => void) =>
 
 /**
  * `meeting://progress`. Sent when a meeting joins the line, its place changes, it starts, a chunk
- * or LLM request moves, and when it ends (with its final status: `review`, `transcribed` when there
- * is no LLM connection, `transcribe_failed`, `summarize_failed`, `paused`).
+ * or LLM request moves, its slow reason changes, and when it ends (with its final status: `review`,
+ * `transcribed` when there is no LLM connection, `transcribe_failed`, `summarize_failed`, `paused`).
  */
 export type Progress = {
   id: string;
@@ -319,7 +319,13 @@ export type Progress = {
   /** Unix seconds since the built-in engine began starting for this summary, until it is ready or
    * fails (plan 5.3): "요약 엔진 준비 중 · N초" counts from it. */
   engine_since?: number | null;
+  /** Why it is slow (plan 5.1-11), judged again every 30 s and at every progress line. Only
+   * `saver` while `summarizing`. */
+  slow?: SlowReason | null;
 };
+/** `saver`: on battery in a power-saving mode (Windows). `cpu`: automatic or GPU, yet the CPU
+ * transcribes; `cpu_nogpu`: there is no GPU. `slow`: slower than the recording all the same. */
+export type SlowReason = "saver" | "cpu" | "cpu_nogpu" | "slow";
 /** Queued and running meetings, for the first render before progress events arrive. */
 export const queueState = () => invoke<Progress[]>("queue_state");
 export const onMeetingProgress = (handler: (progress: Progress) => void) =>

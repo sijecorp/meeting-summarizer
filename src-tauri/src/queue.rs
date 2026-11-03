@@ -8,7 +8,7 @@
 //!
 //! The decisions are pure and tested without the app: `Sched` (who runs, who waits, places in
 //! line, the built-in engine's lease), `ChunkRun` (GPU retry, CPU fallback, TRN-07),
-//! `read_partial` (where to resume), `percent` and `eta_secs`.
+//! `read_partial` (where to resume), `percent`, `eta_secs` and `Pace` (why it is slow, plan 5.1-11).
 
 use crate::grounding;
 use crate::settings::{self, BUILTIN, Backend, LlmConnection, SecretKind, Settings, SettingsStore};
@@ -19,6 +19,7 @@ use crate::transcribe::engine::{self, Chunk, Device, Line, Segment};
 use crate::transcribe::filter;
 use crate::transcribe::model::{self, Check, Models};
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -48,8 +49,8 @@ const PARTIAL: &str = "transcript.partial.jsonl";
 const GPU_FAILED: &str = "GPU 처리가 불안정해 CPU로 전환했습니다. 처리 시간이 길어집니다";
 
 /// `meeting://progress`, and one entry of `queue_state`. Sent when a meeting joins the line, its
-/// place changes, it starts, a chunk or LLM request moves, and when it ends (then with its final
-/// status).
+/// place changes, it starts, a chunk or LLM request moves, its slow reason changes, and when it
+/// ends (then with its final status).
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Progress {
     pub id: String,
@@ -68,6 +69,23 @@ pub struct Progress {
     /// Unix seconds since the built-in engine began starting for this summary, until it is ready
     /// or fails (plan 5.3, up to 120 s): the screens count "요약 엔진 준비 중 · N초" from it.
     pub engine_since: Option<u64>,
+    /// Plan 5.1-11: why it is slow, judged again every `TICK` and at every progress line. Only
+    /// `saver` while `summarizing`.
+    pub slow: Option<SlowReason>,
+}
+
+/// Plan 5.1-11: the one reason a running meeting is slow.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SlowReason {
+    /// On battery in battery saver or the best-efficiency power mode (Windows).
+    Saver,
+    /// Automatic or GPU, yet the CPU transcribes.
+    Cpu,
+    /// As `Cpu`, but the worker found no GPU at all.
+    CpuNogpu,
+    /// Slower than the recording all the same.
+    Slow,
 }
 
 /// `transcribe://gpu-failed`: the GPU crashed twice on one chunk, so automatic mode now uses the
@@ -209,9 +227,23 @@ struct Job {
     cloud: bool,
     /// The last worker's `Line::Device`: where it runs, and the GPU it picked ("" for none).
     device: Option<(Device, String)>,
+    /// Plan 5.1-11: the transcription's pace, once its chunks start.
+    pace: Option<Pace>,
 }
 
 impl Job {
+    /// The worker's `Line::Device`. Plan 5.1-11: from the GPU to the CPU, the pace is measured
+    /// again.
+    fn ran_on(&mut self, device: Device, name: String) {
+        if device == Device::Cpu
+            && matches!(self.device, Some((Device::Gpu, _)))
+            && let Some(pace) = &mut self.pace
+        {
+            pace.restart();
+        }
+        self.device = Some((device, name));
+    }
+
     fn halt(&mut self, why: Stop) {
         // A delete wins: its run must not write `paused` over `deleting` afterwards.
         if self.stop != Some(Stop::Delete) {
@@ -459,6 +491,139 @@ fn eta_secs(processed_ms: u64, elapsed: Duration, remaining_ms: u64) -> Option<u
     Some((remaining_ms as u128 * elapsed.as_millis() / processed_ms as u128 / 1000) as u64)
 }
 
+/// Plan 5.1-11: running meetings' slow reasons are judged again this often without a progress line.
+const TICK: Duration = Duration::from_secs(30);
+/// Plan 5.1-11: a measurement keeps its last verdict this long after it starts.
+const HOLD: Duration = Duration::from_secs(60);
+
+/// Plan 5.1-11: this run's pace, for its real-time factor. Measured again from the first progress
+/// line after the GPU gave way to the CPU.
+struct Pace {
+    /// When measuring began and the audio done then (ms of the recording). `None` from a restart
+    /// until the next progress line.
+    from: Option<(Instant, u64)>,
+    /// The last progress line: when, and the audio done by it. Up to it, not up to now, so the
+    /// factor does not creep up between lines.
+    last: (Instant, u64),
+    /// The last verdict, kept through a measurement's first `HOLD`.
+    held: Option<SlowReason>,
+}
+
+impl Pace {
+    fn new(now: Instant, done_ms: u64) -> Self {
+        Self {
+            from: Some((now, done_ms)),
+            last: (now, done_ms),
+            held: None,
+        }
+    }
+
+    fn progress(&mut self, now: Instant, done_ms: u64) {
+        self.from.get_or_insert((now, done_ms));
+        self.last = (now, done_ms);
+    }
+
+    fn restart(&mut self) {
+        self.from = None;
+    }
+
+    /// The verdict at `now`: the last one within `HOLD` of measuring's start or before any audio
+    /// is done, then by the real-time factor and where the worker runs.
+    fn judge(
+        &mut self,
+        now: Instant,
+        backend: Backend,
+        device: Option<&(Device, String)>,
+    ) -> Option<SlowReason> {
+        let Some((since, from_ms)) = self.from else {
+            return self.held;
+        };
+        let (at, done_ms) = self.last;
+        let audio_s = done_ms.saturating_sub(from_ms) as f64 / 1000.0;
+        if now.duration_since(since) < HOLD || audio_s == 0.0 {
+            return self.held;
+        }
+        let rtf = at.duration_since(since).as_secs_f64() / audio_s;
+        self.held = (rtf > 1.0).then_some(match (backend, device) {
+            (Backend::Cpu, _) | (_, None | Some((Device::Gpu, _))) => SlowReason::Slow,
+            (_, Some((Device::Cpu, gpu))) if gpu.is_empty() => SlowReason::CpuNogpu,
+            _ => SlowReason::Cpu,
+        });
+        self.held
+    }
+}
+
+/// Plan 5.1-11: a running meeting's one reason at `now`, `saver` first. `pace` only while it
+/// transcribes: a summary is only ever `saver`.
+fn slow_reason(
+    saver: bool,
+    pace: Option<&mut Pace>,
+    backend: Backend,
+    device: Option<&(Device, String)>,
+    now: Instant,
+) -> Option<SlowReason> {
+    let paced = pace.and_then(|p| p.judge(now, backend, device));
+    if saver {
+        Some(SlowReason::Saver)
+    } else {
+        paced
+    }
+}
+
+/// Plan 5.1-11: Windows' effective power mode as its last notification said; -1 before the first.
+#[cfg(windows)]
+static POWER_MODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Plan 5.1-11: Windows tells this process its effective power mode now and at every change
+/// (Windows 10 1809 on, hence V1). For the process's life: never unregistered.
+#[cfg(windows)]
+fn watch_power_mode() {
+    use windows_sys::Win32::System::Power::{
+        EFFECTIVE_POWER_MODE, EFFECTIVE_POWER_MODE_V1,
+        PowerRegisterForEffectivePowerModeNotifications,
+    };
+    unsafe extern "system" fn changed(mode: EFFECTIVE_POWER_MODE, _: *const std::ffi::c_void) {
+        POWER_MODE.store(mode, Ordering::Relaxed);
+    }
+    let mut registration = std::ptr::null_mut();
+    // SAFETY: the callback only stores into a static; the registration handle is never used.
+    let hr = unsafe {
+        PowerRegisterForEffectivePowerModeNotifications(
+            EFFECTIVE_POWER_MODE_V1,
+            Some(changed),
+            std::ptr::null(),
+            &mut registration,
+        )
+    };
+    if hr < 0 {
+        log::warn!("전원 모드 알림을 받을 수 없습니다: {hr:#010x}");
+    }
+}
+
+/// Plan 5.1-11 `saver`: on battery, in battery saver or the best-efficiency power mode.
+#[cfg(windows)]
+fn saver() -> bool {
+    use windows_sys::Win32::System::Power::{
+        EffectivePowerModeBatterySaver, EffectivePowerModeBetterBattery, GetSystemPowerStatus,
+        SYSTEM_POWER_STATUS,
+    };
+    let mut status = SYSTEM_POWER_STATUS::default();
+    // SAFETY: fills `status` and nothing else.
+    let battery = unsafe { GetSystemPowerStatus(&mut status) } != 0 && status.ACLineStatus == 0;
+    battery
+        && [
+            EffectivePowerModeBatterySaver,
+            EffectivePowerModeBetterBattery,
+        ]
+        .contains(&POWER_MODE.load(Ordering::Relaxed))
+}
+
+/// macOS never says `saver`.
+#[cfg(not(windows))]
+fn saver() -> bool {
+    false
+}
+
 /// Why a model would not load, from hashing its files (P2-1 review).
 fn model_failure(check: Check, why: &str) -> String {
     match check {
@@ -603,6 +768,8 @@ enum End {
 
 /// An LLM connection's API key by connection name.
 type Secret = Box<dyn Fn(&str) -> Result<Option<String>, String> + Send + Sync>;
+/// Plan 5.1-9: holds the system awake until dropped, `None` when it could not.
+type Awake = Box<dyn Fn() -> Option<Box<dyn Any>> + Send + Sync>;
 
 /// Generic over the runtime only so tests can run it on `tauri::test`'s mock runtime.
 pub struct Queue<R: Runtime = Wry> {
@@ -615,6 +782,11 @@ pub struct Queue<R: Runtime = Wry> {
     /// The built-in summary engine, one for the app (plan 5.3). Its lock comes after `inner`'s.
     /// Shared with its summary's `on_failure` hook.
     sidecar: Arc<Sidecar>,
+    /// Wakes the power thread (`watch`): a run started or ended, a progress line came, the app
+    /// exits.
+    wake: mpsc::Sender<()>,
+    /// Taken by the power thread; tests put a stand-in here.
+    awake: Awake,
 }
 
 impl<R: Runtime> Queue<R> {
@@ -635,12 +807,32 @@ impl<R: Runtime> Queue<R> {
                 }
             },
         );
+        let (wake, woken) = mpsc::channel();
+        let watching = app.clone();
+        let spawned = thread::Builder::new()
+            .name("power".into())
+            .spawn(move || watch(&watching, &woken));
+        if let Err(e) = spawned {
+            log::error!("전원 감시 스레드를 시작할 수 없습니다: {e}");
+        }
         Self {
             app,
             exe,
             secret: Box::new(|name| settings::get_secret(SecretKind::Llm, name)),
             inner: Mutex::new(Inner::default()),
             sidecar: Arc::new(sidecar),
+            wake,
+            awake: Box::new(|| {
+                keepawake::Builder::default()
+                    .idle(true)
+                    .reason("회의 처리 중")
+                    .app_name("회의 요약")
+                    .app_reverse_domain("com.sije.meeting-summarizer")
+                    .create()
+                    .inspect_err(|e| log::warn!("절전 방지 실패: {e}"))
+                    .ok()
+                    .map(|held| Box::new(held) as Box<dyn Any>)
+            }),
         }
     }
 
@@ -695,9 +887,37 @@ impl<R: Runtime> Queue<R> {
                 eta_secs: None,
                 position: None,
                 engine_since: None,
+                slow: None,
             },
         );
         self.publish_positions(&mut inner);
+    }
+
+    /// Plan 5.1-11: every running meeting's slow reason again, sent where it changed. Whether any
+    /// meeting is processing, or `None` once the app is exiting.
+    fn judge(&self) -> Option<bool> {
+        // The OS and the settings file first: never under the lock.
+        let (saver, backend, now) = (saver(), self.settings().backend, Instant::now());
+        let mut inner = lock(&self.inner);
+        if inner.closed {
+            return None;
+        }
+        let Inner { jobs, progress, .. } = &mut *inner;
+        for (id, job) in jobs.iter_mut() {
+            let Some(p) = progress.get_mut(id) else {
+                continue;
+            };
+            let pace = job
+                .pace
+                .as_mut()
+                .filter(|_| p.status == Status::Transcribing);
+            let slow = slow_reason(saver, pace, backend, job.device.as_ref(), now);
+            if p.slow != slow {
+                p.slow = slow;
+                self.emit(p);
+            }
+        }
+        Some(!jobs.is_empty())
     }
 
     /// TRN-01: every `recorded` and `paused` meeting, oldest first, but one with only its summary
@@ -783,6 +1003,7 @@ impl<R: Runtime> Queue<R> {
                 // Detached: `cancel` waits on `running` instead, which `end` clears.
                 Ok(_) => {
                     inner.jobs.insert(id, Job::default());
+                    let _ = self.wake.send(());
                 }
                 Err(e) => {
                     log::error!("처리 스레드를 시작할 수 없습니다 ({id}): {e}");
@@ -842,6 +1063,8 @@ impl<R: Runtime> Queue<R> {
             job.halt(Stop::Quit);
         }
         self.sidecar.stop("앱 종료");
+        // The power thread ends and lets the system sleep again.
+        let _ = self.wake.send(());
     }
 
     /// ENG18: llama-server holds the summary model open.
@@ -1000,7 +1223,7 @@ impl<R: Runtime> Queue<R> {
                 Line::Result { device, segments } => result = Some((device, segments)),
                 Line::Device { device, name } => {
                     if let Some(job) = lock(&self.inner).jobs.get_mut(id) {
-                        job.device = Some((device, name));
+                        job.ran_on(device, name);
                     }
                 }
                 // Plan 5.1-13: the measurements go to app.log, with whose and which version.
@@ -1082,6 +1305,9 @@ impl<R: Runtime> Queue<R> {
             |done: &[ChunkResult]| -> u64 { done.iter().map(|r| r.end_ms - r.start_ms).sum() };
         let resumed_ms = done_ms(&done);
         let since = Instant::now();
+        if let Some(job) = lock(&self.inner).jobs.get_mut(id) {
+            job.pace = Some(Pace::new(since, resumed_ms));
+        }
         self.set_progress(id, |p| {
             p.chunk = done.len() as u32;
             p.chunks = chunks;
@@ -1093,6 +1319,13 @@ impl<R: Runtime> Queue<R> {
             let chunk_ms = chunk.end_ms - chunk.start_ms;
             let report = |pct: u8| {
                 let at_ms = before_ms + chunk_ms * u64::from(pct) / 100;
+                if let Some(pace) = lock(&self.inner)
+                    .jobs
+                    .get_mut(id)
+                    .and_then(|j| j.pace.as_mut())
+                {
+                    pace.progress(Instant::now(), at_ms);
+                }
                 self.set_progress(id, |p| {
                     p.percent = percent(before_ms, chunk_ms, pct, plan.len_ms);
                     p.eta_secs = eta_secs(
@@ -1101,6 +1334,8 @@ impl<R: Runtime> Queue<R> {
                         plan.len_ms.saturating_sub(at_ms),
                     );
                 });
+                // Plan 5.1-11: judged again at every progress line.
+                let _ = self.wake.send(());
             };
             // No speech by VAD: nothing to transcribe.
             let (segments, device) = if chunk.speech_ms == 0 {
@@ -1237,6 +1472,8 @@ impl<R: Runtime> Queue<R> {
                 eta_secs: None,
                 position: None,
                 engine_since: None,
+                // Plan 5.1-12: only `saver` goes on into the summary.
+                slow: p.slow.filter(|s| *s == SlowReason::Saver),
             };
         });
     }
@@ -1479,6 +1716,7 @@ impl<R: Runtime> Queue<R> {
             if let (Some(mut p), Some(status)) = (entry, status) {
                 p.status = status;
                 p.eta_secs = None;
+                p.slow = None;
                 if !waiting {
                     // Out of line, even if a recording put it back before this run could stop.
                     p.position = None;
@@ -1494,6 +1732,8 @@ impl<R: Runtime> Queue<R> {
             self.publish_positions(&mut inner);
         }
         self.pump();
+        // After the next one started, so the system is not let go between them.
+        let _ = self.wake.send(());
         // APP-03: done or failed, said with its title; a click opens it.
         if finished && let Ok(meta) = store.get(id) {
             let event = match meta.status {
@@ -1524,6 +1764,34 @@ fn run<R: Runtime>(app: &AppHandle<R>, id: &str) {
     let end = panic::catch_unwind(AssertUnwindSafe(|| queue.process(&store, id)))
         .unwrap_or_else(|_| End::Failed("처리 중 내부 오류가 났습니다".into()));
     queue.end(&store, id, end);
+}
+
+/// Plan 5.1-9, 5.1-11: the queue's power thread, until the app exits. While any meeting runs it
+/// holds the system awake (Windows ties that to this thread); every `TICK` and whenever woken it
+/// judges the running meetings' slow reasons again.
+fn watch<R: Runtime>(app: &AppHandle<R>, woken: &mpsc::Receiver<()>) {
+    #[cfg(windows)]
+    watch_power_mode();
+    // Set while busy, even when taking the hold failed: one try per busy spell.
+    let mut held = None;
+    loop {
+        if woken.recv_timeout(TICK) == Err(RecvTimeoutError::Disconnected) {
+            return;
+        }
+        while woken.try_recv().is_ok() {}
+        // Not managed: a test's queue that never runs anything.
+        let Some(queue) = app.try_state::<Queue<R>>() else {
+            return;
+        };
+        let Some(busy) = queue.judge() else {
+            return;
+        };
+        if !busy {
+            held = None;
+        } else if held.is_none() {
+            held = Some((queue.awake)());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1799,6 +2067,116 @@ mod tests {
             eta_secs(600_000, Duration::from_secs(60), 1_200_000),
             Some(120)
         );
+    }
+
+    /// Plan 5.1-11: slower than the recording, where the worker runs and what was chosen say why.
+    /// Saver goes first and is the only reason while summarizing (no pace).
+    #[test]
+    fn a_slow_meeting_says_why() {
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let cpu = |gpu: &str| (Device::Cpu, gpu.to_string());
+        // 60 s of audio in 90 s.
+        let slow = || {
+            let mut pace = Pace::new(t0, 0);
+            pace.progress(at(90), 60_000);
+            pace
+        };
+        let judge = |saver, backend, device: &(Device, String)| {
+            slow_reason(saver, Some(&mut slow()), backend, Some(device), at(90))
+        };
+        assert_eq!(
+            judge(false, Backend::Auto, &cpu("Radeon")),
+            Some(SlowReason::Cpu)
+        );
+        assert_eq!(
+            judge(false, Backend::Gpu, &cpu("Radeon")),
+            Some(SlowReason::Cpu)
+        );
+        assert_eq!(
+            judge(false, Backend::Auto, &cpu("")),
+            Some(SlowReason::CpuNogpu)
+        );
+        assert_eq!(
+            judge(false, Backend::Cpu, &cpu("Radeon")),
+            Some(SlowReason::Slow)
+        );
+        assert_eq!(judge(false, Backend::Cpu, &cpu("")), Some(SlowReason::Slow));
+        let gpu = (Device::Gpu, "Radeon".to_string());
+        assert_eq!(judge(false, Backend::Auto, &gpu), Some(SlowReason::Slow));
+        assert_eq!(
+            judge(true, Backend::Auto, &cpu("")),
+            Some(SlowReason::Saver)
+        );
+        assert_eq!(
+            slow_reason(true, None, Backend::Auto, None, at(90)),
+            Some(SlowReason::Saver)
+        );
+        assert_eq!(slow_reason(false, None, Backend::Auto, None, at(90)), None);
+        // What the screens read.
+        assert_eq!(
+            serde_json::to_value(SlowReason::CpuNogpu).unwrap(),
+            "cpu_nogpu"
+        );
+
+        // Plugged in: the next tick clears saver with no progress line in between.
+        let mut pace = Pace::new(t0, 0);
+        pace.progress(at(30), 300_000);
+        let tick =
+            |saver, pace: &mut Pace, s| slow_reason(saver, Some(pace), Backend::Auto, None, at(s));
+        assert_eq!(tick(true, &mut pace, 61), Some(SlowReason::Saver));
+        assert_eq!(tick(false, &mut pace, 91), None);
+    }
+
+    /// Plan 5.1-11: a measurement keeps its last verdict for its first minute, real time is not
+    /// slow, and the CPU taking over from the GPU is measured on its own.
+    #[test]
+    fn the_pace_holds_its_first_minute_and_starts_again_on_the_cpu() {
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let radeon = (Device::Cpu, "Radeon".to_string());
+        let mut pace = Pace::new(t0, 0);
+        // 30 s of audio in 40 s.
+        pace.progress(at(40), 30_000);
+        assert_eq!(pace.judge(at(59), Backend::Auto, Some(&radeon)), None);
+        assert_eq!(
+            pace.judge(at(60), Backend::Auto, Some(&radeon)),
+            Some(SlowReason::Cpu)
+        );
+        pace.progress(at(70), 70_000);
+        assert_eq!(pace.judge(at(75), Backend::Auto, Some(&radeon)), None);
+
+        // The GPU did 10 min of audio in its first minute, then crashed over to the CPU.
+        let mut job = Job {
+            pace: Some(Pace::new(t0, 0)),
+            ..Job::default()
+        };
+        job.ran_on(Device::Gpu, "Radeon".into());
+        let judge = |job: &mut Job, s| {
+            let Job { pace, device, .. } = job;
+            pace.as_mut()
+                .unwrap()
+                .judge(at(s), Backend::Auto, device.as_ref())
+        };
+        job.pace.as_mut().unwrap().progress(at(60), 600_000);
+        assert_eq!(judge(&mut job, 61), None);
+        job.ran_on(Device::Cpu, "Radeon".into());
+        // The CPU runs the chunk again from its start: 30 s of audio in 50 s from its first line.
+        job.pace.as_mut().unwrap().progress(at(80), 540_000);
+        job.pace.as_mut().unwrap().progress(at(130), 570_000);
+        assert_eq!(judge(&mut job, 139), None);
+        // Measured from the run's start it would look fast: 570 s of audio in 130 s.
+        assert_eq!(judge(&mut job, 140), Some(SlowReason::Cpu));
+
+        // Measured again: the last verdict stays until a minute in.
+        job.ran_on(Device::Gpu, "Radeon".into());
+        job.ran_on(Device::Cpu, "Radeon".into());
+        job.pace.as_mut().unwrap().progress(at(150), 600_000);
+        assert_eq!(judge(&mut job, 200), Some(SlowReason::Cpu));
+        // From the CPU to the GPU is not measured again.
+        job.ran_on(Device::Gpu, "Radeon".into());
+        job.pace.as_mut().unwrap().progress(at(210), 1_200_000);
+        assert_eq!(judge(&mut job, 211), None);
     }
 
     #[test]
@@ -2081,7 +2459,18 @@ mod tests {
             app: tauri::App<MockRuntime>,
             events: Arc<Mutex<Vec<serde_json::Value>>>,
             gpu_notices: Arc<Mutex<u32>>,
+            /// Plan 5.1-9's holds: taken, and let go.
+            holds: Arc<(AtomicUsize, AtomicUsize)>,
             tmp: tempfile::TempDir,
+        }
+
+        /// The stand-in for the OS's hold: counts itself let go.
+        struct Hold(Arc<(AtomicUsize, AtomicUsize)>);
+
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.1.fetch_add(1, Ordering::SeqCst);
+            }
         }
 
         /// One test with a summary model on disk at a time (`Fixture::install_summary`): taken
@@ -2134,10 +2523,16 @@ mod tests {
                 fake_llama(behave),
                 crate::sidecar::LIMITS.reap,
             );
-            // Never the real keychain.
+            let holds = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+            let taking = holds.clone();
+            // Never the real keychain, nor the OS's sleep settings.
             app.manage(Queue {
                 secret: Box::new(|_| Ok(Some("sk-test".into()))),
                 sidecar: Arc::new(engine.sidecar),
+                awake: Box::new(move || {
+                    taking.0.fetch_add(1, Ordering::SeqCst);
+                    Some(Box::new(Hold(taking.clone())) as Box<dyn Any>)
+                }),
                 ..Queue::new(app.handle().clone(), exe)
             });
 
@@ -2157,6 +2552,7 @@ mod tests {
                 app,
                 events,
                 gpu_notices,
+                holds,
                 tmp,
             }
         }
@@ -2344,6 +2740,35 @@ mod tests {
                 (&last["status"], &last["percent"]),
                 (&"review".into(), &100.into())
             );
+        }
+
+        /// Plan 5.1-9: the system is held awake once while a meeting is processed, and let go when
+        /// nothing runs.
+        #[cfg(unix)]
+        #[test]
+        fn processing_holds_the_system_awake_until_nothing_runs() {
+            // The chunk waits for the test.
+            let f = fixture(
+                &format!(r#"while [ ! -e "$2/../go" ]; do sleep 0.05; done; {RESULT}"#),
+                Backend::Auto,
+            );
+            let id = f.recorded();
+            let holds = || {
+                (
+                    f.holds.0.load(Ordering::SeqCst),
+                    f.holds.1.load(Ordering::SeqCst),
+                )
+            };
+            assert_eq!(holds(), (0, 0));
+            f.queue().enqueue_pending();
+            f.wait("held", || holds() == (1, 0));
+            f.wait("transcribing", || f.transcribing(&id));
+            assert_eq!(holds(), (1, 0));
+
+            let dir = f.store().dir_for(&id).unwrap();
+            fs::write(dir.parent().unwrap().join("go"), "").unwrap();
+            f.wait("let go", || holds() == (1, 1));
+            assert_eq!(f.status(&id), Status::Review);
         }
 
         #[cfg(unix)]

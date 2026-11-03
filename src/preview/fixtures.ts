@@ -18,6 +18,7 @@ import {
   type Progress,
   type Segment,
   type Settings,
+  type SlowReason,
   type Status,
   type SummaryRoute,
   type Wait,
@@ -35,6 +36,8 @@ export const SCENARIOS = {
   summaryDownloading: "요약 모델 받는 중",
   summaryMissing: "요약 모델 없음",
   summaryReady: "이 PC 요약",
+  // Plan 5.1-12: a meeting for each slow reason (Home's row names only saver).
+  slow: "느린 처리",
 } as const;
 export type Scenario = keyof typeof SCENARIOS;
 
@@ -465,6 +468,28 @@ export function reset(scenario: Scenario) {
     }
   }
 
+  if (scenario === "slow") {
+    const reasons: [SlowReason, string][] = [
+      ["saver", "gpu"],
+      ["cpu", "cpu"],
+      ["cpu_nogpu", "cpu"],
+      ["slow", "cpu"],
+    ];
+    meetings = reasons.map(([, backend], i) =>
+      stored("transcribing", at(0, 14 - i, 0), { duration_ms: 64 * 60_000, backend, chunks_done: 2 }),
+    );
+    line = reasons.map(([slow], i) =>
+      progressOf(meetings[i].meta.id, {
+        status: "transcribing",
+        chunk: 2,
+        chunks: 5,
+        percent: 42,
+        eta_secs: 1_800,
+        slow,
+      }),
+    );
+  }
+
   timers.push(setInterval(tick, 700), setInterval(levels, 40));
 }
 
@@ -493,7 +518,7 @@ function advance(p: Progress) {
     p.chunk = Math.min(p.chunks, Math.floor(p.percent / (100 / p.chunks)));
     p.eta_secs = p.percent > 3 ? (100 - p.percent) * 4 : null;
     m.meta.chunks_done = p.chunk;
-    m.meta.backend = "gpu";
+    m.meta.backend ??= "gpu";
     if (p.percent === 100) {
       m.transcript = TRANSCRIPT;
       const to = route(m.meta);

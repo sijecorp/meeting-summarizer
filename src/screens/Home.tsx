@@ -127,6 +127,8 @@ function stateOf(m: MeetingItem, p: Progress | undefined, name: string): State {
       // "전사 42% · 약 3분 남음": the percent alone would not say what it counts.
       lead: p?.status === "transcribing" && p.chunks > 0 ? "전사" : undefined,
       shimmer: summarizing,
+      // Plan 5.1-12: the one reason a row says, since plugging in helps.
+      note: p?.slow === "saver" ? "에너지 절약 모드 · 전원을 연결하면 빨라질 수 있습니다" : undefined,
       bar: p && line?.bar && (
         <ProgressBar
           value={p.percent}

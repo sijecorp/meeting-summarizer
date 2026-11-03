@@ -1049,6 +1049,47 @@ test("a running meeting shows its step, chunk, percent and time left", async () 
   expect(screen.getByRole("progressbar", { name: "전사 진행률" }).getAttribute("aria-valuenow")).toBe("42");
 });
 
+// Plan 5.1-12: one reason under the memo, with its icon; a CPU reason takes the device off the memo.
+test("a slow meeting says why under its memo", async () => {
+  const transcribing = (slow: Progress["slow"]) =>
+    progress({ status: "transcribing", chunk: 1, chunks: 5, percent: 42, eta_secs: 3_900, slow });
+  mock({ meta: meta({ status: "transcribing", title: "", backend: "cpu" }), summary: "" });
+  const { container, rerender } = render(<Meeting id={id} {...props} progress={transcribing(null)} />);
+  expect(await screen.findByText("구간 2/5 · 약 1시간 5분 남음 · 처리 장치 CPU")).toBeTruthy();
+
+  const cases = [
+    ["saver", "에너지 절약 모드라 처리가 느릴 수 있습니다. 전원을 연결하면 빨라질 수 있습니다", "battery-low", true],
+    ["cpu", "GPU를 쓰지 못해 CPU로 처리하고 있어 느립니다. 그래픽 드라이버를 업데이트하면 나아질 수 있습니다", "cpu", false],
+    ["cpu_nogpu", "이 PC에는 쓸 수 있는 GPU가 없어 CPU로 처리합니다", "cpu", false],
+    ["slow", "이 PC에서는 전사가 회의 길이보다 오래 걸립니다", "cpu", true],
+  ] as const;
+  for (const [slow, copy, icon, device] of cases) {
+    rerender(<Meeting id={id} {...props} progress={transcribing(slow)} />);
+    const line = await screen.findByText(copy);
+    expect(line.querySelector(`svg.lucide-${icon}`)).toBeTruthy();
+    // Not a live region: it changes with the pace.
+    expect(line.closest("[role=status], [aria-live]")).toBeNull();
+    const memo = device ? "구간 2/5 · 약 1시간 5분 남음 · 처리 장치 CPU" : "구간 2/5 · 약 1시간 5분 남음";
+    expect(screen.getByText(memo)).toBeTruthy();
+  }
+  expect(container.querySelectorAll("svg.lucide-battery-low, svg.lucide-cpu")).toHaveLength(1);
+});
+
+// Plan 5.1-12: only saver goes on into the summary.
+test("a summary drops the transcription's slow reasons but not saver", async () => {
+  const cpu = "GPU를 쓰지 못해 CPU로 처리하고 있어 느립니다. 그래픽 드라이버를 업데이트하면 나아질 수 있습니다";
+  const saver = "에너지 절약 모드라 처리가 느릴 수 있습니다. 전원을 연결하면 빨라질 수 있습니다";
+  mock({ meta: meta({ status: "summarizing", title: "", backend: "cpu" }), summary: "" });
+  const { rerender } = render(<Meeting id={id} {...props} progress={progress({ slow: "cpu" })} />);
+
+  expect(await screen.findByText("처리 장치 CPU")).toBeTruthy();
+  expect(screen.queryByText(cpu)).toBeNull();
+  rerender(<Meeting id={id} {...props} progress={progress({ slow: "slow" })} />);
+  expect(screen.queryByText("이 PC에서는 전사가 회의 길이보다 오래 걸립니다")).toBeNull();
+  rerender(<Meeting id={id} {...props} progress={progress({ slow: "saver" })} />);
+  expect(await screen.findByText(saver)).toBeTruthy();
+});
+
 test("다시 시도 puts a failed meeting back in line", async () => {
   const error = "메모리가 부족해 전사가 중단되었습니다";
   const failed = meta({ status: "transcribe_failed", error });

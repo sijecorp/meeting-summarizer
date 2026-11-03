@@ -164,6 +164,22 @@ test("a summarizing row shows 요약 중; a failed summary shows its error, retr
   expect(screen.queryByRole("button", { name: /^다시 시도/ })).toBeNull();
 });
 
+// Plan 5.1-12: a row names only saver, the reason plugging in fixes.
+test("a running row notes saver and no other slow reason", () => {
+  mock();
+  home(
+    [meeting("a", "transcribing"), meeting("b", "transcribing"), meeting("c", "summarizing")],
+    [
+      progress("a", { chunk: 1, chunks: 3, percent: 42, slow: "saver" }),
+      progress("b", { chunk: 1, chunks: 3, percent: 42, slow: "cpu" }),
+      progress("c", { status: "summarizing", slow: "saver" }),
+    ],
+  );
+
+  expect(screen.getAllByText("에너지 절약 모드 · 전원을 연결하면 빨라질 수 있습니다")).toHaveLength(2);
+  expect(screen.queryByText(/GPU/)).toBeNull();
+});
+
 // Plan 5.3: the built-in engine loads first (up to 120 s); the row counts it instead of 요약 중.
 test("a summary on this PC says while its engine starts", () => {
   mock();

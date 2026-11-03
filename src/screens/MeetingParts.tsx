@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Check, ChevronRight, CircleAlert, Copy, Lock, Send, X } from "lucide-react";
+import { BatteryLow, Check, ChevronRight, CircleAlert, Copy, Cpu, Lock, Send, X } from "lucide-react";
 import { AnimatePresence, motion, useTransform, type Variants } from "motion/react";
 import {
   Bars,
@@ -16,7 +16,15 @@ import {
 } from "@/components/common";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { SLACK_MAX, type Channel, type Meta, type Progress, type Segment, type Status } from "@/lib/ipc";
+import {
+  SLACK_MAX,
+  type Channel,
+  type Meta,
+  type Progress,
+  type Segment,
+  type SlowReason,
+  type Status,
+} from "@/lib/ipc";
 import { dur, ease, exitDur, revealVariants, sectionVariants, spring } from "@/lib/motion";
 import { cn } from "@/lib/utils";
 
@@ -286,6 +294,13 @@ export function DocView({
 }
 
 const STEPS = ["녹음", "전사", "요약", "검토"];
+/** Plan 5.1-12: why it is slow, and what may help. */
+const SLOW: Record<SlowReason, string> = {
+  saver: "에너지 절약 모드라 처리가 느릴 수 있습니다. 전원을 연결하면 빨라질 수 있습니다",
+  cpu: "GPU를 쓰지 못해 CPU로 처리하고 있어 느립니다. 그래픽 드라이버를 업데이트하면 나아질 수 있습니다",
+  cpu_nogpu: "이 PC에는 쓸 수 있는 GPU가 없어 CPU로 처리합니다",
+  slow: "이 PC에서는 전사가 회의 길이보다 오래 걸립니다",
+};
 // Summarizing is next or under way. A `paused` meeting with a connection stopped while summarizing.
 const SUMMARY_STEP: Status[] = ["transcribed", "summarizing", "summarize_failed"];
 
@@ -309,12 +324,15 @@ export function Steps({ meta, progress: p, failed }: { meta: Meta; progress?: Pr
   const transcribing = now === "running" && at === 1;
   const counted = transcribing && p?.status === "transcribing" && p.chunks > 0;
   const line = now === "running" && p ? progressText(p) : null;
+  // Plan 5.1-12: only saver goes on into the summary.
+  const slow = now === "running" && p?.slow && (!summary || p.slow === "saver") ? p.slow : null;
   const note = [
     now === "waiting" && statusLabel(meta, p),
     counted && `구간 ${Math.min(p.chunk + 1, p.chunks)}/${p.chunks}`,
     counted && p.eta_secs != null && remaining(p.eta_secs),
     transcribing && p?.status === "transcribing" && !counted && "구간 나누는 중",
-    meta.backend && `처리 장치 ${meta.backend.toUpperCase()}`,
+    // The reason says the CPU already.
+    slow !== "cpu" && slow !== "cpu_nogpu" && meta.backend && `처리 장치 ${meta.backend.toUpperCase()}`,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -349,6 +367,25 @@ export function Steps({ meta, progress: p, failed }: { meta: Meta; progress?: Pr
         ))}
       </ol>
       {note && <p className="text-caption text-ink-2 tabular-nums">{note}</p>}
+      <AnimatePresence initial={false} mode="wait">
+        {slow && (
+          <motion.p
+            key={slow}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: dur.small }}
+            className="flex items-start gap-1.5 text-caption text-ink-2"
+          >
+            {slow === "saver" ? (
+              <BatteryLow aria-hidden className="mt-px size-3.5 shrink-0" />
+            ) : (
+              <Cpu aria-hidden className="mt-px size-3.5 shrink-0" />
+            )}
+            {SLOW[slow]}
+          </motion.p>
+        )}
+      </AnimatePresence>
       {p && line?.bar && (
         <span
           role="progressbar"
