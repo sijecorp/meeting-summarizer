@@ -918,6 +918,29 @@ test("REC-12: the dock shows the file being imported and how far, then lets go",
   await waitFor(() => expect(screen.queryByText("녹음 파일 가져오기")).toBeNull());
 });
 
+// Plan 5.6-25: a language list that could not be read says so and is read again on 다시 시도, which
+// turns back into 가져와서 전사.
+test("an import whose language list cannot be read says why and offers 다시 시도", async () => {
+  let fails = true;
+  mock((cmd) => {
+    if (cmd === "transcribe_languages" && fails) throw "연결이 끊겼습니다";
+    if (cmd === "list_meetings") return [meeting("지난 회의", "sent")];
+    if (cmd === "plugin:dialog|open") return "/a/월요일.wav";
+  });
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "녹음 파일 가져오기" }));
+  const dialog = await importDialog();
+  expect(await dialog.findByText("언어 목록을 읽지 못했습니다: 연결이 끊겼습니다")).toBeTruthy();
+  expect(dialog.queryByRole("button", { name: "가져와서 전사" })).toBeNull();
+
+  fails = false;
+  fireEvent.click(dialog.getByRole("button", { name: "다시 시도" }));
+  expect(await dialog.findByRole("checkbox", { name: /한국어/ })).toBeTruthy();
+  expect(dialog.queryByText(/읽지 못했습니다/)).toBeNull();
+  expect(dialog.getByRole("button", { name: "가져와서 전사" }).getAttribute("aria-disabled")).toBeNull();
+});
+
 // Plan 5.6-25 (d10a): before a picked or dropped file is processed, its languages are asked, the
 // settings' ones checked. Cancelled, nothing is imported.
 test("an imported file asks its languages first, the settings' picked; 취소 imports nothing", async () => {
@@ -958,7 +981,7 @@ test("an imported file asks its languages first, the settings' picked; 취소 im
 });
 
 // Plan 5.3-14: a meeting whose pause still stops is counted until its run ends; a paused one is
-// not; and when the last one stops, the dock goes without saying it finished.
+// not; and when the last one stops because it was paused, the dock goes without saying it finished.
 test("the dock counts a stopping meeting, never a paused one, and goes quietly", async () => {
   let list = [{ ...meeting("a", "transcribing"), held: true }, { ...meeting("b", "paused"), held: true }];
   mock((cmd) => {
@@ -975,7 +998,7 @@ test("the dock counts a stopping meeting, never a paused one, and goes quietly",
   expect(screen.queryByText("처리를 마쳤습니다")).toBeNull();
 });
 
-test("the dock says it finished when no paused meeting is left", async () => {
+test("the dock says it finished when processing ends on its own", async () => {
   let list = [meeting("a", "transcribing")];
   mock((cmd) => {
     if (cmd === "list_meetings") return list;
@@ -986,6 +1009,22 @@ test("the dock says it finished when no paused meeting is left", async () => {
   expect(await screen.findByRole("button", { name: "처리 중 1 · a · 전사 42%" })).toBeTruthy();
 
   list = [meeting("a", "review")];
+  await act(() => emit("meeting://progress", progress("a", { status: "review", eta_secs: null })));
+  expect(await screen.findByText("처리를 마쳤습니다")).toBeTruthy();
+});
+
+// A meeting paused long before does not silence another one finishing (plan 5.3-14).
+test("the dock says it finished when a different meeting is the paused one", async () => {
+  let list = [meeting("a", "transcribing"), { ...meeting("b", "paused"), held: true }];
+  mock((cmd) => {
+    if (cmd === "list_meetings") return list;
+    if (cmd === "queue_state") return [progress("a")];
+  });
+
+  render(<App />);
+  expect(await screen.findByRole("button", { name: "처리 중 1 · a · 전사 42%" })).toBeTruthy();
+
+  list = [meeting("a", "review"), list[1]];
   await act(() => emit("meeting://progress", progress("a", { status: "review", eta_secs: null })));
   expect(await screen.findByText("처리를 마쳤습니다")).toBeTruthy();
 });

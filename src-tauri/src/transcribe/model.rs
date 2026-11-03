@@ -1565,7 +1565,7 @@ mod tests {
             })
             .collect();
         let [whisper, vad] = needed("large-v3-turbo-q8_0").unwrap();
-        let table: Vec<Vec<String>> = [whisper, vad, &SUMMARY]
+        let table: Vec<Vec<String>> = [whisper, vad, lid(), &SUMMARY]
             .iter()
             .map(|f| vec![f.url_path(), f.size.to_string(), f.sha256.to_string()])
             .collect();

@@ -21,7 +21,7 @@ use crate::transcribe::lang;
 use crate::transcribe::model::{self, Check, Models};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::future::Future;
@@ -308,6 +308,9 @@ struct Inner {
     sched: Sched,
     jobs: HashMap<String, Job>,
     progress: HashMap<String, Progress>,
+    /// Plan 5.6-14: meetings lined up with two or more languages, so `pump` reads no `meta.json`
+    /// under this lock to tell. Kept up by `line_up` and `set_language`.
+    mixed: HashSet<String>,
     /// The app is exiting: nothing starts any more.
     closed: bool,
 }
@@ -407,13 +410,18 @@ fn single(languages: &[String]) -> bool {
 
 /// Only the summary is left (architecture 8.4): from its status, and for `paused` from
 /// `transcript.json`. Not from the file alone: a `transcribe_failed` meeting whose
-/// `transcript.json` was written before its status could be transcribes again.
+/// `transcript.json` was written before its status could be transcribes again. Nor a `paused` one
+/// with no chunk done: E3 starts over from 0, and one it could not clear is a waiting `recorded`
+/// meeting paused (plan 5.6-6).
 fn summary_only(store: &Store, meta: &Meta) -> bool {
     match meta.status {
         Status::Transcribed | Status::Summarizing | Status::SummarizeFailed => true,
-        Status::Paused => store
-            .dir_for(&meta.id)
-            .is_ok_and(|dir| dir.join("transcript.json").exists()),
+        Status::Paused => {
+            meta.chunks_done > 0
+                && store
+                    .dir_for(&meta.id)
+                    .is_ok_and(|dir| dir.join("transcript.json").exists())
+        }
         _ => false,
     }
 }
@@ -950,7 +958,7 @@ impl<R: Runtime> Queue<R> {
         let store = self.app.state::<Store>();
         let added = store.with_lock(id, |m| {
             if !m.held {
-                self.line_up(&mut lock(&self.inner), id, status);
+                self.line_up(&mut lock(&self.inner), id, status, &m.languages);
             }
         });
         if let Err(e) = added {
@@ -958,7 +966,12 @@ impl<R: Runtime> Queue<R> {
         }
     }
 
-    fn line_up(&self, inner: &mut Inner, id: &str, status: Status) {
+    fn line_up(&self, inner: &mut Inner, id: &str, status: Status, languages: &[String]) {
+        if single(languages) {
+            inner.mixed.remove(id);
+        } else {
+            inner.mixed.insert(id.to_string());
+        }
         if inner.closed || !inner.sched.enqueue(id) {
             return;
         }
@@ -1130,7 +1143,7 @@ impl<R: Runtime> Queue<R> {
             }
             m.held = false;
             if !inner.sched.running.iter().any(|r| r == id) {
-                self.line_up(&mut inner, id, m.status);
+                self.line_up(&mut inner, id, m.status, &m.languages);
             }
             Ok(())
         })?;
@@ -1151,12 +1164,17 @@ impl<R: Runtime> Queue<R> {
         let languages = lang::parse(languages)?;
         let dir = store.dir_for(id)?;
         store.update(id, |m| {
-            let inner = lock(&self.inner);
+            let mut inner = lock(&self.inner);
             if inner.sched.running.iter().any(|r| r == id) {
                 return Err("처리 중에는 바꿀 수 없습니다".into());
             }
             if m.chunks_done > 0 || dir.join("transcript.json").exists() {
                 return Err(TRANSCRIBED.into());
+            }
+            if languages.len() > 1 {
+                inner.mixed.insert(id.to_string());
+            } else {
+                inner.mixed.remove(id);
             }
             m.languages = languages;
             Ok(())
@@ -1202,7 +1220,7 @@ impl<R: Runtime> Queue<R> {
             },
             |m| {
                 store.clear_results(id)?;
-                self.line_up(&mut lock(&self.inner), id, m.status);
+                self.line_up(&mut lock(&self.inner), id, m.status, &m.languages);
                 Ok(m.clone())
             },
         )?;
@@ -1227,17 +1245,16 @@ impl<R: Runtime> Queue<R> {
         // Plan 5.6-14: a meeting of two or more languages also waits for the detection model.
         let lid = models.installed(model::lid());
         let slots = slots(self.builtin_ready());
-        let can_start = |id: &str| {
-            transcribable && lid
-                || store.get(id).is_ok_and(|m| {
-                    summary_only(&store, &m) || transcribable && single(&m.languages)
-                })
-        };
         let mut inner = lock(&self.inner);
         if inner.closed {
             return;
         }
-        for id in inner.sched.start_next(slots, can_start) {
+        let Inner { sched, mixed, .. } = &mut *inner;
+        let started = sched.start_next(slots, |id| {
+            transcribable && (lid || !mixed.contains(id))
+                || store.get(id).is_ok_and(|m| summary_only(&store, &m))
+        });
+        for id in started {
             let app = self.app.clone();
             let run_id = id.clone();
             let spawned = thread::Builder::new()
@@ -1399,8 +1416,19 @@ impl<R: Runtime> Queue<R> {
         let path = dir.join("chunks.json");
         if let Some(plan) = fs::read(&path)
             .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
+            .and_then(|b| serde_json::from_slice::<Plan>(&b).ok())
         {
+            // A plan from 1.0.3 has no `chunks_total`: a pause before the next chunk ends would
+            // read as one made before the plan (plan 5.3-12).
+            let chunks = plan.chunks.len() as u32;
+            if store.get(id).is_ok_and(|m| m.chunks_total == 0) {
+                store
+                    .update(id, |m| {
+                        m.chunks_total = chunks;
+                        Ok(())
+                    })
+                    .map_err(End::Failed)?;
+            }
             return Ok(plan);
         }
         let args = [
@@ -1535,7 +1563,7 @@ impl<R: Runtime> Queue<R> {
         let lid = models
             .installed(model::lid())
             .then(|| models.dir.join(model::lid().file));
-        let (mut languages, mut waits) = (lang::default_list(), false);
+        let (mut languages, mut waits, mut cleared) = (lang::default_list(), false, Ok(()));
         let started = store.update(id, |m| {
             // `transcribing` itself too: the queue runs a meeting once at a time, so that is a
             // stop whose `paused` could not be written. Recovery would pause it at the next start.
@@ -1562,9 +1590,10 @@ impl<R: Runtime> Queue<R> {
                 waits = true;
                 return Ok(());
             }
-            // Plan 5.6-7: nothing a run in another language left is resumed or shown.
-            if m.status == Status::Recorded {
-                store.clear_results(id)?;
+            // Plan 5.6-7: nothing a run in another language left is resumed or shown. With no
+            // chunk done either: a clear that failed left it `transcribe_failed` at 0.
+            if m.status == Status::Recorded || m.chunks_done == 0 {
+                cleared = store.clear_results(id);
             }
             m.status = Status::Transcribing;
             m.error = None;
@@ -1575,6 +1604,10 @@ impl<R: Runtime> Queue<R> {
         }
         if waits {
             return End::Requeue;
+        }
+        // Failed with its cause, so the meeting offers "다시 시도" and that clears again.
+        if let Err(e) = cleared {
+            return End::Failed(e);
         }
         let lid = lid.filter(|_| languages.len() > 1);
         // Before any worker: a plain failure, not a crash that counts toward `gpu_failed`.
@@ -4043,6 +4076,24 @@ mod tests {
             assert_eq!(lock(&f.queue().inner).sched.position(&waiting), Some(1));
         }
 
+        /// Plan 5.6-6: a `paused` meeting with its `transcript.json` is summary only once a chunk
+        /// was done. A `transcript.json` E3 left at `chunks_done` 0 is never summarized.
+        #[test]
+        fn a_paused_meeting_is_summary_only_once_a_chunk_was_done() {
+            let f = fixture(RESULT, Backend::Cpu);
+            let (id, store) = (f.transcribed(false, None), f.store());
+            let paused = |done| {
+                store
+                    .update(&id, |m| {
+                        (m.status, m.chunks_done) = (Status::Paused, done);
+                        Ok(())
+                    })
+                    .unwrap()
+            };
+            assert!(!summary_only(&store, &paused(0)));
+            assert!(summary_only(&store, &paused(1)));
+        }
+
         /// ENG1: with the summary model in, two "로컬로 요약" meetings beside a cloud default run one
         /// after the other on this PC: no deadlock, never two at once, nothing to the cloud.
         #[test]
@@ -4234,6 +4285,22 @@ mod tests {
                 (Some("내 Ollama"), None)
             );
             assert_eq!(stub.requests.lock().unwrap().len(), 1);
+        }
+
+        /// Plan 5.3-12: a plan saved by 1.0.3 has no `chunks_total`. It is written as the run
+        /// starts, so a pause before the next chunk ends still reads "구간 1/2에서 멈춤".
+        #[cfg(unix)]
+        #[test]
+        fn a_plan_saved_without_its_total_gets_it_when_the_run_starts() {
+            let f = fixture(&format!("{GATED}{RESULT}"), Backend::Cpu);
+            let id = f.recorded();
+            let dir = f.store().dir_for(&id).unwrap();
+            fs::write(dir.join("chunks.json"), PLAN).unwrap();
+            f.queue().enqueue_pending();
+            f.wait("transcribing", || f.transcribing(&id));
+            assert_eq!(f.store().get(&id).unwrap().chunks_total, 2);
+            fs::write(dir.parent().unwrap().join("go"), "").unwrap();
+            f.wait("done", || f.queue().snapshot().is_empty());
         }
 
         /// Plan 5.3-17: a paused run stays `paused` and held through a recording and a restart,
@@ -4559,6 +4626,70 @@ mod tests {
                 header.contains("--lang ko,vi ") && header.contains(&lid),
                 "{header}"
             );
+        }
+
+        /// Plan 5.6-14: a meeting given a second language while in line waits for the detection
+        /// model too: it never starts, not even to be put back.
+        #[cfg(unix)]
+        #[test]
+        fn a_meeting_given_a_second_language_in_line_waits_for_the_detection_model() {
+            let f = fixture(&format!("{GATED}{RESULT}"), Backend::Cpu);
+            let models = f.app.state::<Models>().dir.clone();
+            let medium = model::needed("medium-q5_0").unwrap()[0];
+            fs::File::create(models.join(medium.file))
+                .unwrap()
+                .set_len(medium.size)
+                .unwrap();
+            fs::remove_file(models.join(model::lid().file)).unwrap();
+            let settings = Settings {
+                model: "medium-q5_0".into(),
+                backend: Backend::Cpu,
+                ..Settings::default()
+            };
+            f.app.state::<SettingsStore>().save(settings).unwrap();
+            // Both slots taken, so the next one waits in line.
+            let first = [f.recorded(), f.recorded()];
+            f.queue().enqueue_pending();
+            f.wait("first running", || {
+                first.iter().all(|id| f.transcribing(id))
+            });
+            let next = f.recorded();
+            f.queue().enqueue_pending();
+            f.queue()
+                .set_language(&f.store(), &next, &codes(&["ko", "vi"]))
+                .unwrap();
+            let dir = f.store().dir_for(&next).unwrap();
+            fs::write(dir.parent().unwrap().join("go"), "").unwrap();
+            f.wait("first done", || {
+                first.iter().all(|id| f.status(id) == Status::Review)
+            });
+            thread::sleep(Duration::from_millis(200));
+            assert_eq!(f.status(&next), Status::Recorded);
+            let events = f.events.lock().unwrap();
+            let next: Vec<_> = events.iter().filter(|e| e["id"] == next).collect();
+            assert!(!next.is_empty() && next.iter().all(|e| e["position"] == 1));
+        }
+
+        /// Plan 5.6-7: a leftover that will not go fails the run with its cause, never silently,
+        /// and "다시 시도" clears again before it transcribes.
+        #[cfg(unix)]
+        #[test]
+        fn a_leftover_that_will_not_go_fails_the_run_and_its_retry_clears_it() {
+            let f = fixture(RESULT, Backend::Cpu);
+            let id = f.recorded();
+            let dir = f.store().dir_for(&id).unwrap();
+            // A folder by a result's name: deleting it as a file fails.
+            fs::create_dir(dir.join("summary.md")).unwrap();
+            f.queue().enqueue_pending();
+            f.wait("failed", || f.status(&id) == Status::TranscribeFailed);
+            let error = f.store().get(&id).unwrap().error.unwrap();
+            assert!(error.starts_with("summary.md"), "{error}");
+
+            fs::remove_dir(dir.join("summary.md")).unwrap();
+            fs::write(dir.join("summary.md"), "옛 요약").unwrap();
+            f.queue().resume(&f.store(), &id).unwrap();
+            f.wait("done", || f.status(&id) == Status::Review);
+            assert!(!dir.join("summary.md").exists());
         }
 
         /// Plan 5.6-7: a `recorded` meeting starts without what another run left: the partial

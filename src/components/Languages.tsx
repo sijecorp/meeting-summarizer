@@ -25,17 +25,24 @@ import {
 // Plan 5.6-20..25 and design-system 8.7: one check list for the recording screen, the settings,
 // the meeting's dialog and the import dialog. The languages come from Rust's table, in its order.
 
-/** The language table, null until read: the pickers wait for it. */
+/** The language table, null until read: the pickers wait for it. `failure`: why it could not be
+ * read, for `retry`. */
 export function useLanguages() {
   const [langs, setLangs] = useState<Lang[] | null>(null);
+  const [failure, setFailure] = useState("");
+  const [tries, setTries] = useState(0);
   useEffect(() => {
     let live = true;
-    transcribeLanguages().then((l) => live && setLangs(l), () => {});
+    setFailure("");
+    transcribeLanguages().then(
+      (l) => live && setLangs(l),
+      (e) => live && setFailure(`언어 목록을 읽지 못했습니다: ${e}`),
+    );
     return () => {
       live = false;
     };
-  }, []);
-  return langs;
+  }, [tries]);
+  return { langs, failure, retry: () => setTries((n) => n + 1) };
 }
 
 /** The names of `codes` in table order; none until the table is read. */
@@ -169,7 +176,7 @@ export function LanguagePicker({
   id?: string;
   "aria-describedby"?: string;
 }) {
-  const langs = useLanguages();
+  const { langs } = useLanguages();
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(value);
   const [busy, setBusy] = useState(false);
@@ -245,7 +252,7 @@ export function ImportLanguages({
 }
 
 function ImportChoice({ initial, onImport }: { initial: string[]; onImport: (languages: string[]) => void }) {
-  const langs = useLanguages();
+  const { langs, failure, retry } = useLanguages();
   const [draft, setDraft] = useState(initial);
   return (
     <>
@@ -253,10 +260,16 @@ function ImportChoice({ initial, onImport }: { initial: string[]; onImport: (lan
         <AlertDialogTitle>녹음 파일 가져오기</AlertDialogTitle>
       </AlertDialogHeader>
       {langs && <LanguageChecks langs={langs} value={draft} onChange={setDraft} />}
+      {failure && <p className="text-caption text-danger-line">{failure}</p>}
       <AlertDialogFooter>
         <AlertDialogCancel>취소</AlertDialogCancel>
-        <Button disabled={!langs} onClick={() => onImport(draft)}>
-          가져와서 전사
+        {/* One button: 다시 시도 turns back into 가져와서 전사 and keeps the focus (no `disabled`). */}
+        <Button
+          aria-disabled={(!langs && !failure) || undefined}
+          className="aria-disabled:opacity-50"
+          onClick={() => (failure ? retry() : langs && onImport(draft))}
+        >
+          {failure ? "다시 시도" : "가져와서 전사"}
         </Button>
       </AlertDialogFooter>
     </>

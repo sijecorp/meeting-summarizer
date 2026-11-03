@@ -703,6 +703,12 @@ fn transcribe_chunk(args: &[OsString]) -> Result<(), Fail> {
         .map(|s| (cs_to_samples(s.start), cs_to_samples(s.end)))
         .collect();
     let speech = Speech::new(&audio, &spans);
+    // One language never judges the audio (`plan_runs`): not kept through the model load.
+    let audio = if options.langs.len() > 1 {
+        audio
+    } else {
+        Vec::new()
+    };
     let mut report = progress();
     report(0);
     if speech.samples.is_empty() {
@@ -781,8 +787,19 @@ fn transcribe_chunk(args: &[OsString]) -> Result<(), Fail> {
         .iter()
         .filter_map(|l| whisper_rs::get_lang_id(l))
         .collect();
+    // A GPU that will not take it falls back to the CPU, as the Whisper model does.
     let mut lid = lid_model
-        .map(|path| load(path, used).and_then(|ctx| ctx.create_state()))
+        .map(|path| {
+            let open = |gpu| load(path, gpu).and_then(|ctx| ctx.create_state());
+            open(used).or_else(|e| match used {
+                Some(gpu) => {
+                    eprintln!("GPU {gpu}번으로 언어 판별 모델을 불러오지 못했습니다: {e}");
+                    eprintln!("CPU로 바꿉니다");
+                    open(None)
+                }
+                None => Err(e),
+            })
+        })
         .transpose()
         .map_err(|e| Fail::Model(format!("언어 판별 모델을 불러올 수 없습니다: {e}")))?;
     let mut margins = Vec::new();

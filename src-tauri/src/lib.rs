@@ -478,6 +478,9 @@ pub fn run() {
                 if let Some(store) = app.try_state::<store::Store>() {
                     store.pause_busy();
                 }
+                if let Some(exports) = app.try_state::<audio::mix::Exports>() {
+                    exports.cancel_all();
+                }
             }
             #[cfg(target_os = "macos")]
             RunEvent::Reopen { .. } => show_main_window(app),

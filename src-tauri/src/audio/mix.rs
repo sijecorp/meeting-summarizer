@@ -222,6 +222,18 @@ impl Exports {
             running = self.ended.wait(running).unwrap();
         }
     }
+
+    /// The app quits: stops every export and returns once they have ended, so none leaves its
+    /// `.part` in the recorder's folder.
+    pub fn cancel_all(&self) {
+        let mut running = self.running.lock().unwrap();
+        for stop in running.values() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        while !running.is_empty() {
+            running = self.ended.wait(running).unwrap();
+        }
+    }
 }
 
 /// Plan 5.4-3: refused up front with the numbers, rather than a full disk halfway.
@@ -498,6 +510,35 @@ mod tests {
         let deleted = delete.lock().unwrap().take().unwrap().join().unwrap();
         assert_eq!(deleted, Ok(()));
         assert!(!store.dir_for(&id).unwrap().exists());
+        assert_eq!(
+            fs::read_dir(tmp.path()).unwrap().count(),
+            1,
+            "only meetings/ is left"
+        );
+    }
+
+    /// Quitting stops a running export between two windows and waits for it: no `.part` stays
+    /// in the recorder's folder.
+    #[test]
+    fn quitting_during_an_export_stops_it_and_leaves_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path().join("meetings")).unwrap();
+        let exports = Arc::new(Exports::default());
+        let id = meeting(&store, Status::Review, &[1; 1_000], None);
+        let to = tmp.path().join("out.wav");
+        let quit = Mutex::new(None);
+        let read = |dir: &Path, start, len| {
+            let e = exports.clone();
+            *quit.lock().unwrap() = Some(std::thread::spawn(move || e.cancel_all()));
+            while !exports.running.lock().unwrap()[&id].load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            mixed(dir, start, len)
+        };
+
+        assert!(exports.export_with(&store, &id, &to, read).is_err());
+        quit.lock().unwrap().take().unwrap().join().unwrap();
+        assert!(exports.running.lock().unwrap().is_empty());
         assert_eq!(
             fs::read_dir(tmp.path()).unwrap().count(),
             1,

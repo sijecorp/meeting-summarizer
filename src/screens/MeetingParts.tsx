@@ -367,7 +367,10 @@ export function Steps({
   // the last event is still transcribing, it is still at 전사.
   const running = p?.status === "transcribing" || p?.status === "summarizing" ? p.status : null;
   const total = meta.chunks_total ?? 0;
-  // Paused after its last chunk, before its summary started: its transcript is done.
+  // A plan saved by 1.0.3 has no total, but chunks done say there is one.
+  const planned = total > 0 || meta.chunks_done > 0;
+  // Paused after its last chunk, before its summary started: its transcript is done. Only a known
+  // total says so: one stopped midway reads the same without it.
   const transcribed = total > 0 && meta.chunks_done >= total;
   const summary = running
     ? running === "summarizing"
@@ -381,11 +384,13 @@ export function Steps({
   // Plan 5.6-27: a mixed meeting waits in line for the detection model.
   const lid = useLid(now === "waiting" && meta.languages.length > 1);
   const chunking = transcribing && p?.status === "transcribing";
-  // Plan 5.3-12: where it stopped, from `meta.json`, so a restart draws it too.
+  // Plan 5.3-12: where it stopped, from `meta.json`, so a restart draws it too. "3/7", or "3" while
+  // a plan from 1.0.3 has no total yet.
+  const chunk = total > 0 ? `${Math.min(meta.chunks_done + 1, total)}/${total}` : meta.chunks_done + 1;
   const stoppedIn = summary
     ? "요약 중 멈춤 · 끝난 부분부터 이어서 합니다"
-    : total > 0
-      ? `구간 ${Math.min(meta.chunks_done + 1, total)}/${total}에서 멈춤 · 이어서 처리하면 이 구간부터 다시 합니다`
+    : planned
+      ? `구간 ${chunk}에서 멈춤 · 이어서 처리하면 이 구간부터 다시 합니다`
       : "구간을 나누기 전에 멈춤 · 이어서 처리하면 처음부터 합니다";
   const note = held
     ? stoppedIn
@@ -733,13 +738,14 @@ export function SendBar({
     button.current?.focus();
   }, [inFlight]);
   // Where it went shows for a moment, then the channels come back, none picked; the focus goes to
-  // them when it was in the bar.
+  // them when it was in the bar, or to the words saying none is left after the last one.
   const bar = useRef<HTMLDivElement>(null);
   const picker = useRef<HTMLButtonElement>(null);
+  const none = useRef<HTMLSpanElement>(null);
   const back = useRef(false);
   useEffect(() => {
     if (!sentTo) {
-      if (back.current) picker.current?.focus();
+      if (back.current) (picker.current ?? none.current)?.focus();
       back.current = false;
       return;
     }
@@ -826,7 +832,9 @@ export function SendBar({
               </>
             )}
             {blocked && signedIn && !listFailed && (
-              <span className="px-3 text-label text-ink-2">보낼 수 있는 다른 채널이 없습니다</span>
+              <span ref={none} tabIndex={-1} className="px-3 text-label text-ink-2">
+                보낼 수 있는 다른 채널이 없습니다
+              </span>
             )}
             {!sentTo && !signedIn && (
               <Button variant="link" size="sm" onClick={onSetup}>
@@ -929,7 +937,7 @@ export function LanguageDialog({
   onPause: () => void;
   onChanged: (meta: Meta) => void;
 }) {
-  const langs = useLanguages();
+  const { langs } = useLanguages();
   const [draft, setDraft] = useState(meta.languages);
   // Rust found a chunk done since it opened: redrawn as E3 instead of an error.
   const [late, setLate] = useState(false);
@@ -983,10 +991,12 @@ export function LanguageDialog({
               {stopping ? PAUSE.stopping : PAUSE.pause}
             </Button>
           ) : (
+            // The same button as 일시정지 above: `aria-disabled` keeps the focus it had there.
             <Button
               variant={redo ? "destructive" : "default"}
-              disabled={busy || same(draft, meta.languages)}
-              onClick={confirm}
+              aria-disabled={busy || same(draft, meta.languages) || undefined}
+              className="aria-disabled:opacity-50"
+              onClick={() => !busy && !same(draft, meta.languages) && confirm()}
             >
               {redo ? "지우고 다시 전사" : "바꾸기"}
             </Button>

@@ -256,7 +256,7 @@ export default function Meeting({
   const [panel, setPanel] = useState({ open: false, instant: false });
   const [segments, setSegments] = useState<Segment[] | null>(null);
   const [transcriptError, setTranscriptError] = useState("");
-  const langs = useLanguages();
+  const { langs } = useLanguages();
   const timer = useRef(0);
   const fields = useRef(false);
   const latest = useRef(0);

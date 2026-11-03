@@ -526,7 +526,7 @@ export default function App() {
             live={live}
             stopping={ending}
             queue={[...running, ...waiting]}
-            held={current.some((m) => phase(m, progress[m.id]) === "held")}
+            held={current.filter((m) => phase(m, progress[m.id]) === "held").map((m) => m.id)}
             imported={importing ? imported : null}
             progress={progress}
             hidden={screen.name === "recording"}

@@ -160,7 +160,7 @@ export default function Dock({
   live,
   stopping,
   queue,
-  held = false,
+  held = [],
   progress,
   imported,
   hidden,
@@ -174,8 +174,9 @@ export default function Dock({
   stopping: boolean;
   /** Meetings being processed first, then the ones waiting, by place in line. */
   queue: MeetingItem[];
-  /** A meeting paused by the recorder is left (plan 5.3-14): processing then ends without a word. */
-  held?: boolean;
+  /** Meetings paused by the recorder (plan 5.3-14): processing that ends because they were paused
+   * ends without a word. */
+  held?: string[];
   progress: Record<string, Progress>;
   /** A recording file being imported (REC-12): shown over processing, which it is about to join. */
   imported?: ImportProgress | null;
@@ -190,11 +191,18 @@ export default function Dock({
   const mode: Mode = live ? "recording" : imported ? "importing" : queue.length ? "processing" : "idle";
   const [said, setSaid] = useState("");
   const last = useRef(mode);
+  const ids = queue.map((m) => m.id);
+  const left = useRef(ids);
   useEffect(() => {
-    const quiet = held && last.current === "processing" && mode === "idle";
+    // Quiet only when every meeting that just left processing left because it was paused.
+    const quiet = last.current === "processing" && mode === "idle" && left.current.every((id) => held.includes(id));
     if (last.current !== mode) setSaid(quiet ? "" : announcement(last.current, mode));
     last.current = mode;
   }, [mode]);
+  // After the one above, so it reads the meetings of the render before.
+  useEffect(() => {
+    left.current = ids;
+  });
 
   // Focus moves to the pill before 종료 swaps the shape, so it never falls back to the page.
   const pill = useRef<HTMLDivElement>(null);

@@ -1167,6 +1167,36 @@ test("a sent meeting's bar offers the other channels, says the summary is fixed 
   expect(screen.queryByText("#개발로 보냈습니다")).toBeNull();
 });
 
+// After the last other channel, neither the picker nor the button is left: the focus goes to the
+// words saying so, not to the page.
+test("sending to the last other channel leaves the focus on the words saying none is left", async () => {
+  const at = "2026-10-13T06:10:00Z";
+  mock({ meta: sentMeta(["#회의록", "C1"], ["#개발", "C2"]), summary: "요약" }, (cmd) => {
+    if (cmd === "send_to_slack")
+      return {
+        ...sentMeta(["#회의록", "C1"], ["#개발", "C2"]),
+        also_sent: [
+          { channel: "#개발", channel_id: "C2", at, edit_count: 2 },
+          { channel: "#경영", channel_id: "G1", at, edit_count: 2 },
+        ],
+      };
+  });
+  render(<Meeting id={id} {...props} />);
+  const picker = await screen.findByRole("combobox", { name: "보낼 채널" });
+  await waitFor(() => expect(picker.textContent).toBe("다른 채널 고르기"));
+  fireEvent.keyDown(picker, { key: "Enter" });
+  fireEvent.click(await screen.findByRole("option", { name: "#경영, 비공개 채널" }));
+
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const send = await sendButton("보내기");
+  send.focus();
+  fireEvent.click(send);
+  expect(await screen.findByRole("button", { name: "#경영으로 보냄" })).toBeTruthy();
+  await tick(SENT_SHOWN_MS);
+  const none = await screen.findByText("보낼 수 있는 다른 채널이 없습니다");
+  expect(document.activeElement).toBe(none);
+});
+
 test("a sent meeting with no other channel says so, and offers no button", async () => {
   mock({ meta: sentMeta(["#회의록", "C1"], ["#개발", "C2"], ["#경영", "G1"]), summary: "요약" });
   render(<Meeting id={id} {...props} />);
@@ -1648,6 +1678,8 @@ test("a pause that finds the meeting finished redraws it without a banner", asyn
   expect(calls.filter((c) => c.cmd === "get_meeting").length).toBeGreaterThan(1);
   expect(screen.queryByRole("list", { name: "처리 단계" })).toBeNull();
   expect(document.body.textContent).not.toContain("already_done");
+  // No error banner (role=alert) for it either.
+  expect(screen.queryByRole("alert")).toBeNull();
 });
 
 // Plan 5.3-12: the memo follows the step it stopped in, before the chunk plan too; 녹음 중에 이어서
@@ -1656,6 +1688,8 @@ test("a paused meeting's memo says where it stopped and what 이어서 처리 do
   const cases = [
     [{ chunks_done: 5, chunks_total: 5, llm_connection: "회사 클라우드" }, "요약일시정지됨", "요약 중 멈춤 · 끝난 부분부터 이어서 합니다"],
     [{ chunks_done: 0, chunks_total: 0, llm_connection: null }, "전사일시정지됨", "구간을 나누기 전에 멈춤 · 이어서 처리하면 처음부터 합니다"],
+    // A plan saved by 1.0.3: no total, yet it resumes in the chunk it stopped in.
+    [{ chunks_done: 2, chunks_total: 0, llm_connection: null }, "전사일시정지됨", "구간 3에서 멈춤 · 이어서 처리하면 이 구간부터 다시 합니다"],
   ] as const;
   for (const [patch, step, memo] of cases) {
     mock({ meta: meta({ status: "paused", title: "", held: true, ...patch }), summary: "" });
@@ -1728,11 +1762,13 @@ test("before transcription, 바꾸기 sets the languages once the list changed, 
   expect(dialog.queryByText(/지워집니다|바꿀 수 없습니다/)).toBeNull();
   const confirm = dialog.getByRole("button", { name: "바꾸기" }) as HTMLButtonElement;
   await dialog.findByRole("checkbox", { name: "베트남어" });
-  expect(confirm.disabled).toBe(true);
+  expect(disabled(confirm)).toBe(true);
+  fireEvent.click(confirm);
+  expect(calls.map((c) => c.cmd)).not.toContain("set_meeting_language");
   fireEvent.click(dialog.getByRole("checkbox", { name: "베트남어" }));
-  expect(confirm.disabled).toBe(false);
+  expect(disabled(confirm)).toBe(false);
   fireEvent.click(dialog.getByRole("checkbox", { name: "베트남어" }));
-  expect(confirm.disabled).toBe(true);
+  expect(disabled(confirm)).toBe(true);
   fireEvent.click(dialog.getByRole("checkbox", { name: "베트남어" }));
   fireEvent.click(confirm);
 
@@ -1763,7 +1799,7 @@ test("after transcription, 지우고 다시 전사 warns what goes and transcrib
   const dialog = await languageDialog();
   expect(dialog.getByText("전사본과 요약, 검토에서 고친 내용이 지워집니다")).toBeTruthy();
   const confirm = dialog.getByRole("button", { name: "지우고 다시 전사" }) as HTMLButtonElement;
-  expect(confirm.disabled).toBe(true);
+  expect(disabled(confirm)).toBe(true);
   fireEvent.click(await dialog.findByRole("checkbox", { name: "영어" }));
   fireEvent.click(confirm);
 
@@ -1835,7 +1871,9 @@ test("while it runs, the dialog only offers 일시정지, and redraws with the c
   expect(dialog.getByText("처리 중에는 바꿀 수 없습니다")).toBeTruthy();
   expect(dialog.queryByRole("checkbox")).toBeNull();
   expect(dialog.queryByRole("button", { name: /바꾸기|다시 전사/ })).toBeNull();
-  fireEvent.click(dialog.getByRole("button", { name: "일시정지" }));
+  const pause = dialog.getByRole("button", { name: "일시정지" });
+  pause.focus();
+  fireEvent.click(pause);
   await waitFor(() => expect(calls.filter((c) => c.cmd === "pause_meeting")).toEqual([{ cmd: "pause_meeting", args: { id } }]));
   expect(disabled(await dialog.findByRole("button", { name: "멈추는 중…" }))).toBe(true);
 
@@ -1844,7 +1882,12 @@ test("while it runs, the dialog only offers 일시정지, and redraws with the c
   rerender(<Meeting id={id} {...props} progress={progress({ status: "paused" })} />);
   expect(await dialog.findByText("전사본과 요약, 검토에서 고친 내용이 지워집니다")).toBeTruthy();
   expect(dialog.getAllByRole("checkbox")).toHaveLength(4);
-  expect((dialog.getByRole("button", { name: "지우고 다시 전사" }) as HTMLButtonElement).disabled).toBe(true);
+  // The same button, unpressable until the list changes, keeps the focus: a browser drops it from
+  // a `disabled` one (jsdom does not).
+  const confirm = dialog.getByRole("button", { name: "지우고 다시 전사" });
+  expect(disabled(confirm)).toBe(true);
+  expect(confirm.hasAttribute("disabled")).toBe(false);
+  expect(document.activeElement).toBe(confirm);
 });
 
 // Plan 5.6-27: the meta line names the languages unless it is Korean alone.
