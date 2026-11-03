@@ -386,6 +386,37 @@ fn tick<F: Fn(DownloadProgress) + Send + Sync + 'static>(
         .map(|thread| (stop, thread))
 }
 
+/// Plan 5.2-1: one file's `download` line in app.log, the network's part. Written when dropped, so
+/// a cancel, which drops `fetch` mid-await, still leaves it.
+struct Measured<'a> {
+    file: &'static str,
+    arrived: &'a AtomicU64,
+    began: Instant,
+    /// `arrived` when the file began.
+    before: u64,
+    /// `ok`, `err`, or `cancelled` until `fetch` says otherwise.
+    result: &'static str,
+}
+
+impl Drop for Measured<'_> {
+    fn drop(&mut self) {
+        let bytes = self.arrived.load(Ordering::SeqCst) - self.before;
+        let secs = self.began.elapsed().as_secs_f64();
+        let line = diag_line(
+            "download",
+            &[
+                ("file", self.file.into()),
+                ("bytes", bytes.to_string()),
+                ("secs", format!("{secs:.1}")),
+                ("bps", format!("{:.0}", bytes as f64 / secs.max(0.001))),
+                ("connections", "1".into()),
+                ("result", self.result.into()),
+            ],
+        );
+        log::info!("{line}");
+    }
+}
+
 /// One file into `dest`: attempts that resume each other, then the hash check. `on_progress` gets
 /// the bytes in the `.part`; `arrived` counts each one that comes.
 async fn fetch(
@@ -399,7 +430,13 @@ async fn fetch(
 ) -> Result<(), String> {
     let url = format!("{base_url}/{}", f.url_path());
     let part = part_of(dest);
-    let (began, before) = (Instant::now(), arrived.load(Ordering::SeqCst));
+    let mut measured = Measured {
+        file: f.file,
+        arrived,
+        began: Instant::now(),
+        before: arrived.load(Ordering::SeqCst),
+        result: "cancelled",
+    };
     let mut attempt = 1;
     let fetched = loop {
         match fetch_once(client, &url, &part, f, arrived, on_progress).await {
@@ -411,20 +448,9 @@ async fn fetch(
             Err(Fetch::Retry(e) | Fetch::Stop(e)) => break Err(e),
         }
     };
-    // Plan 5.2-1: the network's part, failed or not; the hash check is not in it.
-    let bytes = arrived.load(Ordering::SeqCst) - before;
-    let secs = began.elapsed().as_secs_f64();
-    let line = diag_line(
-        "download",
-        &[
-            ("file", f.file.into()),
-            ("bytes", bytes.to_string()),
-            ("secs", format!("{secs:.1}")),
-            ("bps", format!("{:.0}", bytes as f64 / secs.max(0.001))),
-            ("connections", "1".into()),
-        ],
-    );
-    log::info!("{line}");
+    // The hash check is not in the measurement.
+    measured.result = if fetched.is_ok() { "ok" } else { "err" };
+    drop(measured);
     fetched?;
     let (dest, mark) = (dest.to_path_buf(), mark.clone());
     blocking(move || install(&part, &dest, f, &mark)).await?

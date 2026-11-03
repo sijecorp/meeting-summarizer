@@ -307,6 +307,7 @@ queue.rs ──spawn── 앱 실행 파일 --plan-chunks {회의 폴더} {VAD 
 - **`gpu_failed`는 대기열이 쓴다**: 설정 화면의 저장(`save_settings`)은 저장돼 있던 `gpu_failed` 값을 그대로 두고, 백엔드가 "GPU"로 바뀔 때만 `false`로 만든다. 설정 화면이 대기열이 쓴 값을 예전 값으로 덮어쓰지 않게 하려는 것이다. 대기열은 `mark_gpu_failed`로 따로 쓴다.
 - 장치는 구간마다 설정을 다시 읽어 정한다. 그래서 한 회의가 `gpu_failed`를 쓰면 함께 돌던 다른 회의도 다음 구간부터 CPU를 쓴다.
 - **GPU 워커 크래시** (5.3 종료 코드 계약의 "크래시", 또는 kill하지 않았는데 결과 없이 끝남):
+  - flash attention(`--fa 1`)으로 돌던 GPU 워커면 먼저 `settings.json`의 `transcribe_flash_attn`을 `false`로 쓰고(앱 로그에 한 줄) 같은 구간을 `--fa 0`으로 GPU에서 다시 실행한다. 일부 내장 GPU가 Vulkan의 flash attention에서만 죽을 수 있어서이고, 이 크래시는 아래 횟수에 세지 않으며 값은 `settings.json`을 고칠 때까지 꺼진 채 남는다(새 버전의 `gpu_failed` 풀기도 건드리지 않는다).
   - 같은 구간을 GPU 워커로 **한 번** 즉시 다시 실행한다.
   - 다시 비정상 종료하면 `settings.json`에 `gpu_failed=true`를 쓰고, 녹음자에게 "GPU 처리가 불안정해 CPU로 전환했습니다. 처리 시간이 길어집니다" 알림을 띄운 뒤, 같은 구간을 CPU 워커로 처리한다. 알림은 `transcribe://gpu-failed` 이벤트(앱 안 배너)다. 열 회의가 없어 OS 알림은 보내지 않는다(10.1, 11.1).
   - CPU 워커까지 비정상 종료하면 회의를 `transcribe_failed`로 바꾸고 원인(`worker.log` 마지막 줄)을 보여준다.
@@ -542,7 +543,7 @@ Queue의 Sidecar ──spawn── 앱 실행 파일 --llm-supervisor {llama-ser
 - `settings.json`은 앱 데이터 폴더(Tauri `app_data_dir`, Windows는 `%APPDATA%`)에 둔다.
 - 용량이 큰 `models/`와 `meetings/`는 **로컬 앱 데이터 폴더**(Tauri `app_local_data_dir`, Windows는 `%LOCALAPPDATA%`)에 둔다. Windows Roaming 프로필 동기화에 녹음 파일과 GB 단위 모델이 섞이지 않게 하려는 것이다(M1 코드 리뷰). macOS는 두 경로가 같다.
 - 앱 로그 `app.log`는 Tauri `app_log_dir()`에 둔다(macOS `~/Library/Logs/com.sije.meeting-summarizer/`, Windows `%LOCALAPPDATA%\com.sije.meeting-summarizer\logs\`). Windows 릴리스는 stderr를 버리므로 `tauri-plugin-log`로 이 파일에 info 이상을 남긴다. 터미널(stdout)에도 같이 쓴다. 5MB를 넘으면 날짜를 붙여 돌려쓰고 이전 파일은 2개까지 둔다(최대 약 15MB). 줄의 시각과 돌려쓴 파일 이름의 날짜는 UTC다. 로그 때문에 앱이 멈추지는 않는다: 시작할 때 `app.log`를 열거나 돌려쓰지 못하면(다른 프로그램이 파일을 잡고 있음, 읽기 전용 프로필) 그 실행 동안은 stdout에만 쓰고 그 사실을 첫 줄로 남긴다. 실행 중에 돌려쓰기가 막히면 그동안의 줄을 메모리에 모아 두고 다음 줄마다 다시 시도해, 파일이 풀리면 한꺼번에 쓴다. 패닉도 이 로그에 남긴다(릴리스는 패닉 때 바로 끝난다). 전사 워커는 이 로그를 쓰지 않는다(stderr는 `worker.log`, 5.3). 요약 엔진의 출력은 같은 폴더의 `llama-server.log`에 남긴다(6.6). 첫 줄은 실행 인자다. 키는 인자에 없고, 로그에 남는 것은 `llama-server`가 쓰는 키의 끝 4자(`****abcd`)뿐이다(요약마다 새 키). 한 실행에 5MB까지 쓴다. 띄울 때마다 이전 파일을 `llama-server.prev.log`로 옮겨 GPU에서 죽은 기록이 CPU 재시작에 지워지지 않게 한다. 설정 일반 탭의 "로그 폴더 열기"가 이 폴더를 연다.
-  - **측정 줄** (1.0.3, 계획 5.1-13, 5.2-1): 느린 PC의 원인을 이 로그 하나로 가르게 `종류 key=value …` 한 줄씩 남긴다. 전사 구간마다 워커의 진단 줄(5.3)에 `id=`(회의)와 `app=`(앱 버전)을 붙인 `chunk device=… gpu=… threads=… beam=… fa=… audio_s=… run_s=… rtf=… power=… saver=… ecoqos=…`, 회의의 전사가 끝나면 `meeting id=… audio_s=… run_s=… rtf=… device=…`, 모델 파일을 받을 때마다 `download file=… bytes=… secs=… bps=… connections=1`이다.
+  - **측정 줄** (1.0.3, 계획 5.1-13, 5.2-1): 느린 PC의 원인을 이 로그 하나로 가르게 `종류 key=value …` 한 줄씩 남긴다. 전사 구간마다 워커의 진단 줄(5.3)에 `id=`(회의)와 `app=`(앱 버전)을 붙인 `chunk device=… gpu=… threads=… beam=… fa=… audio_s=… run_s=… rtf=… power=… saver=… ecoqos=…`, 회의의 전사가 끝나면 `meeting id=… audio_s=… run_s=… rtf=… device=…`, 모델 파일을 받을 때마다 `download file=… bytes=… secs=… bps=… connections=1 result=ok|err|cancelled`이다(취소로 받기가 중간에 끝나도 남긴다).
 
 ```
 {앱 데이터}/

@@ -1226,9 +1226,9 @@ function ModelFiles({
       const { stage, time } = downloadNote(d, d.total - d.received);
       // All in: only the hash check is left.
       if (d.received >= d.total) return stage;
-      return [got, d.bps && `${(d.bps / 1e6).toFixed(1)}MB/s`, stage || (time && `이 파일 ${time}`)]
-        .filter(Boolean)
-        .join(" · ");
+      // Under 1 MB/s in KB/s: "0.4MB/s" reads as almost nothing.
+      const speed = d.bps && (d.bps < 1e6 ? `${Math.round(d.bps / 1e3)}KB/s` : `${(d.bps / 1e6).toFixed(1)}MB/s`);
+      return [got, speed, stage || (time && `이 파일 ${time}`)].filter(Boolean).join(" · ");
     }
     return f.received ? `없음 · ${mb(f.received)}/${mb(f.size)}MB 받아 둠` : "없음";
   };

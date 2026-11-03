@@ -67,7 +67,8 @@ pub struct Settings {
     /// The app version whose first launch cleared `gpu_failed` (plan 5.1-10).
     pub gpu_reset_version: Option<String>,
     /// Whisper's flash attention, the worker's `--fa` (plan 5.1-6). No screen sets it: only an
-    /// edit of settings.json, which a save keeps.
+    /// edit of settings.json, which a save keeps, and the queue, which turns it off for good after
+    /// a GPU crash with it on.
     pub transcribe_flash_attn: bool,
     pub model: String,
     pub model_base_url: String,
@@ -270,6 +271,12 @@ impl SettingsStore {
     /// The GPU crashed twice on one chunk: automatic mode uses the CPU from now on (TRN-06).
     pub fn mark_gpu_failed(&self) -> Result<(), String> {
         self.patch(|s| s.gpu_failed = true)
+    }
+
+    /// A GPU worker crashed with flash attention on (plan 5.1-6). It stays off until settings.json
+    /// is edited; `reset_gpu_failed_once` leaves it alone.
+    pub fn turn_off_flash_attn(&self) -> Result<(), String> {
+        self.patch(|s| s.transcribe_flash_attn = false)
     }
 
     /// Plan 5.1-10: the first launch of `version` clears `gpu_failed` once, so a PC an older

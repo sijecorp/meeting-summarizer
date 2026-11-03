@@ -5,14 +5,16 @@
 
 use super::engine::{Chunk, Device, Fail, Line, read_diag, read_lines, threads};
 use super::{filter, model};
-use crate::queue::last_log_line;
+use crate::queue::{STALL, last_log_line};
 use serde::Deserialize;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const USAGE: &str = "사용법: --transcribe-bench <회의 폴더> [--reference <기준 전사본 txt>] [--range <시작ms>-<끝ms>] [--only <조합,...>] [--smoke] [--model <파일>] [--vad <파일>] [--lang <코드>]. 조합 이름은 <gpu|cpu>/<모델>/b<beam>/fa<0|1>/<half|cores>(예: gpu/large-v3-turbo-q8_0/b5/fa1/half)이고 bench.tsv 첫 열에 있다. half는 논리 CPU의 절반(제품 기본), cores는 물리 코어 수";
 
@@ -20,6 +22,8 @@ const USAGE: &str = "사용법: --transcribe-bench <회의 폴더> [--reference 
 const RANGE: (u64, u64) = (0, 10 * 60_000);
 /// Compared when `--model` is not given, the product default first. Only installed ones run.
 const MODELS: [&str; 2] = ["large-v3-turbo-q8_0", "medium-q5_0"];
+/// The worker's copy of the meeting, in the temp folder: this, then the bench's pid.
+const WORK: &str = "meeting-summarizer-bench-";
 /// The installed app's data folder (`identifier` in tauri.conf.json).
 const APP_ID: &str = "com.sije.meeting-summarizer";
 /// bench.tsv's columns: the combination, the worker's `diag` keys (plan 5.1-4) with the times summed
@@ -295,11 +299,13 @@ fn physical_cores() -> Option<usize> {
 struct Run {
     lines: Vec<Line>,
     code: Option<i32>,
+    /// Killed after `stall` without a line, as the queue does (`STALL`).
+    stalled: bool,
     wall_s: f64,
     why: String,
 }
 
-fn spawn(exe: &Path, args: &[&OsStr], work: &Path) -> Result<Run, Fail> {
+fn spawn(exe: &Path, args: &[&OsStr], work: &Path, stall: Duration) -> Result<Run, Fail> {
     let log = work.join("worker.log");
     let stderr = File::create(&log)
         .map_err(|e| Fail::Crash(format!("worker.log를 만들 수 없습니다: {e}")))?;
@@ -313,9 +319,30 @@ fn spawn(exe: &Path, args: &[&OsStr], work: &Path) -> Result<Run, Fail> {
         .spawn()
         .map_err(|e| Fail::Crash(format!("워커를 시작할 수 없습니다: {e}")))?;
     let mut lines = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        read_lines(stdout, |line| lines.extend(line));
-    }
+    let stdout = child.stdout.take();
+    let stalled = thread::scope(|s| {
+        let (beat, beats) = mpsc::channel::<()>();
+        let child = &mut child;
+        let watch = s.spawn(move || {
+            let timed_out = loop {
+                if let Err(e) = beats.recv_timeout(stall) {
+                    break e == RecvTimeoutError::Timeout;
+                }
+            };
+            if timed_out {
+                let _ = child.kill();
+            }
+            timed_out
+        });
+        if let Some(stdout) = stdout {
+            read_lines(stdout, |line| {
+                let _ = beat.send(());
+                lines.extend(line);
+            });
+        }
+        drop(beat);
+        watch.join().unwrap_or(false)
+    });
     let code = child
         .wait()
         .map_err(|e| Fail::Crash(format!("워커를 기다릴 수 없습니다: {e}")))?
@@ -323,6 +350,7 @@ fn spawn(exe: &Path, args: &[&OsStr], work: &Path) -> Result<Run, Fail> {
     Ok(Run {
         lines,
         code,
+        stalled,
         wall_s: started.elapsed().as_secs_f64(),
         why: last_log_line(&log),
     })
@@ -346,6 +374,7 @@ fn measure(
     (vad, lang): (&Path, &str),
     combo: &Combo,
     pieces: &[(u64, u64)],
+    stall: Duration,
 ) -> Result<Measured, Fail> {
     let mut measured = Measured::default();
     let (beam, fa, threads) = (
@@ -372,7 +401,7 @@ fn measure(
             OsStr::new("--fa"),
             OsStr::new(&fa),
         ];
-        let run = spawn(exe, &args, work)?;
+        let run = spawn(exe, &args, work, stall)?;
         measured.wall_s += run.wall_s;
         let mut done = false;
         for line in run.lines {
@@ -391,7 +420,12 @@ fn measure(
         if !done || run.code != Some(0) {
             // It would fail the same way on the next chunk: only time would be lost.
             let code = run.code.map_or("-".into(), |c| c.to_string());
-            measured.failed = Some(format!("exit {code}: {}", run.why));
+            let how = if run.stalled {
+                "stalled".into()
+            } else {
+                format!("exit {code}")
+            };
+            measured.failed = Some(format!("{how}: {}", run.why));
             break;
         }
     }
@@ -399,6 +433,7 @@ fn measure(
 }
 
 /// A bench.tsv row by `COLUMNS`. Without a `diag` line (a failure) a setting is the one asked for.
+/// A failed combination has no times: the chunks before its failure are not the range.
 fn row(combo: &Combo, lang: &str, audio_s: f64, measured: &Measured, cer: Option<f64>) -> String {
     let sum = |key: &str| -> f64 {
         let values = measured.diags.iter().flatten().filter(|(k, _)| k == key);
@@ -411,14 +446,15 @@ fn row(combo: &Combo, lang: &str, audio_s: f64, measured: &Measured, cer: Option
         ("fa", combo.fa.to_string()),
         ("lang", lang.to_string()),
     ];
-    let timed = !measured.diags.is_empty();
+    let timed = measured.failed.is_none() && !measured.diags.is_empty();
     let values = COLUMNS.iter().map(|&column| {
         let value = match column {
             "combo" => combo.name.clone(),
             "model" => combo.model.0.clone(),
             "audio_s" => format!("{audio_s:.1}"),
-            "speech_s" | "load_s" | "run_s" if timed => format!("{:.2}", sum(column)),
-            "rtf" if timed => format!("{:.3}", sum("run_s") / audio_s),
+            "speech_s" | "load_s" | "run_s" | "rtf" if !timed => String::new(),
+            "speech_s" | "load_s" | "run_s" => format!("{:.2}", sum(column)),
+            "rtf" => format!("{:.3}", sum("run_s") / audio_s),
             "wall_s" => format!("{:.1}", measured.wall_s),
             "cer_pct" => cer.map_or(String::new(), |c| format!("{:.2}", c * 100.0)),
             "status" => measured.failed.clone().unwrap_or_else(|| "ok".into()),
@@ -532,13 +568,39 @@ fn run(args: &[OsString], exe: &Path, app: Option<PathBuf>) -> Result<PathBuf, F
         args.smoke,
     )?;
     // The worker reads a copy: the meeting folder gets bench.tsv and nothing else.
-    let work =
-        std::env::temp_dir().join(format!("meeting-summarizer-bench-{}", std::process::id()));
+    let temp = std::env::temp_dir();
+    remove_stale(&temp);
+    let work = temp.join(format!("{WORK}{}", std::process::id()));
     let result = fs::create_dir_all(&work)
         .map_err(|e| Fail::Crash(format!("임시 폴더를 만들 수 없습니다: {e}")))
         .and_then(|()| run_in(&work, exe, &args, (&vad, reference.as_deref()), &combos));
-    let _ = fs::remove_dir_all(&work);
+    remove(&work);
     result
+}
+
+/// The copies of benches that were killed before they removed theirs. By age, not by pid (a pid
+/// is reused): a day old, so a bench still running next to this one keeps its own.
+fn remove_stale(temp: &Path) {
+    let Ok(entries) = fs::read_dir(temp) else {
+        return;
+    };
+    let day = Duration::from_secs(24 * 60 * 60);
+    for entry in entries.flatten() {
+        let age = entry
+            .metadata()
+            .ok()
+            .filter(|m| m.is_dir())
+            .and_then(|m| m.modified().ok()?.elapsed().ok());
+        if entry.file_name().to_string_lossy().starts_with(WORK) && age.is_some_and(|a| a >= day) {
+            remove(&entry.path());
+        }
+    }
+}
+
+fn remove(work: &Path) {
+    if let Err(e) = fs::remove_dir_all(work) {
+        eprintln!("임시 폴더를 지울 수 없습니다 ({}): {e}", work.display());
+    }
 }
 
 fn run_in(
@@ -575,7 +637,7 @@ fn run_in(
                 work.as_os_str(),
                 vad.as_os_str(),
             ];
-            let run = spawn(exe, &plan, work)?;
+            let run = spawn(exe, &plan, work, STALL)?;
             let chunks = run.lines.into_iter().find_map(|line| match line {
                 Line::Plan { chunks, .. } => Some(chunks),
                 _ => None,
@@ -626,7 +688,7 @@ fn run_in(
     eprintln!("{header}\n결과 파일: {}", tsv.display());
     for (i, combo) in combos.iter().enumerate() {
         eprintln!("[{}/{}] {}", i + 1, combos.len(), combo.name);
-        let measured = measure(exe, work, (vad, &args.lang), combo, &pieces)?;
+        let measured = measure(exe, work, (vad, &args.lang), combo, &pieces, STALL)?;
         let cer = reference
             .filter(|_| measured.failed.is_none())
             .and_then(|r| cer(r, &measured.text));
@@ -819,7 +881,8 @@ mod tests {
     }
 
     /// A fake worker: plans two chunks, transcribes the same sentence for every chunk, and fails
-    /// to load the model with `--fa 0`. It logs its arguments, and whether its stdin is a pipe.
+    /// to load the model with `--fa 0` past the first chunk. It logs its arguments, and whether its
+    /// stdin is a pipe.
     #[cfg(unix)]
     const FAKE: &str = r##"#!/bin/sh
 echo "$*" >> 'LOG'
@@ -828,7 +891,7 @@ case "$1" in
 --plan-chunks)
   echo '{"type":"plan","len_ms":700000,"chunks":[{"start_ms":0,"end_ms":400000,"speech_ms":1},{"start_ms":400000,"end_ms":700000,"speech_ms":1}]}' ;;
 --transcribe-worker)
-  if [ "${15}" = 0 ]; then echo '모델을 불러올 수 없습니다' >&2; exit 3; fi
+  if [ "${15}" = 0 ] && [ "$3" != 0 ]; then echo '모델을 불러올 수 없습니다' >&2; exit 3; fi
   echo '{"type":"progress","pct":50}'
   printf '{"type":"diag","line":"chunk device=%s gpu=\\"Fake GPU\\" gpus=1 gpu_device=0 threads=%s beam=%s fa=%s lang=%s audio_s=1 speech_s=100.0 load_s=0.50 run_s=20.00 rtf=0.1 power=ac saver=0 ecoqos=-"}\n' "$5" "${13}" "${11}" "${15}" "$9"
   echo '{"type":"result","device":"cpu","segments":[{"start_ms":0,"end_ms":1,"text":"오늘 회의를 시작합니다"}]}' ;;
@@ -899,11 +962,12 @@ esac
                 path(&vad)
             )
         );
-        // The default range ends in the second chunk; the failing combination stops at once.
+        // The default range ends in the second chunk.
         assert!(calls[2].starts_with(&format!("--transcribe-worker {work} 400000 600000 gpu")));
         assert!(calls[3].contains(" 0 400000 gpu ") && calls[3].ends_with("--fa 0"));
-        assert!(calls[4].contains(" 0 400000 cpu ") && calls[4].contains("--beam 1"));
-        assert_eq!(calls.len(), 6, "{calls:?}");
+        assert!(calls[4].contains(" 400000 600000 gpu ") && calls[4].ends_with("--fa 0"));
+        assert!(calls[5].contains(" 0 400000 cpu ") && calls[5].contains("--beam 1"));
+        assert_eq!(calls.len(), 7, "{calls:?}");
 
         let text = fs::read_to_string(&tsv).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -942,14 +1006,17 @@ esac
             assert_eq!(get(0, key), value, "{key}");
         }
         assert!(get(0, "wall_s").parse::<f64>().is_ok());
-        // The failure: the settings asked for, no times, no CER, and why.
+        // The failure in the second chunk: the settings it ran with, no times (the first chunk is not
+        // the range), no CER, and why.
         for (key, value) in [
             ("combo", "gpu/tiny/b5/fa0/half"),
             ("device", "gpu"),
-            ("gpu", ""),
+            ("gpu", "Fake GPU"),
             ("threads", &t),
             ("fa", "0"),
             ("audio_s", "600.0"),
+            ("speech_s", ""),
+            ("load_s", ""),
             ("run_s", ""),
             ("rtf", ""),
             ("cer_pct", ""),
@@ -975,7 +1042,7 @@ esac
         let smoke = [smoke, os(&["--smoke"])].concat();
         run(&smoke, &exe, None).ok().unwrap();
         let calls = fs::read_to_string(&log).unwrap();
-        assert_eq!(calls.lines().count(), 7);
+        assert_eq!(calls.lines().count(), 8);
         assert!(calls.lines().last().unwrap().contains(" 0 300000 gpu "));
         let again = fs::read_to_string(&tsv).unwrap();
         assert!(again.starts_with(&text));
@@ -990,6 +1057,79 @@ esac
         assert!(added[0].contains("기준 전사본 없음"));
         assert!(added[2].starts_with("gpu/tiny/b5/fa1/half\ttiny\tgpu\t"));
         assert!(!calls.contains("stdin is not a pipe"));
+    }
+
+    /// A worker silent for the stall is killed, and the row says so with the settings asked for.
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_worker_is_killed_and_its_row_says_stalled() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("worker.sh");
+        fs::write(&exe, "#!/bin/sh\necho 'hanging' >&2\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let combo = Combo {
+            name: "gpu/tiny/b5/fa1/half".into(),
+            device: Device::Gpu,
+            model: ("tiny".into(), "m.bin".into()),
+            beam: 5,
+            fa: 1,
+            threads: 4,
+        };
+        let started = Instant::now();
+        let pieces = [(0, 1000), (1000, 2000)];
+        let stall = Duration::from_millis(200);
+        let measured = measure(
+            &exe,
+            tmp.path(),
+            (Path::new("v.bin"), "ko"),
+            &combo,
+            &pieces,
+            stall,
+        );
+        let measured = measured.ok().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let row = row(&combo, "ko", 2.0, &measured, None);
+        let get = |key: &str| {
+            COLUMNS
+                .iter()
+                .zip(row.split('\t'))
+                .find(|(k, _)| **k == key)
+                .unwrap()
+                .1
+        };
+        for (key, value) in [
+            ("device", "gpu"),
+            ("threads", "4"),
+            ("run_s", ""),
+            ("rtf", ""),
+            ("status", "stalled: hanging"),
+        ] {
+            assert_eq!(get(key), value, "{key}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_day_old_bench_copy_is_removed_and_a_newer_one_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (old, new) = (format!("{WORK}1"), format!("{WORK}2"));
+        for name in [&old, &new, "other"] {
+            fs::create_dir(tmp.path().join(name)).unwrap();
+            fs::write(tmp.path().join(name).join("mic.wav"), b"RIFF").unwrap();
+        }
+        let day_ago = std::time::SystemTime::now() - Duration::from_secs(25 * 60 * 60);
+        for name in [&old, "other"] {
+            let dir = File::open(tmp.path().join(name)).unwrap();
+            dir.set_modified(day_ago).unwrap();
+        }
+        remove_stale(tmp.path());
+        let mut left: Vec<String> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, [new, "other".into()]);
     }
 
     /// Plan 5.1-14 from a checkout: the bench with the release app built next to this test binary as

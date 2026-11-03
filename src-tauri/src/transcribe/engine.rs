@@ -732,26 +732,30 @@ fn exit_now(code: i32) -> ! {
 
 /// Runs the worker and exits when this process was started as one; returns for the app.
 pub fn worker_main() {
-    run_as(std::env::args_os().skip(1).collect());
-}
-
-fn run_as(args: Vec<OsString>) {
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let Some(run) = mode(&args) else {
         return;
     };
     #[cfg(windows)]
     let _ = ECOQOS
         .set(crate::no_ecoqos(None).map_or_else(|code| format!("err:{code}"), |()| "ok".into()));
-    // The app holds a worker's stdin open. If it goes away (a crash, a force quit), so does the
-    // worker, instead of keeping the GPU busy next to the workers the restarted app starts. Not the
-    // bench (plan 5.1-2): no app stands behind it, and a Windows GUI program has no stdin at all.
-    if args[0] != "--transcribe-bench" {
+    if watches_stdin(&args) {
         std::thread::spawn(|| {
             let _ = std::io::stdin().read(&mut [0; 1]);
             exit_now(EXIT_CRASH);
         });
     }
     exit_now(code_of(run(&args[1..])));
+}
+
+/// The app holds a worker's stdin open. If it goes away (a crash, a force quit), so does the
+/// worker, instead of keeping the GPU busy next to the workers the restarted app starts. Not the
+/// bench (plan 5.1-2): no app stands behind it, and a Windows GUI program has no stdin at all.
+fn watches_stdin(args: &[OsString]) -> bool {
+    matches!(
+        args.first().and_then(|a| a.to_str()),
+        Some("--plan-chunks" | "--transcribe-worker")
+    )
 }
 
 #[cfg(test)]
@@ -949,26 +953,13 @@ mod tests {
         }
     }
 
-    /// Plan 5.1-2: the bench runs without a stdin (a Windows GUI program has none) and gets to its
-    /// own argument check, where a worker would have exited at the closed stdin. This test binary
-    /// is the bench, in a child whose stdin is null.
+    /// Plan 5.1-2: the app's two worker modes end with its stdin; the bench, run by hand without
+    /// one, does not.
     #[test]
-    fn the_bench_outlives_a_closed_stdin() {
-        const CHILD: &str = "MS_BENCH_STDIN_CHILD";
-        if std::env::var_os(CHILD).is_some() {
-            run_as(os(&["--transcribe-bench", "/no/meeting", "--range", "5-1"]));
-            unreachable!("the bench exits");
-        }
-        let name = "transcribe::engine::tests::the_bench_outlives_a_closed_stdin";
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", name, "--nocapture"])
-            .env(CHILD, "1")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(EXIT_INPUT), "{stderr}");
-        assert!(stderr.contains("잘못된 인자: --range"), "{stderr}");
+    fn only_the_apps_workers_watch_stdin() {
+        assert!(watches_stdin(&os(&["--plan-chunks", "/m", "vad.bin"])));
+        assert!(watches_stdin(&os(&["--transcribe-worker", "/m"])));
+        assert!(!watches_stdin(&os(&["--transcribe-bench", "/m"])));
     }
 
     #[test]

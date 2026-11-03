@@ -604,6 +604,9 @@ test("전사 tab: the file in flight shows its speed and time left, or why not",
   // 504 MB left at 2.8 MB/s.
   await at(370_000_000, 2_800_000);
   expect(await screen.findByText("받는 중 42% (370/874MB) · 2.8MB/s · 이 파일 약 3분 남음")).toBeTruthy();
+  // Under 1 MB/s, in KB/s.
+  await at(370_000_000, 400_000);
+  expect(await screen.findByText("받는 중 42% (370/874MB) · 400KB/s · 이 파일 약 21분 남음")).toBeTruthy();
   expect(said()).toContain("전사 모델 받는 중");
   // 10 s without a byte.
   await at(370_000_000, 0);

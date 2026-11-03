@@ -100,7 +100,7 @@ Windows에서 전사가 매우 오래 걸린다는 보고가 있다. 특히 배�
 
 **B. 속도**
 
-6. **flash attention**: `WhisperContextParameters::flash_attn(fa)`. UI 없는 설정 키 `transcribe_flash_attn`(기본 true)을 대기열이 `--fa`로 넘긴다. 이 키는 `save_settings`와 TS `Settings` 타입을 거쳐도 지워지지 않는다.
+6. **flash attention**: `WhisperContextParameters::flash_attn(fa)`. UI 없는 설정 키 `transcribe_flash_attn`(기본 true)을 대기열이 `--fa`로 넘긴다. 이 키는 `save_settings`와 TS `Settings` 타입을 거쳐도 지워지지 않는다. GPU 워커가 fa를 켠 채 크래시하면 대기열이 이 키를 `false`로 쓰고 같은 구간을 `--fa 0`으로 GPU에서 다시 돌린다(이 크래시는 `gpu_failed`로 세지 않고, 키는 꺼진 채 남는다).
 7. **EcoQoS 끄기 (Windows)**: 워커는 시작하자마자 자기 프로세스에 `SetProcessInformation(ProcessPowerThrottling, {Version=1, ControlMask=EXECUTION_SPEED, StateMask=0})`를 걸고 결과를 진단 `ecoqos`에 남긴다. 앱 프로세스는 자기에게, 그리고 띄운 `llama-server` 핸들에 같은 설정을 건다. 우선순위는 바꾸지 않는다. 실패는 로그만 남기고 계속한다. `cfg(windows)` 테스트가 상태를 걸고 `GetProcessInformation`으로 다시 읽는다.
 8. **GPU 고르기**: 워커가 ggml 장치를 whisper.cpp와 같은 방식으로 센다(GPU·내장 GPU를 등록 순서대로, `whisper-rs-sys`를 직접 의존으로 더해 `ggml_backend_dev_*`를 부른다). 외장 GPU가 있으면 그 번호, 없으면 첫 내장 GPU, `--gpu-device`가 있으면 그 값을 `gpu_device`로 쓴다. 기본(0)이 아닌 장치로 모델 불러오기가 실패하면 워커 안에서 다른 GPU로 한 번 더 불러 본 뒤 CPU로 간다(지금의 GPU→CPU 대신 보기와 같은 모양). 실행 중 충돌은 지금 경로 그대로다.
 9. **처리 중 잠자기 방지**: 대기열이 회의를 하나라도 처리하는 동안(전사·요약) 전용 스레드가 `keepawake`를 `idle(true)`로 쥐고(화면은 꺼져도 됨), 처리 중인 회의가 0이 되면 놓는다. 모델을 받는 동안에도 같은 방식으로 쥔다. 2단계에 배터리·화면 꺼짐 1시간 실측과 `powercfg /requests`로 확인하고, 모자라면 `PowerCreateRequest`+`PowerSetRequest(SystemRequired)`로 바꾼다.
@@ -126,7 +126,7 @@ Windows에서 전사가 매우 오래 걸린다는 보고가 있다. 특히 배�
 
 ### 5.2 모델 다운로드 (1.0.3 최종 명세)
 
-1. **측정 줄**: 파일마다 받은 바이트, 걸린 시간, 평균 속도, 연결 수(1)를 `app.log`에 `download file=… bytes=… secs=… bps=… connections=1` 한 줄로 쓴다.
+1. **측정 줄**: 파일마다 받은 바이트, 걸린 시간, 평균 속도, 연결 수(1)를 `app.log`에 `download file=… bytes=… secs=… bps=… connections=1 result=ok|err|cancelled` 한 줄로 쓴다.
 2. **속도와 남은 시간(E4)**: 받기 코드가 공유 바이트 카운터를 두고, 받는 동안 1초 타이머로 `model://download`를 보낸다(바이트가 오지 않아도 보낸다. 지금의 1%마다 이벤트는 그대로). 이벤트에 최근 10초 평균 속도(bytes/s)를 더하고, 이 창은 받을 파일 전체에 걸쳐 이어진다(파일이 바뀌어도 비우지 않는다).
 3. 화면: 설정의 파일 행만 속도를 보인다 "받는 중 42% (370/874MB) · 12.4MB/s · 이 파일 약 3분 남음". 홈 설정 줄과 요약 모델 안내(RouteNotice)는 기존 `remaining()` 형식의 남은 시간만(받을 파일 전체 기준). 받기 시작 10초 전이나 속도가 0이면 남은 시간을 숨기고, 10초 넘게 바이트가 없으면 "연결 기다리는 중". 다 받은 뒤 해시 확인 동안은 "확인 중…"이 앞선다. 단계가 바뀔 때만 role=status로 알리고 속도는 알리지 않는다.
 4. **받기 중 잠자기 방지**: 5.1-9와 같다.

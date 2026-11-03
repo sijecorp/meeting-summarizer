@@ -44,7 +44,7 @@ fn slots(builtin_ready: bool) -> usize {
 /// A worker that prints nothing for this long is killed and counted as a crash. It prints a
 /// progress line at least once per 30 s Whisper window (once per 10 min window when planning),
 /// and loading even the 874 MB model takes seconds.
-const STALL: Duration = Duration::from_secs(5 * 60);
+pub(crate) const STALL: Duration = Duration::from_secs(5 * 60);
 const PARTIAL: &str = "transcript.partial.jsonl";
 const GPU_FAILED: &str = "GPU 처리가 불안정해 CPU로 전환했습니다. 처리 시간이 길어집니다";
 
@@ -366,6 +366,9 @@ fn summary_only(store: &Store, meta: &Meta) -> bool {
 enum Next {
     Accept,
     Run(Device),
+    /// A GPU crash with flash attention on: turn it off for good and run the chunk on the GPU
+    /// again without it. Not counted toward `gpu_failed` (plan 5.1-6).
+    FlashAttnOff,
     /// The second GPU crash on this chunk: record `gpu_failed`, tell the recorder, then run the
     /// chunk on the CPU.
     GpuFailed,
@@ -375,14 +378,17 @@ enum Next {
 /// One chunk's attempts (TRN-06, TRN-07). Crash counts live only here, in memory.
 struct ChunkRun {
     device: Device,
+    /// The worker's `--fa`.
+    flash_attn: bool,
     gpu_crashes: u32,
     rechecked: bool,
 }
 
 impl ChunkRun {
-    fn new(device: Device) -> Self {
+    fn new(device: Device, flash_attn: bool) -> Self {
         Self {
             device,
+            flash_attn,
             gpu_crashes: 0,
             rechecked: false,
         }
@@ -401,6 +407,12 @@ impl ChunkRun {
                     // A CPU result is kept even if it looks odd: running it again gives the same.
                     Next::Accept
                 }
+            }
+            // Some integrated GPUs may crash only in Vulkan's flash attention: that is tried
+            // before the GPU is given up on.
+            Exit::Crash | Exit::Stalled if self.device == Device::Gpu && self.flash_attn => {
+                self.flash_attn = false;
+                Next::FlashAttnOff
             }
             Exit::Crash | Exit::Stalled if self.device == Device::Gpu => {
                 self.gpu_crashes += 1;
@@ -1190,14 +1202,15 @@ impl<R: Runtime> Queue<R> {
         mut on_pct: impl FnMut(u8),
     ) -> Result<(Vec<Segment>, Device), End> {
         let settings = self.settings();
-        let mut run = ChunkRun::new(first_device(settings.backend, settings.gpu_failed));
-        let (threads, fa) = (
-            engine::threads().to_string(),
-            u8::from(settings.transcribe_flash_attn).to_string(),
+        let mut run = ChunkRun::new(
+            first_device(settings.backend, settings.gpu_failed),
+            settings.transcribe_flash_attn,
         );
+        let threads = engine::threads().to_string();
         let version = self.app.package_info().version.to_string();
         loop {
             let (start, end) = (chunk.start_ms.to_string(), chunk.end_ms.to_string());
+            let fa = u8::from(run.flash_attn).to_string();
             let args = [
                 OsStr::new("--transcribe-worker"),
                 dir.as_os_str(),
@@ -1241,6 +1254,15 @@ impl<R: Runtime> Queue<R> {
             match run.after(exit, abnormal.is_some()) {
                 Next::Accept => return Ok((segments, run.device)),
                 Next::Run(_) => {}
+                Next::FlashAttnOff => {
+                    log::warn!(
+                        "GPU 워커가 비정상 종료해 flash attention을 껐습니다 ({id}, {}ms~)",
+                        chunk.start_ms
+                    );
+                    if let Err(e) = self.app.state::<SettingsStore>().turn_off_flash_attn() {
+                        log::error!("transcribe_flash_attn 저장 실패: {e}");
+                    }
+                }
                 Next::GpuFailed => {
                     if let Err(e) = self.app.state::<SettingsStore>().mark_gpu_failed() {
                         log::error!("gpu_failed 저장 실패: {e}");
@@ -1911,22 +1933,39 @@ mod tests {
 
     #[test]
     fn gpu_crash_retries_once_then_marks_gpu_failed_and_uses_the_cpu() {
-        let mut run = ChunkRun::new(Device::Gpu);
+        let mut run = ChunkRun::new(Device::Gpu, false);
         assert_eq!(run.after(Exit::Crash, false), Next::Run(Device::Gpu));
         assert_eq!(run.after(Exit::Crash, false), Next::GpuFailed);
         assert_eq!(run.device, Device::Cpu);
         assert_eq!(run.after(Exit::Crash, false), Next::Fail);
 
-        let mut run = ChunkRun::new(Device::Gpu);
+        let mut run = ChunkRun::new(Device::Gpu, false);
         assert_eq!(run.after(Exit::Crash, false), Next::Run(Device::Gpu));
         assert_eq!(run.after(Exit::Done(Device::Gpu), false), Next::Accept);
         assert_eq!(run.device, Device::Gpu);
     }
 
+    /// Plan 5.1-6: a GPU crash with flash attention on turns it off first, uncounted; the CPU's
+    /// crash is never flash attention's.
+    #[test]
+    fn a_gpu_crash_with_flash_attention_turns_it_off_before_counting() {
+        let mut run = ChunkRun::new(Device::Gpu, true);
+        assert_eq!(run.after(Exit::Crash, false), Next::FlashAttnOff);
+        assert_eq!(
+            (run.device, run.flash_attn, run.gpu_crashes),
+            (Device::Gpu, false, 0)
+        );
+        assert_eq!(run.after(Exit::Stalled, false), Next::Run(Device::Gpu));
+        assert_eq!(run.after(Exit::Crash, false), Next::GpuFailed);
+
+        let mut run = ChunkRun::new(Device::Cpu, true);
+        assert_eq!(run.after(Exit::Crash, false), Next::Fail);
+    }
+
     #[test]
     fn input_and_model_errors_fail_without_blaming_the_gpu() {
         for exit in [Exit::Input, Exit::Model] {
-            let mut run = ChunkRun::new(Device::Gpu);
+            let mut run = ChunkRun::new(Device::Gpu, false);
             assert_eq!(run.after(exit, false), Next::Fail);
             assert_eq!((run.gpu_crashes, run.device), (0, Device::Gpu));
         }
@@ -1973,7 +2012,7 @@ mod tests {
             ..Ended::default()
         };
         assert_eq!(exit_of(killed, None), Exit::OutOfMemory);
-        let mut run = ChunkRun::new(Device::Gpu);
+        let mut run = ChunkRun::new(Device::Gpu, false);
         assert_eq!(run.after(Exit::OutOfMemory, false), Next::Fail);
         assert_eq!(run.gpu_crashes, 0);
 
@@ -1983,23 +2022,23 @@ mod tests {
             ..Ended::default()
         };
         assert_eq!(exit_of(stalled, None), Exit::Stalled);
-        let mut run = ChunkRun::new(Device::Gpu);
+        let mut run = ChunkRun::new(Device::Gpu, false);
         assert_eq!(run.after(Exit::Stalled, false), Next::Run(Device::Gpu));
         assert_eq!(run.after(Exit::Stalled, false), Next::GpuFailed);
     }
 
     #[test]
     fn abnormal_gpu_result_is_redone_once_on_the_cpu() {
-        let mut run = ChunkRun::new(Device::Gpu);
+        let mut run = ChunkRun::new(Device::Gpu, false);
         assert_eq!(
             run.after(Exit::Done(Device::Gpu), true),
             Next::Run(Device::Cpu)
         );
         assert_eq!(run.after(Exit::Done(Device::Cpu), true), Next::Accept);
         // Already on the CPU (forced, or the GPU fell back): kept.
-        let mut run = ChunkRun::new(Device::Gpu);
+        let mut run = ChunkRun::new(Device::Gpu, false);
         assert_eq!(run.after(Exit::Done(Device::Cpu), true), Next::Accept);
-        let mut run = ChunkRun::new(Device::Cpu);
+        let mut run = ChunkRun::new(Device::Cpu, false);
         assert_eq!(run.after(Exit::Done(Device::Cpu), true), Next::Accept);
     }
 
@@ -2856,6 +2895,27 @@ mod tests {
             assert!(!f.gpu_failed());
         }
 
+        /// Plan 5.1-6: `${15}` is `--fa`. The crash turns it off for good, and the GPU finishes.
+        #[cfg(unix)]
+        #[test]
+        fn a_gpu_crash_with_flash_attention_runs_the_gpu_again_without_it() {
+            let f = fixture(
+                &format!(
+                    r#"if [ "$5" = gpu ] && [ "${{15}}" = 1 ]; then echo 'fa fault' >&2; exit 1; fi; {RESULT}"#
+                ),
+                Backend::Auto,
+            );
+            let id = f.recorded();
+            f.queue().enqueue_pending();
+            f.wait("done", || f.status(&id) == Status::Review);
+            assert_eq!(f.runs(&id), ["gpu", "gpu"]);
+            assert_eq!(f.store().get(&id).unwrap().backend.as_deref(), Some("gpu"));
+            let settings = f.app.state::<SettingsStore>().load().unwrap().settings;
+            assert!(!settings.transcribe_flash_attn && !settings.gpu_failed);
+            assert_eq!(*f.gpu_notices.lock().unwrap(), 0);
+        }
+
+        /// With flash attention already off, as before it was there.
         #[cfg(unix)]
         #[test]
         fn two_gpu_crashes_mark_gpu_failed_and_the_cpu_finishes() {
@@ -2863,6 +2923,10 @@ mod tests {
                 &format!(r#"if [ "$5" = gpu ]; then echo 'gpu fault' >&2; exit 1; fi; {RESULT}"#),
                 Backend::Auto,
             );
+            f.app
+                .state::<SettingsStore>()
+                .turn_off_flash_attn()
+                .unwrap();
             let id = f.recorded();
             f.queue().enqueue_pending();
             // Too little speech to summarize (SUM-10): done once transcribed.
