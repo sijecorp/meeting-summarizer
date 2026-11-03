@@ -94,6 +94,9 @@ export type Settings = {
   /** The summary engine's GPU failed and its CPU worked: automatic mode summarizes on the CPU
    * (plan 5.3). Rust keeps it across saves. */
   summary_gpu_failed?: boolean;
+  /** Whisper's flash attention (plan 5.1-6), on unless settings.json says otherwise. No screen
+   * sets it: a save sends it back as loaded, and Rust keeps the stored value anyway. */
+  transcribe_flash_attn?: boolean;
   model: string;
   model_base_url: string;
   input_device: string | null;

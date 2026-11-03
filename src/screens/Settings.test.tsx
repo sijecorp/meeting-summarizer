@@ -889,6 +889,25 @@ test("저장 shows the settings as Rust stored them", async () => {
   );
 });
 
+// Plan 5.1-6: a field no screen shows goes back to Rust as settings.json had it.
+test("저장 sends flash attention back as loaded", async () => {
+  const calls: Call[] = [];
+  mockIPC((cmd, args) => {
+    calls.push({ cmd, args: args as Call["args"] });
+    if (cmd === "get_settings") return { ...loaded, settings: { ...loaded.settings, transcribe_flash_attn: false } };
+    if (cmd === "has_secret") return true;
+  });
+  render(<Settings onHome={() => {}} />);
+  fireEvent.change(await screen.findByRole("textbox", { name: "녹음자 이름" }), { target: { value: "김철수" } });
+  fireEvent.click(screen.getByRole("button", { name: "저장" }));
+  await waitFor(() =>
+    expect(calls.find((c) => c.cmd === "save_settings")?.args.value).toMatchObject({
+      recorder_name: "김철수",
+      transcribe_flash_attn: false,
+    }),
+  );
+});
+
 // d6: Rust's words, before the name is even added.
 test("a connection cannot be added under a name this PC reserves", async () => {
   mockIPC((cmd) => {

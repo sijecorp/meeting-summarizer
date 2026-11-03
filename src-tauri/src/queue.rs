@@ -207,6 +207,8 @@ struct Job {
     abort: Option<Box<dyn Fn() + Send>>,
     /// A cloud summary is in flight: a recording lets it run on (SUM-09).
     cloud: bool,
+    /// The last worker's `Line::Device`: where it runs, and the GPU it picked ("" for none).
+    device: Option<(Device, String)>,
 }
 
 impl Job {
@@ -939,7 +941,7 @@ impl<R: Runtime> Queue<R> {
         let ended = run_worker(&self.inner, id, command, STALL, |line| match line {
             Line::Progress { pct } => self.set_progress(id, |p| p.percent = pct),
             Line::Plan { len_ms, chunks } => plan = Some(Plan { len_ms, chunks }),
-            Line::Result { .. } => {}
+            _ => {}
         })?;
         let plan = match (ended.code, plan) {
             (Some(0), Some(plan)) if !ended.stalled => plan,
@@ -966,6 +968,11 @@ impl<R: Runtime> Queue<R> {
     ) -> Result<(Vec<Segment>, Device), End> {
         let settings = self.settings();
         let mut run = ChunkRun::new(first_device(settings.backend, settings.gpu_failed));
+        let (threads, fa) = (
+            engine::threads().to_string(),
+            u8::from(settings.transcribe_flash_attn).to_string(),
+        );
+        let version = self.app.package_info().version.to_string();
         loop {
             let (start, end) = (chunk.start_ms.to_string(), chunk.end_ms.to_string());
             let args = [
@@ -976,12 +983,28 @@ impl<R: Runtime> Queue<R> {
                 OsStr::new(run.device.name()),
                 model.as_os_str(),
                 vad.as_os_str(),
+                // Plan 5.1-1: the product's values. The GPU is the worker's pick.
+                OsStr::new("--lang"),
+                OsStr::new("ko"),
+                OsStr::new("--beam"),
+                OsStr::new("5"),
+                OsStr::new("--threads"),
+                OsStr::new(&threads),
+                OsStr::new("--fa"),
+                OsStr::new(&fa),
             ];
             let command = self.worker(dir, &args)?;
             let mut result = None;
             let ended = run_worker(&self.inner, id, command, STALL, |line| match line {
                 Line::Progress { pct } => on_pct(pct),
                 Line::Result { device, segments } => result = Some((device, segments)),
+                Line::Device { device, name } => {
+                    if let Some(job) = lock(&self.inner).jobs.get_mut(id) {
+                        job.device = Some((device, name));
+                    }
+                }
+                // Plan 5.1-13: the measurements go to app.log, with whose and which version.
+                Line::Diag { line } => log::info!("{line} id={id} app={version}"),
                 Line::Plan { .. } => {}
             })?;
             let exit = exit_of(ended, result.as_ref().map(|(device, _)| *device));
@@ -1120,10 +1143,31 @@ impl<R: Runtime> Queue<R> {
             m.status = Status::Transcribed;
             Ok(())
         });
-        match finished {
-            Ok(_) => End::Done(Status::Transcribed),
-            Err(e) => End::Failed(e),
+        if let Err(e) = finished {
+            return End::Failed(e);
         }
+        // Plan 5.1-13: this run's pace, unless resuming left nothing to run.
+        let audio_s = plan.len_ms.saturating_sub(resumed_ms) as f64 / 1000.0;
+        if audio_s > 0.0 {
+            let run_s = since.elapsed().as_secs_f64();
+            let device = lock(&self.inner)
+                .jobs
+                .get(id)
+                .and_then(|j| j.device.as_ref())
+                .map_or("-", |(device, _)| device.name());
+            let line = engine::diag_line(
+                "meeting",
+                &[
+                    ("id", id.into()),
+                    ("audio_s", format!("{audio_s:.1}")),
+                    ("run_s", format!("{run_s:.1}")),
+                    ("rtf", format!("{:.3}", run_s / audio_s)),
+                    ("device", device.into()),
+                ],
+            );
+            log::info!("{line}");
+        }
+        End::Done(Status::Transcribed)
     }
 
     /// Transcribes, then summarizes in the same slot (architecture 8.4), or only summarizes

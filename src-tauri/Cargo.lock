@@ -2639,6 +2639,7 @@ dependencies = [
  "tempfile",
  "time",
  "whisper-rs",
+ "whisper-rs-sys",
  "windows-sys 0.61.2",
 ]
 

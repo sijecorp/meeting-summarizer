@@ -431,6 +431,11 @@ fn supervise(mut command: Command, mut stdin: impl Read + Send + 'static) -> ! {
             ..Ended::default()
         }),
     };
+    // Plan 5.1-7: into `llama-server.log` if Windows refuses.
+    #[cfg(windows)]
+    if let Err(code) = crate::no_ecoqos(Some(&server)) {
+        eprintln!("llama-server의 EcoQoS를 끄지 못했습니다: {code}");
+    }
     let pid = server.id();
     engine::print(&Report::Started { pid, port: None });
     let said = Arc::new(AtomicBool::new(false));

@@ -17,6 +17,41 @@ pub fn worker_main() {
     transcribe::engine::worker_main();
 }
 
+/// Plan 5.1-7: opts this process (`None`) or a child out of EcoQoS, so Windows does not move its
+/// work to efficiency cores at low clocks to save power. The priority stays. `Err`: the error code.
+#[cfg(windows)]
+pub(crate) fn no_ecoqos(child: Option<&std::process::Child>) -> Result<(), i32> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+        ProcessPowerThrottling, SetProcessInformation,
+    };
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        StateMask: 0,
+    };
+    // SAFETY: our own pseudo handle, or the child's while `child` is borrowed; `state` outlives
+    // the call that reads it.
+    let set = unsafe {
+        let process = match child {
+            Some(child) => child.as_raw_handle(),
+            None => GetCurrentProcess(),
+        };
+        SetProcessInformation(
+            process,
+            ProcessPowerThrottling,
+            (&raw const state).cast(),
+            size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    };
+    match set {
+        0 => Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0)),
+        _ => Ok(()),
+    }
+}
+
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::image::Image;
@@ -281,6 +316,10 @@ pub fn run() {
             {
                 log::error!("app.log를 열 수 없어 stdout에만 씁니다: {e}");
             }
+            #[cfg(windows)]
+            if let Err(code) = no_ecoqos(None) {
+                log::warn!("EcoQoS를 끄지 못했습니다: {code}");
+            }
             // Recordings and models stay out of the Windows roaming profile (8.1).
             let local = app.path().app_local_data_dir()?;
             let store = store::Store::new(local.join("meetings"))?;
@@ -288,9 +327,13 @@ pub fn run() {
             store.recover();
             app.manage(store);
             app.manage(audio::Recorder::default());
-            app.manage(settings::SettingsStore::new(
-                app.path().app_data_dir()?.join("settings.json"),
-            ));
+            let settings =
+                settings::SettingsStore::new(app.path().app_data_dir()?.join("settings.json"));
+            if let Err(e) = settings.reset_gpu_failed_once(&app.package_info().version.to_string())
+            {
+                log::warn!("gpu_failed 초기화 실패: {e}");
+            }
+            app.manage(settings);
             app.manage(transcribe::model::Models::new(local.join("models")));
             app.manage(queue::Queue::new(
                 app.handle().clone(),
@@ -489,6 +532,37 @@ mod tests {
         assert!(!clears_notifications("other", &WindowEvent::Focused(true)));
         // The test binary has no bundle identifier, like a bare binary: nothing to clear, no panic.
         clear_notifications();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ecoqos_reads_back_as_off() {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentProcess, GetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+            ProcessPowerThrottling,
+        };
+        assert_eq!(no_ecoqos(None), Ok(()));
+        let mut state = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ..Default::default()
+        };
+        // SAFETY: our own pseudo handle; `state` is the size given and outlives the call.
+        let read = unsafe {
+            GetProcessInformation(
+                GetCurrentProcess(),
+                ProcessPowerThrottling,
+                (&raw mut state).cast(),
+                size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+            )
+        };
+        assert_ne!(read, 0, "{}", std::io::Error::last_os_error());
+        // Execution speed is controlled by us, and not throttled.
+        let speed = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+        assert_eq!(
+            (state.ControlMask & speed, state.StateMask & speed),
+            (speed, 0)
+        );
     }
 
     #[test]

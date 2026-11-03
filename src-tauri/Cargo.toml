@@ -42,6 +42,9 @@ keepawake = "0.6.1"
 # Pinned (M0 exit condition): bundles whisper.cpp 1.8.3 with the built-in Silero VAD. Building it
 # needs cmake. GPU features are per target below (architecture 5.4).
 whisper-rs = "0.16.0"
+# ggml's device list for picking the GPU (plan 5.1-8): whisper-rs re-exports it only with `raw-api`.
+# The version whisper-rs pins, so both are one crate.
+whisper-rs-sys = "=0.15.0"
 # Model hashes. Same version the tree already has.
 sha2 = "0.10.9"
 # Model download, LLM and Slack. The OS TLS stack and certificate store, so a company mirror
@@ -94,9 +97,10 @@ whisper-rs = { version = "0.16.0", features = ["metal"] }
 # Needs the Vulkan SDK (VULKAN_SDK) to build and ships vulkan-1.dll next to the app (architecture 5.4).
 whisper-rs = { version = "0.16.0", features = ["vulkan"] }
 # Reference clocks and disk space (architecture 4.2, 4.6); for the summary engine (sidecar.rs) its
-# kill-on-close Job Object (whose functions and limits structs also need Security and Threading)
-# and the supervisor's error mode (Diagnostics_Debug). Same version tauri already pulls in.
-windows-sys = { version = "0.61.2", features = ["Win32_System_WindowsProgramming", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_Debug"] }
+# kill-on-close Job Object (whose functions and limits structs also need Security and Threading),
+# the supervisor's error mode (Diagnostics_Debug), EcoQoS (Threading) and the power state (Power).
+# Same version tauri already pulls in.
+windows-sys = { version = "0.61.2", features = ["Win32_System_WindowsProgramming", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_Debug", "Win32_System_Power"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -10,9 +10,11 @@
 use crate::audio::mix;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::ffi::{OsStr, OsString};
+use std::ffi::{CStr, OsStr, OsString};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
+use std::sync::OnceLock;
+use std::time::Instant;
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperVadContext,
     WhisperVadContextParams, WhisperVadParams,
@@ -87,6 +89,38 @@ pub enum Line {
         device: Device,
         segments: Vec<Segment>,
     },
+    /// `--transcribe-worker`, once the model has loaded (plan 5.1-3): where it runs, and the GPU
+    /// picked for it, empty when there is none.
+    Device {
+        device: Device,
+        name: String,
+    },
+    /// `--transcribe-worker`, before its result (plan 5.1-4): a `diag_line`.
+    Diag {
+        line: String,
+    },
+}
+
+/// A measurement line (plan 5.1-4): `kind`, then `key=value` pairs. A value with whitespace or a
+/// `"` goes in double quotes, inside which `"` and `\` are escaped with a backslash.
+pub(crate) fn diag_line(kind: &str, pairs: &[(&str, String)]) -> String {
+    let mut line = kind.to_string();
+    for (key, value) in pairs {
+        line += &format!(" {key}=");
+        if value.contains(|c: char| c.is_whitespace() || c == '"') {
+            line.push('"');
+            for c in value.chars() {
+                if matches!(c, '"' | '\\') {
+                    line.push('\\');
+                }
+                line.push(c);
+            }
+            line.push('"');
+        } else {
+            line += value;
+        }
+    }
+    line
 }
 
 /// Union of the speech spans found by overlapping windows: speech seen by two windows, or cut
@@ -191,9 +225,71 @@ fn progress() -> impl FnMut(u8) {
 
 /// Two meetings may transcribe at once (TRN-01), so each worker takes half the logical CPUs:
 /// the physical cores on SMT machines, half the cores on Apple Silicon. Tune after S2.
-fn threads() -> i32 {
+pub(crate) fn threads() -> i32 {
     std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).max(1) as i32)
 }
+
+/// The devices whisper.cpp numbers `gpu_device` over (`whisper_backend_init_gpu`): ggml's GPUs
+/// and integrated GPUs in registration order, as (integrated, description).
+fn gpus() -> Vec<(bool, String)> {
+    use whisper_rs_sys as sys;
+    // SAFETY: ggml's device registry lives as long as the process, and a device's description is
+    // a C string it owns.
+    unsafe {
+        (0..sys::ggml_backend_dev_count())
+            .map(|i| sys::ggml_backend_dev_get(i))
+            .filter_map(|dev| {
+                let integrated = match sys::ggml_backend_dev_type(dev) {
+                    sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU => false,
+                    sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU => true,
+                    _ => return None,
+                };
+                let name = CStr::from_ptr(sys::ggml_backend_dev_description(dev));
+                Some((integrated, name.to_string_lossy().into_owned()))
+            })
+            .collect()
+    }
+}
+
+/// Plan 5.1-8: the `gpu_device`s to load the model on, in order, over `gpus()`' kinds. The first
+/// discrete GPU, else the first integrated one, or `forced`; one other than whisper.cpp's default
+/// (0) falls back to 0 once. The CPU comes after these. `None`: `forced` names no GPU.
+fn gpu_order(integrated: &[bool], forced: Option<usize>) -> Option<Vec<usize>> {
+    let first = match forced {
+        Some(n) if n >= integrated.len() => return None,
+        Some(n) => n,
+        None if integrated.is_empty() => return Some(Vec::new()),
+        None => integrated.iter().position(|i| !i).unwrap_or(0),
+    };
+    Some(if first == 0 { vec![0] } else { vec![first, 0] })
+}
+
+/// The diagnostic's `power` and `saver` (plan 5.1-4): on AC or battery, battery saver on or off.
+fn power() -> (&'static str, &'static str) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+        let mut status = SYSTEM_POWER_STATUS::default();
+        // SAFETY: fills `status` and nothing else.
+        if unsafe { GetSystemPowerStatus(&mut status) } != 0 {
+            let power = match status.ACLineStatus {
+                0 => "battery",
+                1 => "ac",
+                _ => "?",
+            };
+            let saver = match status.SystemStatusFlag {
+                0 => "0",
+                1 => "1",
+                _ => "?",
+            };
+            return (power, saver);
+        }
+    }
+    ("?", "?")
+}
+
+/// `ok` or `err:<code>` once a worker opted out of EcoQoS (plan 5.1-7); never set off Windows.
+static ECOQOS: OnceLock<String> = OnceLock::new();
 
 /// whisper.cpp takes model paths as C strings: they must be UTF-8 without NUL.
 fn path_str(path: &OsStr) -> Result<&str, Fail> {
@@ -318,15 +414,69 @@ fn cs_to_samples(cs: f32) -> usize {
     (cs.max(0.0) * 160.0) as usize
 }
 
-/// `--transcribe-worker <meeting dir> <start ms> <end ms> <gpu|cpu> <model> <VAD model>`: one
-/// chunk with the TRN-04 parameters, same as S2's `whisper-cli -l ko --vad -vm`.
-fn transcribe_chunk(args: &[OsString]) -> Result<(), Fail> {
-    let [dir, start, end, device, model, vad_model] = args else {
-        return Err(Fail::Input(
-            "사용법: --transcribe-worker <회의 폴더> <시작 ms> <끝 ms> <gpu|cpu> <모델> <VAD 모델>"
-                .into(),
-        ));
+const USAGE: &str = "사용법: --transcribe-worker <회의 폴더> <시작 ms> <끝 ms> <gpu|cpu> <모델> <VAD 모델> [--lang <코드>] [--beam <1..8>] [--threads <n>] [--fa <0|1>] [--gpu-device <n>]";
+
+/// The flags after the positional arguments (plan 5.1-1), each at most once and with its value.
+#[derive(Debug, PartialEq)]
+struct Options {
+    lang: String,
+    beam: i32,
+    threads: i32,
+    flash_attn: bool,
+    /// `None`: picked by `gpu_order`.
+    gpu_device: Option<usize>,
+}
+
+fn options(flags: &[OsString]) -> Result<Options, Fail> {
+    let mut options = Options {
+        lang: "ko".into(),
+        beam: 5,
+        threads: threads(),
+        flash_attn: true,
+        gpu_device: None,
     };
+    let cpus = std::thread::available_parallelism().map_or(i32::MAX, |n| n.get() as i32);
+    let mut seen = Vec::new();
+    let mut flags = flags.iter();
+    while let Some(flag) = flags.next() {
+        let flag = flag.to_string_lossy();
+        let bad = || Fail::Input(format!("잘못된 인자: {flag}. {USAGE}"));
+        let value = flags.next().and_then(|v| v.to_str()).ok_or_else(bad)?;
+        if seen.contains(&flag) {
+            return Err(bad());
+        }
+        let number = |range: std::ops::RangeInclusive<i32>| {
+            value
+                .parse()
+                .ok()
+                .filter(|n| range.contains(n))
+                .ok_or_else(bad)
+        };
+        match &*flag {
+            "--lang" if !value.contains('\0') && whisper_rs::get_lang_id(value).is_some() => {
+                options.lang = value.into();
+            }
+            "--beam" => options.beam = number(1..=8)?,
+            "--threads" => options.threads = number(1..=cpus)?,
+            "--fa" => options.flash_attn = number(0..=1)? == 1,
+            // Checked against the GPUs found once they are counted (`gpu_order`).
+            "--gpu-device" => options.gpu_device = Some(number(0..=i32::MAX)? as usize),
+            _ => return Err(bad()),
+        }
+        seen.push(flag);
+    }
+    Ok(options)
+}
+
+/// `--transcribe-worker <meeting dir> <start ms> <end ms> <gpu|cpu> <model> <VAD model> [flags]`:
+/// one chunk with the TRN-04 parameters, same as S2's `whisper-cli -l ko --vad -vm`, and the
+/// plan 5.1 flags (`options`).
+fn transcribe_chunk(args: &[OsString]) -> Result<(), Fail> {
+    let (positional, flags) = args.split_at(args.len().min(6));
+    let [dir, start, end, device, model, vad_model] = positional else {
+        return Err(Fail::Input(USAGE.into()));
+    };
+    let options = options(flags)?;
     let number = |s: &OsStr| {
         s.to_str()
             .and_then(|s| s.parse::<u64>().ok())
@@ -373,32 +523,72 @@ fn transcribe_chunk(args: &[OsString]) -> Result<(), Fail> {
         return Ok(());
     }
 
-    let load = |gpu: bool| {
+    let gpus = gpus();
+    let integrated: Vec<bool> = gpus.iter().map(|g| g.0).collect();
+    let order = gpu_order(&integrated, options.gpu_device).ok_or_else(|| {
+        Fail::Input(format!(
+            "GPU {}번이 없습니다 (찾은 GPU {}개). {USAGE}",
+            options.gpu_device.unwrap_or_default(),
+            gpus.len()
+        ))
+    })?;
+    let load = |gpu: Option<usize>| {
         let mut params = WhisperContextParameters::default();
-        params.use_gpu(gpu);
+        params
+            .use_gpu(gpu.is_some())
+            .gpu_device(gpu.unwrap_or_default() as i32)
+            .flash_attn(options.flash_attn);
         WhisperContext::new_with_params(model, params)
     };
-    // TRN-05: a GPU that will not start falls back to the CPU. whisper.cpp itself also runs on
-    // the CPU when it finds no GPU device.
-    let (ctx, device) = match device {
-        Device::Gpu => match load(true) {
-            Ok(ctx) => (ctx, Device::Gpu),
-            Err(e) => {
-                eprintln!("GPU로 모델을 불러오지 못해 CPU로 바꿉니다: {e}");
-                (load(false).map_err(model_failed)?, Device::Cpu)
-            }
-        },
-        Device::Cpu => (load(false).map_err(model_failed)?, Device::Cpu),
+    // TRN-05, plan 5.1-8: a GPU that will not start falls back to the other one, then to the CPU,
+    // which is also where whisper.cpp runs when there is no GPU.
+    let loading = Instant::now();
+    let tries = if device == Device::Gpu {
+        &order[..]
+    } else {
+        &[]
     };
+    let mut loaded = None;
+    for &gpu in tries {
+        match load(Some(gpu)) {
+            Ok(ctx) => {
+                loaded = Some((ctx, Some(gpu)));
+                break;
+            }
+            Err(e) => eprintln!("GPU {gpu}번으로 모델을 불러오지 못했습니다: {e}"),
+        }
+    }
+    let (ctx, used) = match loaded {
+        Some(loaded) => loaded,
+        None => {
+            if !tries.is_empty() {
+                eprintln!("CPU로 바꿉니다");
+            }
+            (load(None).map_err(model_failed)?, None)
+        }
+    };
+    let load_s = loading.elapsed().as_secs_f64();
+    let device = if used.is_some() {
+        Device::Gpu
+    } else {
+        Device::Cpu
+    };
+    let name = used
+        .or(order.first().copied())
+        .map_or("", |i| gpus[i].1.as_str());
+    print(&Line::Device {
+        device,
+        name: name.into(),
+    });
     let mut state = ctx.create_state().map_err(model_failed)?;
 
     // whisper-cli's default sampling (beam 5), so speed and accuracy match what S2 measures.
     let mut params = FullParams::new(SamplingStrategy::BeamSearch {
-        beam_size: 5,
+        beam_size: options.beam,
         patience: -1.0,
     });
-    params.set_language(Some("ko"));
-    params.set_n_threads(threads());
+    params.set_language(Some(&options.lang));
+    params.set_n_threads(options.threads);
     params.set_no_context(true);
     params.set_suppress_nst(true);
     // Stdout carries the JSON lines only.
@@ -408,9 +598,11 @@ fn transcribe_chunk(args: &[OsString]) -> Result<(), Fail> {
     params.set_print_special(false);
     params.set_progress_callback_safe(move |pct: i32| report(pct.clamp(0, 100) as u8));
 
+    let running = Instant::now();
     state
         .full(params, &speech.samples)
         .map_err(|e| Fail::Crash(format!("전사 실패: {e}")))?;
+    let run_s = running.elapsed().as_secs_f64();
     let mut segments = Vec::new();
     for segment in state.as_iter() {
         let text = segment
@@ -430,6 +622,33 @@ fn transcribe_chunk(args: &[OsString]) -> Result<(), Fail> {
             text: text.trim().to_string(),
         });
     }
+    let audio_s = (end_ms - start_ms) as f64 / 1000.0;
+    let (power, saver) = power();
+    let line = diag_line(
+        "chunk",
+        &[
+            ("device", device.name().into()),
+            ("gpu", name.into()),
+            ("gpus", gpus.len().to_string()),
+            ("gpu_device", used.map_or("-".into(), |g| g.to_string())),
+            ("threads", options.threads.to_string()),
+            ("beam", options.beam.to_string()),
+            ("fa", u8::from(options.flash_attn).to_string()),
+            ("lang", options.lang.clone()),
+            ("audio_s", format!("{audio_s:.1}")),
+            (
+                "speech_s",
+                format!("{:.1}", speech.samples.len() as f64 / 16_000.0),
+            ),
+            ("load_s", format!("{load_s:.2}")),
+            ("run_s", format!("{run_s:.2}")),
+            ("rtf", format!("{:.3}", run_s / audio_s)),
+            ("power", power.into()),
+            ("saver", saver.into()),
+            ("ecoqos", ECOQOS.get().map_or("-", String::as_str).into()),
+        ],
+    );
+    print(&Line::Diag { line });
     print(&Line::Result { device, segments });
     Ok(())
 }
@@ -469,6 +688,13 @@ fn exit_now(code: i32) -> ! {
     unsafe {
         libc::_exit(code)
     }
+    // Plan 5.1-5: `std::process::exit` runs static destructors, which can crash in the Vulkan
+    // teardown. SAFETY: ends this process at once, as `_exit` does above.
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        TerminateProcess(GetCurrentProcess(), code as u32);
+    }
     #[cfg(not(target_os = "macos"))]
     std::process::exit(code)
 }
@@ -479,6 +705,9 @@ pub fn worker_main() {
     let Some(run) = mode(&args) else {
         return;
     };
+    #[cfg(windows)]
+    let _ = ECOQOS
+        .set(crate::no_ecoqos(None).map_or_else(|code| format!("err:{code}"), |()| "ok".into()));
     // The app holds our stdin open. If it goes away (a crash, a force quit), so do we, instead of
     // keeping the GPU busy next to the workers the restarted app starts.
     std::thread::spawn(|| {
@@ -656,6 +885,121 @@ mod tests {
         // Arguments fine, but no recording there.
         assert_eq!(chunk("0", "cpu", model), EXIT_INPUT);
         assert_eq!(worker(&["--plan-chunks", dir, model]), EXIT_INPUT);
+
+        // Plan 5.1-1: flags pass to the next check (the missing model); a bad one stops first.
+        let flagged = |flags: &[&str]| {
+            let mut args = vec!["--transcribe-worker", dir, "0", "1000", "cpu"];
+            args.extend(["/no/such/model.bin", "/no/such/model.bin"]);
+            args.extend(flags);
+            worker(&args)
+        };
+        let all = ["--lang", "en", "--beam", "1", "--threads", "1", "--fa", "0"];
+        assert_eq!(flagged(&all), EXIT_MODEL);
+        assert_eq!(flagged(&["--gpu-device", "0"]), EXIT_MODEL);
+        for bad in [
+            &["--speed", "1"][..],
+            &["--beam", "1", "--beam", "2"],
+            &["--beam", "0"],
+            &["--beam", "9"],
+            &["--threads", "0"],
+            &["--fa", "2"],
+            &["--gpu-device", "-1"],
+            &["--lang", "xx"],
+            &["--lang"],
+            &["--beam", "--fa", "1"],
+        ] {
+            assert_eq!(flagged(bad), EXIT_INPUT, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn flags_default_to_the_product_values() {
+        let parsed = options(&[]).ok().unwrap();
+        assert_eq!(
+            parsed,
+            Options {
+                lang: "ko".into(),
+                beam: 5,
+                threads: threads(),
+                flash_attn: true,
+                gpu_device: None,
+            }
+        );
+        let parsed = options(&os(&["--gpu-device", "1", "--lang", "vi"]))
+            .ok()
+            .unwrap();
+        assert_eq!((parsed.gpu_device, parsed.lang.as_str()), (Some(1), "vi"));
+    }
+
+    /// Plan 5.1-8 over made-up device lists (`true`: integrated), in registration order.
+    #[test]
+    fn the_discrete_gpu_goes_first_and_another_pick_falls_back_to_the_default() {
+        assert_eq!(gpu_order(&[], None), Some(vec![]));
+        assert_eq!(gpu_order(&[true], None), Some(vec![0]));
+        // A laptop whose integrated GPU registers first.
+        assert_eq!(gpu_order(&[true, false], None), Some(vec![1, 0]));
+        assert_eq!(gpu_order(&[false, true], None), Some(vec![0]));
+        assert_eq!(gpu_order(&[true, true], None), Some(vec![0]));
+        assert_eq!(gpu_order(&[true, false, false], None), Some(vec![1, 0]));
+        // `--gpu-device` wins, still with the default behind it.
+        assert_eq!(gpu_order(&[false, true], Some(1)), Some(vec![1, 0]));
+        assert_eq!(gpu_order(&[true, false], Some(0)), Some(vec![0]));
+        assert_eq!(gpu_order(&[true], Some(1)), None);
+        assert_eq!(gpu_order(&[], Some(0)), None);
+    }
+
+    /// The reading side of `diag_line`, as a log reader would do it.
+    fn parse_diag(line: &str) -> (String, Vec<(String, String)>) {
+        let (kind, mut rest) = line.split_once(' ').unwrap_or((line, ""));
+        let mut pairs = Vec::new();
+        while !rest.is_empty() {
+            let (key, after) = rest.split_once('=').unwrap();
+            let (value, left) = match after.strip_prefix('"') {
+                Some(quoted) => {
+                    let (mut value, mut chars) = (String::new(), quoted.char_indices());
+                    let end = loop {
+                        match chars.next().unwrap() {
+                            (_, '\\') => value.push(chars.next().unwrap().1),
+                            (i, '"') => break i + 1,
+                            (_, c) => value.push(c),
+                        }
+                    };
+                    (value, &quoted[end..])
+                }
+                None => {
+                    let end = after.find(' ').unwrap_or(after.len());
+                    (after[..end].to_string(), &after[end..])
+                }
+            };
+            pairs.push((key.to_string(), value));
+            rest = left.strip_prefix(' ').unwrap_or(left);
+        }
+        (kind.to_string(), pairs)
+    }
+
+    #[test]
+    fn diag_values_with_spaces_or_quotes_are_quoted_and_read_back() {
+        let pairs = [
+            ("device", "gpu".to_string()),
+            ("gpu", "NVIDIA GeForce RTX 3060".into()),
+            ("gpus", "2".into()),
+            ("odd", r#"a "b" \c"#.into()),
+            ("path", r"C:\x".into()),
+            ("empty", String::new()),
+            ("rtf", "0.250".into()),
+        ];
+        let line = diag_line("chunk", &pairs);
+        assert_eq!(
+            line,
+            r#"chunk device=gpu gpu="NVIDIA GeForce RTX 3060" gpus=2 odd="a \"b\" \\c" path=C:\x empty= rtf=0.250"#
+        );
+        let (kind, read) = parse_diag(&line);
+        assert_eq!(kind, "chunk");
+        let expected: Vec<_> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        assert_eq!(read, expected);
     }
 
     #[test]
@@ -665,5 +1009,12 @@ mod tests {
         assert_eq!(serde_json::to_string(&parsed).unwrap(), line);
         let progress: Line = serde_json::from_str(r#"{"type":"progress","pct":42}"#).unwrap();
         assert_eq!(progress, Line::Progress { pct: 42 });
+        for line in [
+            r#"{"type":"device","device":"cpu","name":""}"#,
+            r#"{"type":"diag","line":"chunk device=gpu gpu=\"Apple M2\""}"#,
+        ] {
+            let parsed: Line = serde_json::from_str(line).unwrap();
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), line);
+        }
     }
 }

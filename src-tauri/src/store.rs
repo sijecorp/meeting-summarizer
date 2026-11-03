@@ -461,8 +461,13 @@ impl Store {
         if meta.status == Status::Deleting {
             return Err(format!("삭제 중인 회의입니다: {id}"));
         }
+        let from = meta.status;
         f(&mut meta)?;
         self.write(&meta)?;
+        // Plan 5.1-13: app.log's timestamps then tell how long each step took.
+        if meta.status != from {
+            log::info!("상태 ({id}): {from:?} -> {:?}", meta.status);
+        }
         Ok(meta)
     }
 
@@ -542,8 +547,10 @@ impl Store {
                 return Err(NEWER_VERSION.to_string());
             }
             if meta.status != Status::Deleting {
+                let from = meta.status;
                 meta.status = Status::Deleting;
                 self.write(&meta)?;
+                log::info!("상태 ({id}): {from:?} -> Deleting");
             }
         }
         // Outside the lock: the work being stopped may itself be waiting to write meta.json.

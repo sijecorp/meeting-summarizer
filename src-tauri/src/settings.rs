@@ -64,6 +64,11 @@ pub struct Settings {
     /// The summary engine's GPU died of its own fault and the CPU then worked (plan 5.3): automatic
     /// mode runs llama-server on the CPU. Written by the sidecar the way `gpu_failed` is by the queue.
     pub summary_gpu_failed: bool,
+    /// The app version whose first launch cleared `gpu_failed` (plan 5.1-10).
+    pub gpu_reset_version: Option<String>,
+    /// Whisper's flash attention, the worker's `--fa` (plan 5.1-6). No screen sets it: only an
+    /// edit of settings.json, which a save keeps.
+    pub transcribe_flash_attn: bool,
     pub model: String,
     pub model_base_url: String,
     pub input_device: Option<String>,
@@ -89,6 +94,8 @@ impl Default for Settings {
             backend: Backend::Auto,
             gpu_failed: false,
             summary_gpu_failed: false,
+            gpu_reset_version: None,
+            transcribe_flash_attn: true,
             model: "large-v3-turbo-q8_0".into(),
             model_base_url: "https://huggingface.co".into(),
             input_device: None,
@@ -239,9 +246,12 @@ impl SettingsStore {
         let kept = |field: &str| stored[field].as_bool().unwrap_or(false) && !gpu_chosen;
         settings.gpu_failed = kept("gpu_failed");
         settings.summary_gpu_failed = kept("summary_gpu_failed");
-        // `last_channel` belongs to sending (SND-04) the same way, and `slack_team` to signing in.
+        // `last_channel` belongs to sending (SND-04) the same way, `slack_team` to signing in, and
+        // the two below to the app's start and to settings.json alone.
         settings.last_channel = stored["last_channel"].as_str().map(String::from);
         settings.slack_team = stored["slack_team"].as_str().map(String::from);
+        settings.gpu_reset_version = stored["gpu_reset_version"].as_str().map(String::from);
+        settings.transcribe_flash_attn = stored["transcribe_flash_attn"].as_bool().unwrap_or(true);
         self.write(settings)
     }
 
@@ -260,6 +270,19 @@ impl SettingsStore {
     /// The GPU crashed twice on one chunk: automatic mode uses the CPU from now on (TRN-06).
     pub fn mark_gpu_failed(&self) -> Result<(), String> {
         self.patch(|s| s.gpu_failed = true)
+    }
+
+    /// Plan 5.1-10: the first launch of `version` clears `gpu_failed` once, so a PC an older
+    /// version tied to the CPU tries this version's GPU handling. A mark made after that stays.
+    pub fn reset_gpu_failed_once(&self, version: &str) -> Result<(), String> {
+        let loaded = self.load()?;
+        if loaded.read_only || loaded.settings.gpu_reset_version.as_deref() == Some(version) {
+            return Ok(());
+        }
+        self.patch(|s| {
+            s.gpu_failed = false;
+            s.gpu_reset_version = Some(version.into());
+        })
     }
 
     /// The summary engine's GPU failed and its CPU worked (plan 5.3).
@@ -572,6 +595,45 @@ mod tests {
             })
             .unwrap();
         assert!(!store.load().unwrap().settings.summary_gpu_failed);
+    }
+
+    /// Plan 5.1-10: a 1.0.2 file's `gpu_failed` goes on 1.0.3's first launch only; a GPU that
+    /// fails again in 1.0.3 stays failed through a settings save and the next launch.
+    #[test]
+    fn gpu_failed_is_cleared_once_by_a_new_version() {
+        let (_tmp, store) = store();
+        fs::write(&store.path, r#"{"schema_version": 1, "gpu_failed": true}"#).unwrap();
+        store.reset_gpu_failed_once("1.0.3").unwrap();
+        let loaded = store.load().unwrap().settings;
+        assert!(!loaded.gpu_failed);
+        assert_eq!(loaded.gpu_reset_version.as_deref(), Some("1.0.3"));
+
+        store.mark_gpu_failed().unwrap();
+        store.save(Settings::default()).unwrap();
+        store.reset_gpu_failed_once("1.0.3").unwrap();
+        assert!(store.load().unwrap().settings.gpu_failed);
+    }
+
+    /// Plan 5.1-6: on by default, and a hand edit survives the settings screen, which has no
+    /// control for it.
+    #[test]
+    fn flash_attention_is_on_unless_settings_json_says_otherwise() {
+        let (_tmp, store) = store();
+        assert!(store.load().unwrap().settings.transcribe_flash_attn);
+        fs::write(
+            &store.path,
+            r#"{"schema_version": 1, "transcribe_flash_attn": false}"#,
+        )
+        .unwrap();
+        store
+            .save(Settings {
+                recorder_name: "홍길동".into(),
+                ..Settings::default()
+            })
+            .unwrap();
+        let loaded = store.load().unwrap().settings;
+        assert!(!loaded.transcribe_flash_attn);
+        assert_eq!(loaded.recorder_name, "홍길동");
     }
 
     #[test]
