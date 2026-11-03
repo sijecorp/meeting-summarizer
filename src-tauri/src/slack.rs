@@ -59,7 +59,7 @@ fn local_start(created_at: &str, offset_minutes: i32) -> String {
 }
 
 /// `1시간 5분`, `42분`, `1분 미만`.
-fn length_text(ms: u64) -> String {
+pub(crate) fn length_text(ms: u64) -> String {
     let minutes = ms / 60_000;
     match (minutes / 60, minutes % 60) {
         (0, 0) => "1분 미만".into(),
@@ -898,6 +898,10 @@ impl Slack {
     /// then posts it to `channel` as the recorder. Success: `sent` with the channel, time and edit
     /// count, and `channel` becomes `last_channel` (SND-04). Failure: still `review`, with the cause
     /// in `error` for 다시 보내기 (SND-06).
+    ///
+    /// Plan 5.5-3..6: from `sent` it posts the stored summary to a channel not sent to yet and adds
+    /// it to `also_sent`; the screen's title and body are not used. A failure then leaves the
+    /// meeting as it was, `error` too.
     #[allow(clippy::too_many_arguments)]
     pub async fn send(
         &self,
@@ -913,22 +917,47 @@ impl Slack {
             return Err("이미 보내는 중입니다".into());
         }
         let _claim = Claim(&self.sending, id);
-        if store.get(id)?.no_speech {
+        let meta = store.get(id)?;
+        // Read-only, and a post could not be recorded.
+        if meta.schema_version > store::SCHEMA_VERSION {
+            return Err(store::NEWER_VERSION.into());
+        }
+        if meta.no_speech {
             return Err("음성이 거의 감지되지 않아 보낼 요약이 없습니다".into());
         }
-        // `review` only. The last attempt's cause goes: it is no longer what happens.
-        store.save_summary(id, title, body)?;
-        let meta = store.update(id, |m| {
-            m.error = None;
-            Ok(())
-        })?;
+        let again = meta.status == Status::Sent;
+        let (meta, body) = if again {
+            if sent_to(&meta, channel) {
+                return Err("이미 보낸 채널입니다".into());
+            }
+            let body = store.summary(id)?;
+            (meta, body)
+        } else {
+            // `review` only. The last attempt's cause goes: it is no longer what happens.
+            store.save_summary(id, title, body)?;
+            let meta = store.update(id, |m| {
+                m.error = None;
+                Ok(())
+            })?;
+            (meta, body.to_string())
+        };
         match self
-            .deliver(store, settings, &meta, channel, body, offset_minutes)
+            .deliver(store, settings, &meta, channel, &body, offset_minutes)
             .await
         {
             Ok(sent) => {
                 let meta = store
                     .update(id, |m| {
+                        if again {
+                            if m.status != Status::Sent {
+                                return Err(format!("{:?}에서 더 보낼 수 없습니다", m.status));
+                            }
+                            // SND-03: the same text as the first send, so the same count.
+                            let edit_count =
+                                m.sent.as_ref().map_or(sent.edit_count, |s| s.edit_count);
+                            m.also_sent.push(Sent { edit_count, ..sent });
+                            return Ok(());
+                        }
                         if !can_transition(m.status, Status::Sent) {
                             return Err(format!("{:?}에서 보낸 것으로 바꿀 수 없습니다", m.status));
                         }
@@ -945,6 +974,8 @@ impl Slack {
                 }
                 Ok(meta)
             }
+            // Plan 5.5-5: a send to another channel leaves the sent meeting as it was.
+            Err(e) if again => Err(e),
             Err(e) => {
                 let failed = store.update(id, |m| {
                     m.error = Some(e.clone());
@@ -1008,6 +1039,7 @@ impl Slack {
         }
         Ok(Sent {
             channel: format!("#{}", channel.name),
+            channel_id: channel.id.clone(),
             at: store::utc(OffsetDateTime::now_utc()),
             edit_count: edits,
         })
@@ -1032,6 +1064,18 @@ impl Slack {
         .await
         .map(|_| ())
     }
+}
+
+/// Plan 5.5-1: by id, so a renamed channel is still the same one; a send from before 1.1.0 has
+/// only the name it had then.
+fn sent_to(meta: &Meta, channel: &Channel) -> bool {
+    meta.sent.iter().chain(&meta.also_sent).any(|s| {
+        if s.channel_id.is_empty() {
+            s.channel == format!("#{}", channel.name)
+        } else {
+            s.channel_id == channel.id
+        }
+    })
 }
 
 /// `summary.generated.md`, or nothing when the meeting has none.
@@ -1078,6 +1122,7 @@ mod tests {
             held: false,
             chunks_total: 0,
             languages: crate::transcribe::lang::default_list(),
+            also_sent: Vec::new(),
         }
     }
 
@@ -1524,11 +1569,15 @@ mod tests {
 
     impl Fixture {
         fn send(&self, title: &str, body: &str) -> Result<Meta, String> {
+            self.send_to(&channel(), title, body)
+        }
+
+        fn send_to(&self, channel: &Channel, title: &str, body: &str) -> Result<Meta, String> {
             block_on(self.slack.send(
                 &self.store,
                 &self.settings,
                 &self.id,
-                &channel(),
+                channel,
                 title,
                 body,
                 540,
@@ -2193,5 +2242,161 @@ mod tests {
         assert!(f.send("주간 회의", "- 본문").is_err());
         assert_eq!(f.store.get(&f.id).unwrap().status, Status::Archived);
         assert!(stub.requests.lock().unwrap().is_empty());
+    }
+
+    fn other(id: &str, name: &str) -> Channel {
+        Channel {
+            id: id.into(),
+            name: name.into(),
+            private: false,
+        }
+    }
+
+    /// Plan 5.5-3: a sent summary cannot change, so another channel gets what is stored, whatever
+    /// the screen still holds.
+    #[test]
+    fn a_sent_meeting_goes_to_another_channel_with_its_stored_summary() {
+        let stub = serve(|_| Some(ok(json!({}))));
+        let f = fixture(&stub);
+        let body = "## 결정사항\n- 금요일 배포";
+        let first = f.send("주간 회의", body).unwrap().sent.unwrap();
+
+        let meta = f
+            .send_to(&other("C3", "기획"), "다른 제목", "- 다른 본문")
+            .unwrap();
+
+        assert_eq!(meta.status, Status::Sent);
+        assert_eq!(meta.sent.as_ref(), Some(&first));
+        let again = &meta.also_sent[..];
+        assert_eq!(again.len(), 1);
+        assert_eq!(
+            (
+                again[0].channel.as_str(),
+                again[0].channel_id.as_str(),
+                again[0].edit_count
+            ),
+            ("#기획", "C3", first.edit_count)
+        );
+        assert_eq!(f.store.get(&f.id).unwrap().title, "주간 회의");
+        let requests = stub.requests.lock().unwrap();
+        let sent = form(&requests[1]);
+        assert_eq!(sent["channel"], "C3");
+        let blocks: Value = serde_json::from_str(&sent["blocks"]).unwrap();
+        let text = blocks[0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("**주간 회의**") && text.ends_with(body),
+            "{text}"
+        );
+    }
+
+    /// Plan 5.5-1·4: by id, so a renamed channel is still sent to; a send from before 1.1.0 by
+    /// its name.
+    #[test]
+    fn a_channel_already_sent_to_is_refused() {
+        let stub = serve(|_| Some(ok(json!({}))));
+        let f = fixture(&stub);
+        f.send("주간 회의", "- 본문").unwrap();
+        f.send_to(&other("C3", "기획"), "", "").unwrap();
+
+        for channel in [channel(), other("C2", "개발-이름바뀜"), other("C3", "기획")] {
+            assert_eq!(
+                f.send_to(&channel, "", "").unwrap_err(),
+                "이미 보낸 채널입니다"
+            );
+        }
+        // Sent before channel ids were kept: the name is all there is.
+        f.store
+            .update(&f.id, |m| {
+                m.sent.as_mut().unwrap().channel_id.clear();
+                Ok(())
+            })
+            .unwrap();
+        assert!(f.send_to(&other("C9", "개발"), "", "").is_err());
+        assert_eq!(stub.requests.lock().unwrap().len(), 2);
+        // Renamed since, it can no longer be told apart from another channel.
+        f.send_to(&other("C2", "개발-이름바뀜"), "", "").unwrap();
+        assert_eq!(f.store.get(&f.id).unwrap().also_sent.len(), 2);
+    }
+
+    /// Plan 5.5-5: the meeting stays sent and keeps no error; the cause goes back to the screen.
+    #[test]
+    fn a_failed_send_to_another_channel_keeps_the_meeting_as_sent() {
+        let stub = serve(|r| {
+            Some(if form(r)["channel"] == "C2" {
+                ok(json!({}))
+            } else {
+                error("channel_not_found")
+            })
+        });
+        let f = fixture(&stub);
+        let before = f.send("주간 회의", "- 본문").unwrap();
+
+        let error = f.send_to(&other("C3", "기획"), "", "").unwrap_err();
+
+        assert_eq!(error, failure("channel_not_found").message());
+        assert_eq!(f.store.get(&f.id).unwrap(), before);
+    }
+
+    /// Plan 5.5-4: the meeting's place in `sending` holds two sends to the same channel to one post.
+    #[test]
+    fn two_sends_of_a_sent_meeting_to_the_same_channel_post_once() {
+        let (release, wait) = mpsc::channel::<()>();
+        let wait = Mutex::new(wait);
+        let stub = serve(move |r| {
+            if form(r)["channel"] == "C3" {
+                let _ = wait.lock().unwrap().recv();
+            }
+            Some(ok(json!({})))
+        });
+        let f = fixture(&stub);
+        f.send("주간 회의", "- 본문").unwrap();
+        thread::scope(|s| {
+            let first = s.spawn(|| f.send_to(&other("C3", "기획"), "", ""));
+            let until = Instant::now() + Duration::from_secs(5);
+            while stub.requests.lock().unwrap().len() < 2 {
+                assert!(Instant::now() < until, "the first send never arrived");
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(
+                f.send_to(&other("C3", "기획"), "", "").unwrap_err(),
+                "이미 보내는 중입니다"
+            );
+            release.send(()).unwrap();
+            assert_eq!(first.join().unwrap().unwrap().also_sent.len(), 1);
+        });
+        assert_eq!(
+            f.send_to(&other("C3", "기획"), "", "").unwrap_err(),
+            "이미 보낸 채널입니다"
+        );
+        assert_eq!(stub.requests.lock().unwrap().len(), 2);
+    }
+
+    /// Plan 5.5-6: a delete never waits for a send. The send ends by itself and writes nothing.
+    #[test]
+    fn a_delete_during_a_send_runs_to_the_end() {
+        let (release, wait) = mpsc::channel::<()>();
+        let wait = Mutex::new(wait);
+        let stub = serve(move |r| {
+            if form(r)["channel"] == "C3" {
+                let _ = wait.lock().unwrap().recv();
+            }
+            Some(ok(json!({})))
+        });
+        let f = fixture(&stub);
+        f.send("주간 회의", "- 본문").unwrap();
+        let dir = f.store.dir_for(&f.id).unwrap();
+        thread::scope(|s| {
+            let sending = s.spawn(|| f.send_to(&other("C3", "기획"), "", ""));
+            let until = Instant::now() + Duration::from_secs(5);
+            while stub.requests.lock().unwrap().len() < 2 {
+                assert!(Instant::now() < until, "the send never arrived");
+                thread::sleep(Duration::from_millis(10));
+            }
+            f.store.delete(&f.id).unwrap();
+            assert!(!dir.exists());
+            release.send(()).unwrap();
+            assert!(sending.join().unwrap().is_err());
+        });
+        assert!(!dir.exists());
     }
 }

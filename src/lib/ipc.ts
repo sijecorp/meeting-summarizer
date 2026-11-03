@@ -56,7 +56,7 @@ export type Meta = {
   /** SUM-10: too little speech, so no LLM was asked: nothing to send. */
   no_speech: boolean;
   error: string | null;
-  sent: { channel: string; at: string; edit_count: number } | null;
+  sent: Sent | null;
   /** The grounding check (plan 5.6) could read the action items. Absent: no summary checked. */
   grounding_checked?: boolean;
   /** Why a meeting with its transcript waits in `transcribed` or `paused` instead of summarizing
@@ -69,7 +69,17 @@ export type Meta = {
   /** Plan 5.6-2: the languages it is transcribed in (codes of `transcribeLanguages`), one or more
    * in that list's order. A meeting from before 1.1.0 reads as `["ko"]`. */
   languages: string[];
+  /** Plan 5.5-2: the sends after `sent`, in order. Absent when there are none. */
+  also_sent?: Sent[];
 };
+
+/** `channel_id` is empty for a send from before 1.1.0 (plan 5.5-1). */
+export type Sent = { channel: string; channel_id?: string; at: string; edit_count: number };
+/** Plan 5.5-2: every channel it went to, the first one first. */
+export const sentAll = (m: Meta): Sent[] => (m.sent ? [m.sent, ...(m.also_sent ?? [])] : []);
+/** Plan 5.5-1: by id, so a renamed channel is the same one; a send from before 1.1.0 by name. */
+export const sentTo = (sent: Sent[], c: Channel) =>
+  sent.some((s) => (s.channel_id ? s.channel_id === c.id : s.channel === `#${c.name}`));
 
 /** `summary_model`: the built-in route needs the summary model (`modelStatus("summary")` tells
  * whether it is downloading). `connection_deleted`: the connection it was pinned to is gone; it is
@@ -236,6 +246,10 @@ export const retrySummary = (id: string, connection: string) =>
 /** REV-05: summary and transcript as one `.md` file, through a save dialog. The saved path, or null
  * when cancelled. */
 export const exportMarkdown = (id: string) => invoke<string | null>("export_markdown", { id });
+/** Plan 5.4: the recording as one WAV, through a save dialog. Where it went and whether two tracks
+ * were mixed into it (an upload has one), or null when cancelled. A delete meanwhile stops it. */
+export const exportRecording = (id: string) =>
+  invoke<{ path: string; mixed: boolean } | null>("export_recording", { id });
 
 // Slack (architecture 7, 10.2).
 
@@ -256,7 +270,9 @@ export const slackSignOut = () => invoke<void>("slack_sign_out");
 export const slackChannels = () => invoke<Channel[]>("slack_channels");
 /** SND-01..06, on the send button only: saves the title and body, then posts them to `channel` as
  * the signed-in recorder. Resolves `sent`; on failure the meeting stays in `review` with the cause
- * in `error`. Never retried by itself: a resend could post twice. */
+ * in `error`. Never retried by itself: a resend could post twice. A `sent` meeting goes to another
+ * channel with its stored summary (`title` and `body` unused) and stays as it was on failure
+ * (plan 5.5-3..5). */
 export const sendToSlack = (
   id: string,
   channel: Channel,

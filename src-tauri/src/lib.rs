@@ -340,6 +340,7 @@ pub fn run() {
                 std::env::current_exe()?,
             ));
             app.manage(slack::Slack::default());
+            app.manage(audio::mix::Exports::default());
             // APP-03: a click on a notification shows the app on that meeting. Registered before
             // any is shown: the plugin reports clicks only on ones shown after a handler exists.
             let handle = app.handle().clone();
@@ -443,6 +444,7 @@ pub fn run() {
             commands::retry_summary,
             commands::list_connections,
             commands::export_markdown,
+            commands::export_recording,
             commands::slack_length,
             commands::send_to_slack,
             commands::slack_sign_in,

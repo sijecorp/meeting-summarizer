@@ -29,6 +29,7 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   retranscribe,
+  sentTo as isSentTo,
   setMeetingLanguage,
   SLACK_MAX,
   type Channel,
@@ -36,6 +37,7 @@ import {
   type Meta,
   type Progress,
   type Segment,
+  type Sent,
   type SlowReason,
   type Status,
 } from "@/lib/ipc";
@@ -660,6 +662,9 @@ function Gauge({ length }: { length: number }) {
   );
 }
 
+/** How long the send bar says where it went before it offers the channels again (plan 5.5-9). */
+export const SENT_SHOWN_MS = 2000;
+
 /** The send bar (design-system 6.6): a white pill where the dock sits, above it when both show. */
 export function SendBar({
   shown,
@@ -670,9 +675,13 @@ export function SendBar({
   inFlight,
   failed,
   canSend,
+  sent,
+  listFailed,
   sentTo,
   onChannel,
   onSend,
+  onSentShown,
+  onRetryList,
   onSetup,
 }: {
   shown: boolean;
@@ -686,22 +695,34 @@ export function SendBar({
   /** The last send failed (SND-06): the button sends again. */
   failed: boolean;
   canSend: boolean;
-  /** Sent while open: the button turns into where it went. */
+  /** A sent meeting's bar (plan 5.5-9): where it went already. It offers the other channels. */
+  sent?: Sent[];
+  /** The channels could not be read; a sent meeting's bar offers to read them again. */
+  listFailed?: boolean;
+  /** Sent while open: the button turns into where it went, then the channels come back. */
   sentTo?: string;
   onChannel: (id: string) => void;
   onSend: () => void;
+  onSentShown: () => void;
+  onRetryList: () => void;
   onSetup: () => void;
 }) {
   const over = Math.max(0, (length ?? 0) - SLACK_MAX);
+  const again = !!sent;
+  const noOther = !!sent && !!channels && !channels.some((c) => !isSentTo(sent, c));
+  // A sent meeting's bar holds only what it can do now: sign in, read the list again, or nothing.
+  const blocked = again && !sentTo && (!signedIn || !!listFailed || noOther);
   const label = sentTo
     ? `${sentTo}${ro(sentTo)} 보냄`
     : inFlight
       ? "보내는 중…"
       : failed
         ? "다시 보내기"
-        : channel
-          ? `#${channel.name}${ro(channel.name)} 보내기`
-          : "Slack으로 보내기";
+        : again
+          ? "보내기"
+          : channel
+            ? `#${channel.name}${ro(channel.name)} 보내기`
+            : "Slack으로 보내기";
   // Sent from the keyboard: `disabled` dropped the focus meanwhile, so it comes back when the send
   // ends, sent or failed.
   const button = useRef<HTMLButtonElement>(null);
@@ -711,10 +732,41 @@ export function SendBar({
     refocus.current = false;
     button.current?.focus();
   }, [inFlight]);
+  // Where it went shows for a moment, then the channels come back, none picked; the focus goes to
+  // them when it was in the bar.
+  const bar = useRef<HTMLDivElement>(null);
+  const picker = useRef<HTMLButtonElement>(null);
+  const back = useRef(false);
+  useEffect(() => {
+    if (!sentTo) {
+      if (back.current) picker.current?.focus();
+      back.current = false;
+      return;
+    }
+    const t = window.setTimeout(() => {
+      back.current = !!bar.current?.contains(document.activeElement);
+      onSentShown();
+    }, SENT_SHOWN_MS);
+    return () => window.clearTimeout(t);
+  }, [sentTo]);
   return (
     <AnimatePresence>
+      {/* Gate d12a: only while another channel is picked, never over the read-only summary. */}
+      {shown && again && channel && !sentTo && (
+        <motion.p
+          key="fixed"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: dur.small }}
+          className="rounded-full bg-surface px-3 py-1 text-caption text-ink-2"
+        >
+          보낸 요약은 고칠 수 없습니다. 다른 채널에도 같은 내용이 갑니다
+        </motion.p>
+      )}
       {shown && (
         <motion.div
+          ref={bar}
           key="send"
           // Slides up and down with the dock coming and going under it.
           layout="position"
@@ -727,47 +779,72 @@ export function SendBar({
         >
           <Present className="contents">
             {/* SND-04: the recorder's channels; none is picked for them the first time. */}
-            {!sentTo && signedIn && (
+            {!sentTo && signedIn && !blocked && (
               <Select value={channel?.id ?? ""} disabled={inFlight || !channels} onValueChange={onChannel}>
                 <SelectTrigger
+                  ref={picker}
                   aria-label="보낼 채널"
+                  title={channel ? `#${channel.name}` : undefined}
                   className="h-10 max-w-56 rounded-full border-transparent bg-transparent pl-4 hover:bg-sunken"
                 >
                   <SelectValue
-                    placeholder={!channels ? "채널 읽는 중…" : channels.length ? "채널 고르기" : "채널 없음"}
+                    placeholder={
+                      !channels ? "채널 읽는 중…" : again ? "다른 채널 고르기" : channels.length ? "채널 고르기" : "채널 없음"
+                    }
                   />
                 </SelectTrigger>
                 <SelectContent position="popper" side="top" className="max-h-80">
-                  {channels?.map((c) => (
-                    <SelectItem key={c.id} value={c.id}>
-                      {`#${c.name}`}
-                      {c.private && (
-                        <>
-                          <Lock aria-hidden className="size-3.5 text-ink-2" />
-                          <span className="sr-only">, 비공개 채널</span>
-                        </>
-                      )}
-                    </SelectItem>
-                  ))}
+                  {channels?.map((c) => {
+                    // Plan 5.5-9: where it went already cannot be picked again.
+                    const done = !!sent && isSentTo(sent, c);
+                    return (
+                      <SelectItem key={c.id} value={c.id} disabled={done}>
+                        {`#${c.name}`}
+                        {c.private && (
+                          <>
+                            <Lock aria-hidden className="size-3.5 text-ink-2" />
+                            <span className="sr-only">, 비공개 채널</span>
+                          </>
+                        )}
+                        {done && (
+                          <span className="text-ink-2">
+                            <span className="sr-only">,</span> 보냄
+                          </span>
+                        )}
+                      </SelectItem>
+                    );
+                  })}
                 </SelectContent>
               </Select>
+            )}
+            {blocked && signedIn && listFailed && (
+              <>
+                <span className="pl-3 text-label">Slack 채널 목록을 읽지 못했습니다</span>
+                <Button variant="ghost" size="sm" className="rounded-full" onClick={onRetryList}>
+                  다시 시도
+                </Button>
+              </>
+            )}
+            {blocked && signedIn && !listFailed && (
+              <span className="px-3 text-label text-ink-2">보낼 수 있는 다른 채널이 없습니다</span>
             )}
             {!sentTo && !signedIn && (
               <Button variant="link" size="sm" onClick={onSetup}>
                 Slack 로그인하기
               </Button>
             )}
-            {!sentTo && length != null && <Gauge length={length} />}
+            {!sentTo && !again && length != null && <Gauge length={length} />}
             {/* The warning in words too, from 90%, not only the ring's color (NFR-09). */}
-            {!sentTo && length != null && length / SLACK_MAX >= 0.9 && over === 0 && (
+            {!sentTo && !again && length != null && length / SLACK_MAX >= 0.9 && over === 0 && (
               <span className="text-label text-ink-2 tabular-nums">{`${(SLACK_MAX - length).toLocaleString("ko-KR")}자 남음`}</span>
             )}
-            {!sentTo && over > 0 && (
+            {!sentTo && !again && over > 0 && (
               <span className="text-label">{`${over.toLocaleString("ko-KR")}자를 줄여 주세요`}</span>
             )}
             {/* Named by `aria-label`: while the label swaps, both labels are in the button. */}
             <Button
               ref={button}
+              hidden={blocked}
               aria-label={label}
               className={cn("relative h-10 rounded-full px-4", sentTo && "bg-transparent text-ink hover:bg-transparent")}
               disabled={!sentTo && !canSend}

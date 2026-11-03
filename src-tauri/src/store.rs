@@ -55,6 +55,9 @@ pub struct Gap {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Sent {
     pub channel: String,
+    /// Plan 5.5-1: empty for a send from before 1.1.0, which is matched by `channel` instead.
+    #[serde(default)]
+    pub channel_id: String,
     pub at: String,
     pub edit_count: u32,
 }
@@ -107,6 +110,9 @@ pub struct Meta {
     /// Plan 5.6-2: the languages it is transcribed in, one or more in `lang::LANGS` order.
     #[serde(default = "lang::default_list")]
     pub languages: Vec<String>,
+    /// Plan 5.5-2: the sends after `sent` (which stays the first, for older apps), in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_sent: Vec<Sent>,
 }
 
 /// Plan 5.4, ENG15: the meeting's route does not resolve yet.
@@ -123,7 +129,7 @@ impl Meta {
     /// Plan 5.7-9: 2 only while it uses a 1.1.0 field, so an older app keeps every other meeting
     /// as before and leaves this one read-only instead of dropping the field.
     fn schema(&self) -> u32 {
-        if self.held || !lang::korean_only(&self.languages) {
+        if self.held || !lang::korean_only(&self.languages) || !self.also_sent.is_empty() {
             2
         } else {
             1
@@ -228,7 +234,7 @@ pub fn one_line(title: &str) -> String {
 
 /// `fs::rename`, tried again a few times on Windows: antivirus or the search indexer can hold a file
 /// open for a moment.
-fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut retries = 0;
     loop {
         match fs::rename(from, to) {
@@ -315,6 +321,7 @@ fn new_meta(
         held: false,
         chunks_total: 0,
         languages,
+        also_sent: Vec::new(),
     };
     meta.schema_version = meta.schema();
     meta
@@ -1142,6 +1149,47 @@ mod tests {
             })
             .unwrap();
         assert_eq!(english.schema_version, 2);
+    }
+
+    /// Plan 5.5-1·2, 5.7-9: a send to another channel is a 1.1.0 field; a send from before has no
+    /// `channel_id`.
+    #[test]
+    fn sends_to_other_channels_are_schema_2_and_old_sends_have_no_channel_id() {
+        let (_tmp, store) = store();
+        let id = put(&store, Sent).id;
+        let path = meta_path(&store, &id);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        json["sent"] = serde_json::json!({ "channel": "#a", "at": "t", "edit_count": 2 });
+        fs::write(&path, json.to_string()).unwrap();
+        let first = store.get(&id).unwrap().sent.unwrap();
+        assert_eq!((first.channel_id.as_str(), first.edit_count), ("", 2));
+
+        let again = super::Sent {
+            channel: "#b".into(),
+            channel_id: "C2".into(),
+            ..first
+        };
+        let meta = store
+            .update(&id, |m| {
+                m.also_sent.push(again.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(meta.schema_version, 2);
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            (&json["schema_version"], &json["also_sent"][0]["channel_id"]),
+            (&serde_json::json!(2), &serde_json::json!("C2"))
+        );
+        assert_eq!(store.get(&id).unwrap().also_sent, [again]);
+        let back = store
+            .update(&id, |m| {
+                m.also_sent.clear();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(back.schema_version, 1);
     }
 
     /// Plan 5.6-2: a meeting from before 1.1.0 has no `languages`: it is Korean. Lists go and come

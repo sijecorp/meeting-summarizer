@@ -1610,6 +1610,7 @@ pub(crate) mod tests {
             held: false,
             chunks_total: 0,
             languages: crate::transcribe::lang::default_list(),
+            also_sent: Vec::new(),
         }
     }
 

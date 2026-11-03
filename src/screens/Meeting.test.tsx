@@ -17,7 +17,7 @@ import type {
   Status,
 } from "../lib/ipc";
 import Meeting from "./Meeting";
-import { parseDoc } from "./MeetingParts";
+import { parseDoc, SENT_SHOWN_MS } from "./MeetingParts";
 import lines from "../../src-tauri/tests/fixtures/summary-lines.json";
 
 // Autosave state outlives the screen (one per meeting id), so each test opens a meeting of its own.
@@ -364,7 +364,7 @@ test("미정 is marked on a hidden mirror of the text, without touching the fiel
 });
 
 // SUM-10, eng review D8. REV-01: the transcript can still be read.
-test("no speech: a warning and no editor or send; only 전사 언어 바꾸기…, 전송 안 함 and 삭제 remain", async () => {
+test("no speech: a warning and no editor or send; only 녹음 파일 저장, 전사 언어 바꾸기…, 전송 안 함 and 삭제 remain", async () => {
   mock({ meta: meta({ no_speech: true, llm_connection: null, title: "" }), summary: "" });
 
   render(<Meeting id={id} {...props} />);
@@ -373,7 +373,12 @@ test("no speech: a warning and no editor or send; only 전사 언어 바꾸기�
   expect(screen.queryByRole("textbox")).toBeNull();
   expect(screen.getAllByRole("button").map((b) => b.textContent)).toEqual(["홈으로", "전사본", ""]);
   expect(screen.queryByRole("button", { name: /보내기$/ })).toBeNull();
-  expect((await menu()).getAllByRole("menuitem").map((i) => i.textContent)).toEqual(["전사 언어 바꾸기…", "전송 안 함", "삭제"]);
+  expect((await menu()).getAllByRole("menuitem").map((i) => i.textContent)).toEqual([
+    "녹음 파일 저장",
+    "전사 언어 바꾸기…",
+    "전송 안 함",
+    "삭제",
+  ]);
 });
 
 test("the 미정 list holds only the lines with 미정, and follows edits", async () => {
@@ -1022,6 +1027,197 @@ test("a sent meeting says where, when and how many edits, and is read-only", asy
   expect((await menu()).queryByRole("menuitem", { name: "전송 안 함" })).toBeNull();
 });
 
+// Plan 5.4: the recording as one WAV, from ⋯.
+test("녹음 파일 저장 sits after .md로 저장, shows without a summary, and hides while recording or deleting", async () => {
+  mock({ meta: meta(), summary: "요약" });
+  render(<Meeting id={id} {...props} />);
+  await screen.findByRole("button", { name: "고치기" });
+  expect((await menu()).getAllByRole("menuitem").map((i) => i.textContent)).toEqual([
+    "요약 복사",
+    ".md로 저장",
+    "녹음 파일 저장",
+    "전사 언어 바꾸기…",
+    "전송 안 함",
+    "삭제",
+  ]);
+  cleanup();
+
+  for (const status of ["recorded", "transcribe_failed", "recording", "deleting", "unknown"] as Status[]) {
+    mock({ meta: meta({ status, llm_connection: null }), summary: "" });
+    render(<Meeting id={id} {...props} />);
+    await screen.findByRole("button", { name: "더보기" });
+    const items = (await menu()).getAllByRole("menuitem").map((i) => i.textContent);
+    expect(items.includes("녹음 파일 저장"), status).toBe(!["recording", "deleting", "unknown"].includes(status));
+    cleanup();
+  }
+});
+
+test("녹음 파일 저장 says it is saving, waits, and names where it went; a cancel says nothing", async () => {
+  const replies: ((value: unknown) => void)[] = [];
+  const calls = mock({ meta: meta(), summary: "요약" }, (cmd) => {
+    if (cmd === "export_recording") return new Promise((resolve) => replies.push(resolve));
+  });
+  render(<Meeting id={id} {...props} />);
+  await screen.findByRole("button", { name: "고치기" });
+
+  await pick("녹음 파일 저장");
+  expect(await screen.findByText("녹음 파일 저장 중…")).toBeTruthy();
+  expect(disabled((await menu()).getByRole("menuitem", { name: "녹음 파일 저장" }))).toBe(true);
+  fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+  await act(async () => replies.shift()!({ path: "/Users/me/주간 회의.wav", mixed: true }));
+  const said = screen.getByText("녹음 파일(두 소리 합침)을 저장했습니다: /Users/me/주간 회의.wav");
+  expect(said.getAttribute("role")).toBe("status");
+
+  await pick("녹음 파일 저장");
+  await waitFor(() => expect(replies).toHaveLength(1));
+  await act(async () => replies.shift()!({ path: "/Users/me/가져온 녹음.wav", mixed: false }));
+  expect(screen.getByText("녹음 파일을 저장했습니다: /Users/me/가져온 녹음.wav")).toBeTruthy();
+
+  await pick("녹음 파일 저장");
+  await waitFor(() => expect(replies).toHaveLength(1));
+  await act(async () => replies.shift()!(null));
+  expect(screen.queryByText(/^녹음 파일/)).toBeNull();
+  expect(calls.filter((c) => c.cmd === "export_recording").map((c) => c.args.id)).toEqual([id, id, id]);
+});
+
+test("a recording that cannot be saved says why above the document", async () => {
+  for (const cause of [
+    "필요 약 115MB, 남은 공간 40MB. 다른 폴더를 골라 주세요",
+    "회의가 삭제되어 저장하지 못했습니다",
+    "녹음 파일을 쓰지 못했습니다: Permission denied (os error 13)",
+  ]) {
+    mock({ meta: meta(), summary: "요약" }, (cmd) => {
+      if (cmd === "export_recording") throw cause;
+    });
+    render(<Meeting id={id} {...props} />);
+    await screen.findByRole("button", { name: "고치기" });
+    await pick("녹음 파일 저장");
+    expect(await screen.findByText(cause)).toBeTruthy();
+    expect(screen.queryByText("녹음 파일 저장 중…")).toBeNull();
+    expect(disabled((await menu()).getByRole("menuitem", { name: "녹음 파일 저장" }))).toBe(false);
+    cleanup();
+  }
+});
+
+// Plan 5.5: more channels for a sent summary, as it is.
+const sentMeta = (...channels: [string, string][]) =>
+  meta({
+    status: "sent",
+    sent: { channel: channels[0][0], channel_id: channels[0][1], at: "2026-10-13T05:43:00Z", edit_count: 2 },
+    also_sent: channels.slice(1).map(([channel, channel_id], i) => ({
+      channel,
+      channel_id,
+      at: `2026-10-13T06:0${i}:00Z`,
+      edit_count: 2,
+    })),
+  });
+
+test("the meta line names two channels, and three or more open a list from the keyboard", async () => {
+  mock({ meta: sentMeta(["#회의록", "C1"], ["#개발", "C2"]), summary: "요약" });
+  render(<Meeting id={id} {...props} />);
+  expect(await screen.findByText(`#회의록, #개발로 보냄 · ${hhmm("2026-10-13T05:43:00Z")} · 수정 2곳`)).toBeTruthy();
+  cleanup();
+
+  mock({ meta: sentMeta(["#회의록", "C1"], ["#개발", "C2"], ["#경영", "G1"]), summary: "요약" });
+  render(<Meeting id={id} {...props} />);
+  const more = await screen.findByRole("button", { name: "#회의록 외 2곳에 보냄" });
+  expect(more.getAttribute("title")).toBeNull();
+  more.focus();
+  fireEvent.keyDown(more, { key: "Enter" });
+  fireEvent.click(more);
+  const list = within(await screen.findByRole("dialog", { name: "보낸 채널" }));
+  expect(list.getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+    `#회의록${hhmm("2026-10-13T05:43:00Z")}`,
+    `#개발${hhmm("2026-10-13T06:00:00Z")}`,
+    `#경영${hhmm("2026-10-13T06:01:00Z")}`,
+  ]);
+});
+
+test("a sent meeting's bar offers the other channels, says the summary is fixed while one is picked, and comes back after sending", async () => {
+  const at = "2026-10-13T06:10:00Z";
+  const calls = mock({ meta: sentMeta(["#회의록", "C1"]), summary: "요약" }, (cmd) => {
+    if (cmd === "send_to_slack")
+      return { ...sentMeta(["#회의록", "C1"]), also_sent: [{ channel: "#개발", channel_id: "C2", at, edit_count: 2 }] };
+  });
+  render(<Meeting id={id} {...props} />);
+
+  const picker = await screen.findByRole("combobox", { name: "보낼 채널" });
+  await waitFor(() => expect(picker.textContent).toBe("다른 채널 고르기"));
+  expect((await sendButton("보내기")).disabled).toBe(true);
+  expect(screen.queryByText(/^보낸 요약은 고칠 수 없습니다/)).toBeNull();
+  fireEvent.keyDown(picker, { key: "Enter" });
+  expect((await screen.findByRole("option", { name: "#회의록, 보냄" })).getAttribute("aria-disabled")).toBe("true");
+  fireEvent.click(screen.getByRole("option", { name: "#개발" }));
+  expect(screen.getByText("보낸 요약은 고칠 수 없습니다. 다른 채널에도 같은 내용이 갑니다")).toBeTruthy();
+
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  const send = await sendButton("보내기");
+  send.focus();
+  fireEvent.click(send);
+  expect(await screen.findByRole("button", { name: "#개발로 보냄" })).toBeTruthy();
+  expect(screen.getByText("#개발로 보냈습니다")).toBeTruthy();
+  expect(screen.queryByText(/^보낸 요약은 고칠 수 없습니다/)).toBeNull();
+  expect(calls.find((c) => c.cmd === "send_to_slack")?.args.channel).toEqual(CHANNELS[1]);
+  expect(await screen.findByText(`#회의록, #개발로 보냄 · ${hhmm("2026-10-13T05:43:00Z")} · 수정 2곳`)).toBeTruthy();
+
+  await tick(SENT_SHOWN_MS);
+  const back = await screen.findByRole("combobox", { name: "보낼 채널" });
+  expect(back.textContent).toBe("다른 채널 고르기");
+  expect(document.activeElement).toBe(back);
+  expect(screen.queryByText("#개발로 보냈습니다")).toBeNull();
+});
+
+test("a sent meeting with no other channel says so, and offers no button", async () => {
+  mock({ meta: sentMeta(["#회의록", "C1"], ["#개발", "C2"], ["#경영", "G1"]), summary: "요약" });
+  render(<Meeting id={id} {...props} />);
+  expect(await screen.findByText("보낼 수 있는 다른 채널이 없습니다")).toBeTruthy();
+  expect(screen.queryByRole("combobox", { name: "보낼 채널" })).toBeNull();
+  expect(screen.queryByRole("button", { name: /보내기$/ })).toBeNull();
+});
+
+test("a failed send to another channel keeps the channel for 다시 보내기, with the cause alone in the banner", async () => {
+  const cause = "채널이 없거나 보관됐습니다(channel_not_found). 다른 채널을 골라 주세요";
+  mock({ meta: sentMeta(["#회의록", "C1"]), summary: "요약" }, (cmd) => {
+    if (cmd === "send_to_slack") throw cause;
+  });
+  render(<Meeting id={id} {...props} />);
+
+  fireEvent.keyDown(await screen.findByRole("combobox", { name: "보낼 채널" }), { key: "Enter" });
+  fireEvent.click(await screen.findByRole("option", { name: "#개발" }));
+  fireEvent.click(await sendButton("보내기"));
+  expect(await screen.findByText(cause)).toBeTruthy();
+  expect((await sendButton("다시 보내기")).disabled).toBe(false);
+  expect(screen.getByRole("combobox", { name: "보낼 채널" }).textContent).toBe("#개발");
+  // A read after the send (its `slack://finished`) does not take the cause away.
+  await act(() => emit("slack://finished", id));
+  expect(screen.getByText(cause)).toBeTruthy();
+});
+
+test("a sent meeting's bar says when the channels cannot be read and reads them again", async () => {
+  let fail = true;
+  const calls = mock({ meta: sentMeta(["#회의록", "C1"]), summary: "요약" }, (cmd) => {
+    if (cmd === "slack_channels" && fail) throw "Slack 응답을 받지 못했습니다";
+  });
+  render(<Meeting id={id} {...props} />);
+
+  expect(await screen.findByText("Slack 채널 목록을 읽지 못했습니다")).toBeTruthy();
+  // Not in the banner: that is a failed send's alone.
+  expect(screen.queryByText(/Slack 응답을 받지 못했습니다/)).toBeNull();
+  fail = false;
+  fireEvent.click(screen.getByRole("button", { name: "다시 시도" }));
+  await waitFor(() => expect(screen.getByRole("combobox", { name: "보낼 채널" }).textContent).toBe("다른 채널 고르기"));
+  expect(calls.filter((c) => c.cmd === "slack_channels")).toHaveLength(2);
+});
+
+test("a sent meeting signed out of Slack offers the sign-in in its bar", async () => {
+  mock({ meta: sentMeta(["#회의록", "C1"]), summary: "요약" }, (cmd) =>
+    cmd === "get_settings" ? settings({ slack_team: null }) : undefined,
+  );
+  render(<Meeting id={id} {...props} />);
+  expect(await screen.findByRole("button", { name: "Slack 로그인하기" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /보내기$/ })).toBeNull();
+});
+
 // Before review (architecture 10.1).
 
 // Architecture 10.4: a transcript is outside text and must stay plain text.
@@ -1627,10 +1823,11 @@ test("while it runs, the dialog only offers 일시정지, and redraws with the c
   const { rerender } = render(<Meeting id={id} {...props} progress={running} />);
   const more = await screen.findByRole("button", { name: "더보기" });
   more.focus();
-  const item = (await menu()).getByRole("menuitem", { name: "전사 언어 바꾸기…" });
+  const items = await menu();
+  const item = items.getByRole("menuitem", { name: "전사 언어 바꾸기…" });
   expect(disabled(item)).toBe(false);
   fireEvent.keyDown(item, { key: "ArrowDown" });
-  fireEvent.keyDown(item, { key: "ArrowUp" });
+  fireEvent.keyDown(items.getByRole("menuitem", { name: "삭제" }), { key: "ArrowUp" });
   await waitFor(() => expect(document.activeElement).toBe(item));
   fireEvent.keyDown(item, { key: "Enter" });
 

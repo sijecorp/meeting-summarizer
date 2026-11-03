@@ -1,6 +1,17 @@
 import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent } from "react";
 import { createPortal } from "react-dom";
-import { Archive, ArrowLeft, Check, Copy, Ellipsis, FileDown, Languages, RotateCcw, Trash2 } from "lucide-react";
+import {
+  Archive,
+  ArrowLeft,
+  Check,
+  Copy,
+  Ellipsis,
+  FileAudio,
+  FileDown,
+  Languages,
+  RotateCcw,
+  Trash2,
+} from "lucide-react";
 import { AnimatePresence, motion, useIsPresent, useReducedMotion } from "motion/react";
 import {
   Banner,
@@ -30,6 +41,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -42,6 +54,7 @@ import {
   BUILTIN,
   connectionLabel,
   exportMarkdown,
+  exportRecording,
   getMeeting,
   getSettings,
   getTranscript,
@@ -54,6 +67,7 @@ import {
   saveSummary,
   SCHEMA_VERSION,
   sendToSlack,
+  sentAll,
   SLACK_MAX,
   slackChannels,
   slackLength,
@@ -67,6 +81,7 @@ import {
   type Status,
   type Channel,
   type Meta,
+  type Sent,
 } from "@/lib/ipc";
 import { swapVariants, TITLE_GLIDE_MS, titleMove } from "@/lib/motion";
 import { cn } from "@/lib/utils";
@@ -109,6 +124,33 @@ const startOf = (iso: string) => `${day(new Date(iso))} ${"일월화수목금토
 /** When it was sent: the time, and the day too when it was not the meeting's. */
 const sentAt = (at: string, start: string) =>
   new Date(at).toDateString() === new Date(start).toDateString() ? hhmm(at) : `${day(new Date(at))} ${hhmm(at)}`;
+
+/** Plan 5.5-8: where it went in the meta line. Three or more open a list of every channel and when
+ * it went there, from the keyboard too. */
+function SentChannels({ sent, start }: { sent: Sent[]; start: string }) {
+  const [first, second] = sent;
+  if (sent.length === 1) return `${first.channel}${ro(first.channel)} 보냄`;
+  if (sent.length === 2) return `${first.channel}, ${second.channel}${ro(second.channel)} 보냄`;
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button variant="ghost" size="sm" className="-my-2 px-1.5 text-caption text-ink-2 hover:text-ink">
+          {`${first.channel} 외 ${sent.length - 1}곳에 보냄`}
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="start" aria-label="보낸 채널" className="w-auto">
+        <ul className="space-y-1 text-label">
+          {sent.map((s) => (
+            <li key={s.channel + s.at} className="flex justify-between gap-4">
+              <span>{s.channel}</span>
+              <span className="text-ink-2 tabular-nums">{sentAt(s.at, start)}</span>
+            </li>
+          ))}
+        </ul>
+      </PopoverContent>
+    </Popover>
+  );
+}
 
 // Called within the click, as WebKit wants. The webview may have no clipboard or refuse it: either
 // way the recorder is told.
@@ -185,6 +227,8 @@ export default function Meeting({
   // A copy's result shows briefly where it was asked; the saved `.md` path stays.
   const [copied, setCopied] = useState<{ at: "summary" | "transcript"; text: string } | null>(null);
   const [exported, setExported] = useState("");
+  // Plan 5.4-6: a recording being saved; its menu item waits.
+  const [savingRecording, setSavingRecording] = useState(false);
   // SND-04: the recorder's channels, read once the send bar can show, and the one picked: the last
   // sent to while the recorder is still in it, else none until they pick.
   const [channels, setChannels] = useState<Channel[] | null>(null);
@@ -194,8 +238,11 @@ export default function Meeting({
   const [sending, setSending] = useState(false);
   // SND-06: why the last send failed, also when this screen opens again.
   const [sendError, setSendError] = useState("");
-  // Sent while open: the send bar stays to show where it went.
-  const [sentHere, setSentHere] = useState(false);
+  // Sent while open: the send bar shows where it went for a moment.
+  const [justSent, setJustSent] = useState("");
+  // Plan 5.5-9: a sent meeting's bar says the list failed and reads it again on request.
+  const [listFailed, setListFailed] = useState(false);
+  const [listTry, setListTry] = useState(0);
   // SUM-06: the connection picked for 요약 다시 실행, until then the default.
   const [chosen, setChosen] = useState("");
   const [asking, setAsking] = useState<"archive" | "delete" | "language" | null>(null);
@@ -274,9 +321,10 @@ export default function Meeting({
     const was = seen.current;
     seen.current = d.meta.status;
     setDetail(d);
-    // In review, `error` is only ever a failed send's (the queue clears it before review).
-    setSendError(d.meta.status === "review" ? (d.meta.error ?? "") : "");
-    if (was === "review" && d.meta.status === "sent") setSentHere(true);
+    // In review, `error` is only ever a failed send's (the queue clears it before review). A send to
+    // another channel never writes it (plan 5.5-5): its failure stays as this screen heard it.
+    if (d.meta.status === "review") setSendError(d.meta.error ?? "");
+    if (was === "review" && d.meta.status === "sent") setJustSent(d.meta.sent?.channel ?? "");
     if (fields.current || !REVIEWABLE.includes(d.meta.status)) return;
     fields.current = true;
     if (was && !REVIEWABLE.includes(was) && !reduce) setReveal(true);
@@ -448,6 +496,28 @@ export default function Meeting({
       () => {},
     );
   };
+  // Plan 5.4-6: the menu closes, so the header line says how it goes; a failure is a banner.
+  const saveRecording = () => {
+    setError("");
+    setExported("녹음 파일 저장 중…");
+    setSavingRecording(true);
+    exportRecording(id)
+      .then(
+        (saved) =>
+          setExported(
+            !saved
+              ? ""
+              : saved.mixed
+                ? `녹음 파일(두 소리 합침)을 저장했습니다: ${saved.path}`
+                : `녹음 파일을 저장했습니다: ${saved.path}`,
+          ),
+        (e) => {
+          setExported("");
+          setError(String(e));
+        },
+      )
+      .finally(() => setSavingRecording(false));
+  };
   // SND-05: only this click sends. A pending edit is saved first, and a failed save stops it.
   const send = () => {
     if (!createdAt) return;
@@ -462,7 +532,8 @@ export default function Meeting({
               seen.current = meta.status;
               setDetail((d) => d && { ...d, meta });
               setTitle(meta.title);
-              setSentHere(true);
+              const all = sentAll(meta);
+              setJustSent(all[all.length - 1]?.channel ?? "");
             },
             (e) => {
               setSendError(String(e));
@@ -515,32 +586,37 @@ export default function Meeting({
   const inFlight = sending || !!detail?.sending;
   // `sent`, `archived` and a newer app's meeting stay read-only; with no speech there is no text.
   const editable = meta?.status === "review" && !newer && loaded && !meta.no_speech;
+  // Plan 5.5-9: a sent summary can go to other channels as it is.
+  const resend = meta?.status === "sent" && !newer && loaded && !meta.no_speech;
   // Not while it arrives, nor while a send could change what is on disk.
   const canEdit = editable && !reveal && !inFlight;
   const over = Math.max(0, (length ?? 0) - SLACK_MAX);
-  const canSend = editable && !!channel && over === 0 && !inFlight;
+  const canSend = (editable ? over === 0 : resend) && !!channel && !inFlight;
   const signedIn = !!settings?.slack_team;
   const lastChannel = settings?.last_channel;
   useEffect(() => {
-    if (!editable || !signedIn) return;
+    if (!(editable || resend) || !signedIn) return;
     let live = true;
     slackChannels().then(
       (list) => {
         if (!live) return;
         setChannels(list);
-        setChannel((picked) => picked ?? list.find((c) => c.id === lastChannel) ?? null);
+        // A sent meeting's bar starts with none picked (plan 5.5-9).
+        setChannel((picked) => picked ?? (editable ? list.find((c) => c.id === lastChannel) : null) ?? null);
       },
       (e) => {
         if (!live) return;
         setChannels([]);
-        setError(`Slack 채널 목록을 읽지 못했습니다: ${e}`);
+        // Plan 5.5-9: in `sent` the bar says it; the banner is the failed send's alone.
+        if (editable) setError(`Slack 채널 목록을 읽지 못했습니다: ${e}`);
+        else setListFailed(true);
         rereadSettings();
       },
     );
     return () => {
       live = false;
     };
-  }, [editable, signedIn, lastChannel]);
+  }, [editable, resend, signedIn, lastChannel, listTry]);
   const transcribeFailed = meta?.status === "transcribe_failed" && now === null && !newer;
   const summaryFailed = meta?.status === "summarize_failed" && now === null && !newer;
   // Stopped after transcribing, with no place in line: its route does not resolve yet.
@@ -585,6 +661,8 @@ export default function Meeting({
   // Plan 5.6-24: not once sent, nor while recording (the recording screen changes it then).
   const relanguage =
     !!meta && !newer && !(["sent", "recording", "deleting", "unknown"] as Status[]).includes(meta.status);
+  // Plan 5.4-5: its sound, with or without a summary, once the recording is written.
+  const recordingFile = !!meta && !(["recording", "deleting", "unknown"] as Status[]).includes(meta.status);
 
   // The meta line (`caption`): when, how long, who recorded, where it was summarized (SUM-07),
   // where it went, and the autosave.
@@ -605,7 +683,10 @@ export default function Meeting({
         meta.status === "sent" && meta.sent && (
           <>
             <Check aria-hidden className="size-3.5 text-ok-line" />
-            {`${meta.sent.channel}${ro(meta.sent.channel)} 보냄 · ${sentAt(meta.sent.at, meta.created_at)} · 수정 ${meta.sent.edit_count}곳`}
+            <span>
+              <SentChannels sent={sentAll(meta)} start={meta.created_at} />
+              {` · ${sentAt(meta.sent.at, meta.created_at)} · 수정 ${meta.sent.edit_count}곳`}
+            </span>
           </>
         ),
         meta.status === "archived" && STATUS_LABEL.archived,
@@ -620,7 +701,7 @@ export default function Meeting({
   };
 
   return (
-    <main className={`mx-auto box-content max-w-doc px-8 pt-8 ${editable || sentHere ? "pb-20" : "pb-8"}`}>
+    <main className={`mx-auto box-content max-w-doc px-8 pt-8 ${editable || resend ? "pb-20" : "pb-8"}`}>
       <div className="flex items-center justify-between gap-3">
         <Button variant="ghost" size="sm" className="-ml-3 text-ink-2 hover:text-ink" onClick={onHome}>
           <ArrowLeft aria-hidden />
@@ -667,6 +748,12 @@ export default function Meeting({
                     </DropdownMenuItem>
                   </>
                 )}
+                {recordingFile && (
+                  <DropdownMenuItem disabled={savingRecording} onSelect={saveRecording}>
+                    <FileAudio aria-hidden />
+                    녹음 파일 저장
+                  </DropdownMenuItem>
+                )}
                 {/* Focusable while it runs too: the dialog says why it cannot change then. */}
                 {relanguage && (
                   <DropdownMenuItem disabled={inFlight} onSelect={() => setAsking("language")}>
@@ -680,7 +767,7 @@ export default function Meeting({
                     전송 안 함
                   </DropdownMenuItem>
                 )}
-                {(text || relanguage) && <DropdownMenuSeparator />}
+                {(text || relanguage || recordingFile) && <DropdownMenuSeparator />}
                 <DropdownMenuItem disabled={inFlight} onSelect={() => setAsking("delete")}>
                   <Trash2 aria-hidden className="text-danger-line" />
                   삭제
@@ -766,7 +853,7 @@ export default function Meeting({
         {error && <Banner kind="error">{error}</Banner>}
         {saveError && <Banner kind="error">{saveError}</Banner>}
         {/* SND-06: the cause; the send button turns into 다시 보내기, and 요약 복사 is in ⋯. */}
-        {editable && sendError && <Banner kind="error">{sendError}</Banner>}
+        {(editable || resend) && sendError && <Banner kind="error">{sendError}</Banner>}
         {newer && <Banner kind="warning">{NEWER_VERSION}</Banner>}
 
         {detail && reviewable && meta?.no_speech && (
@@ -989,7 +1076,7 @@ export default function Meeting({
           // A press here keeps the editor open (React events pass through the portal).
           <div className="contents" onPointerDown={() => (leaving.current = "bar")}>
             <SendBar
-            shown={present && !!text && (editable || sentHere)}
+            shown={present && !!text && (editable || resend)}
             signedIn={!!settings?.slack_team}
             channels={channels}
             channel={channel}
@@ -997,9 +1084,20 @@ export default function Meeting({
             inFlight={inFlight}
             failed={!!sendError}
             canSend={canSend}
-            sentTo={sentHere && meta?.status === "sent" ? meta.sent?.channel : undefined}
+            sent={resend && meta ? sentAll(meta) : undefined}
+            listFailed={listFailed}
+            sentTo={justSent || undefined}
             onChannel={(picked) => setChannel(channels?.find((c) => c.id === picked) ?? null)}
             onSend={send}
+            onSentShown={() => {
+              setJustSent("");
+              setChannel(null);
+            }}
+            onRetryList={() => {
+              setListFailed(false);
+              setChannels(null);
+              setListTry((n) => n + 1);
+            }}
             onSetup={() => onSetup("slack")}
             />
           </div>,

@@ -30,6 +30,7 @@ import {
   onModelDownload,
   resumeMeeting,
   SCHEMA_VERSION,
+  sentAll,
   startModelDownload,
   STATUS_LABEL,
   type MeetingItem,
@@ -163,9 +164,15 @@ function stateOf(m: MeetingItem, p: Progress | undefined, name: string, failure?
     return { mark: <span aria-hidden className="size-2 rounded-full bg-brand" />, text: STATUS_LABEL.review };
   }
   if (m.status === "sent") {
+    // Plan 5.5-11: the first channel, then how many more.
+    const [first, ...more] = sentAll(m);
     return {
       mark: <Check aria-hidden className="size-4 text-ok-line" />,
-      text: m.sent ? `${m.sent.channel}${ro(m.sent.channel)} 보냄` : STATUS_LABEL.sent,
+      text: !first
+        ? STATUS_LABEL.sent
+        : more.length
+          ? `${first.channel} 외 ${more.length}곳에 보냄`
+          : `${first.channel}${ro(first.channel)} 보냄`,
     };
   }
   if (FAILED.includes(m.status)) {

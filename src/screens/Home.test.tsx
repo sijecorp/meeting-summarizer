@@ -427,7 +427,10 @@ test("groups meetings into 지금 할 일 and days, each once", () => {
       at("보관 회의", "archived", 1, 15),
       at("검토 회의", "review", 2, 10),
       at("중단 회의", "recording", 3, 9, { interrupted: true }),
-      at("옛 회의", "sent", 9, 9),
+      at("옛 회의", "sent", 9, 9, {
+        sent: { channel: "#개발", channel_id: "C2", at: ago(9, 9), edit_count: 0 },
+        also_sent: [{ channel: "#회의록", channel_id: "C1", at: ago(9, 10), edit_count: 0 }],
+      }),
     ],
     [progress("전사 회의", { chunk: 1, chunks: 3, percent: 42 }), progress("대기 회의", { status: "recorded", position: 1 })],
   );
@@ -449,6 +452,8 @@ test("groups meetings into 지금 할 일 and days, each once", () => {
   // Under 지금 할 일, a meeting from another day says which.
   expect(within(screen.getByText("대기 회의").closest("li")!).getByText("어제")).toBeTruthy();
   expect(within(screen.getByText("보낸 회의").closest("li")!).getByText("#회의록으로 보냄")).toBeTruthy();
+  // Plan 5.5-11: the first channel, then how many more.
+  expect(within(screen.getByText("옛 회의").closest("li")!).getByText("#개발 외 1곳에 보냄")).toBeTruthy();
   expect(screen.getByRole("heading", { level: 2, name: "지금 할 일 6" })).toBeTruthy();
 });
 

@@ -1,5 +1,6 @@
 // `async` keeps file and keychain I/O off the main (UI) thread.
 use crate::QUIT_CONFIRMED;
+use crate::audio::mix::{self, Exports};
 use crate::audio::{self, AudioDevices, Recorder, RecordingState};
 use crate::queue::{Pause, Progress, Queue};
 use crate::settings::{self, LoadedSettings, SecretKind, Settings, SettingsStore};
@@ -117,11 +118,15 @@ pub fn delete_meeting(
     store: State<'_, Store>,
     recorder: State<'_, Recorder>,
     queue: State<'_, Queue>,
+    exports: State<'_, Exports>,
     id: String,
 ) -> Result<(), String> {
     // Delete step 2 (8.3): close the WAV files before the folder goes.
     recorder.stop(Some(&id));
-    let deleted = store.delete_with(&id, || queue.cancel(&id));
+    let deleted = store.delete_with(&id, || {
+        queue.cancel(&id);
+        exports.cancel(&id);
+    });
     crate::refresh_tray(&app);
     deleted
 }
@@ -789,6 +794,90 @@ pub async fn export_markdown(
     Ok(Some(path.display().to_string()))
 }
 
+/// Plan 5.4: where a recording was saved, and whether it is two tracks mixed into one.
+#[derive(Serialize)]
+pub struct SavedRecording {
+    path: String,
+    mixed: bool,
+}
+
+/// Plan 5.4: the recording as one WAV, the mix transcription hears. The save dialog opens here
+/// like `export_markdown`'s. `None` when the recorder cancels.
+#[tauri::command]
+pub async fn export_recording(
+    app: AppHandle,
+    id: String,
+) -> Result<Option<SavedRecording>, String> {
+    log::info!("{}", diag_line("export_recording", &[("id", id.clone())]));
+    let saved = save_recording(app, &id).await;
+    let result = match &saved {
+        Ok(Some(_)) => "ok".into(),
+        Ok(None) => "cancelled".into(),
+        Err(e) => format!("err:{e}"),
+    };
+    log::info!(
+        "{}",
+        diag_line("export_recording", &[("id", id), ("result", result)])
+    );
+    saved
+}
+
+async fn save_recording(app: AppHandle, id: &str) -> Result<Option<SavedRecording>, String> {
+    let (name, mixed) = {
+        let store = app.state::<Store>();
+        let meta = store.get(id)?;
+        mix::exportable(meta.status)?;
+        let mixed = store.dir_for(id)?.join("system.wav").exists();
+        (file_name(&recording_name(&meta)), mixed)
+    };
+    // Plan 5.4 (decided before building): an upload has one track, nothing was mixed.
+    let title = if mixed {
+        "녹음 파일 저장 (마이크와 시스템 소리를 합친 WAV)"
+    } else {
+        "녹음 파일 저장 (WAV)"
+    };
+    let dialog = app.clone();
+    // Blocks until the recorder answers, so not on an async worker.
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        dialog
+            .dialog()
+            .file()
+            .set_title(title)
+            .set_file_name(format!("{name}.wav"))
+            .add_filter("WAV", &["wav"])
+            .blocking_save_file()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let Some(path) = picked else {
+        return Ok(None);
+    };
+    let path = path.into_path().map_err(|e| e.to_string())?;
+    let id = id.to_string();
+    // Minutes of disk work, and a delete waits on it: off the async workers.
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<Exports>()
+            .export(&app.state::<Store>(), &id, &path)
+            .map(|()| {
+                Some(SavedRecording {
+                    path: path.display().to_string(),
+                    mixed,
+                })
+            })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Home's name for a meeting (`nameOf`): its title, else how long it is, as "42분 녹음".
+fn recording_name(meta: &Meta) -> String {
+    match meta.title.trim() {
+        "" if meta.duration_ms == 0 => "제목 없는 녹음".into(),
+        "" => format!("{} 녹음", slack::length_text(meta.duration_ms)),
+        title => title.into(),
+    }
+}
+
 /// The save dialog's suggested name: path separators, characters Windows refuses in a file name,
 /// and control characters become `_`.
 fn file_name(title: &str) -> String {
@@ -970,6 +1059,23 @@ mod tests {
             gone.contains("찾을 수 없습니다") && gone.contains("다른 연결"),
             "{gone}"
         );
+    }
+
+    /// Plan 5.4-1: as Home names it.
+    #[test]
+    fn a_recording_is_saved_under_its_title_or_its_length() {
+        let meta = |title: &str, duration_ms| Meta {
+            title: title.into(),
+            duration_ms,
+            ..serde_json::from_value(serde_json::json!({
+                "schema_version": 1, "id": "m", "title": "", "status": "sent", "created_at": "",
+            }))
+            .unwrap()
+        };
+        assert_eq!(recording_name(&meta(" 주간 회의 ", 0)), "주간 회의");
+        assert_eq!(recording_name(&meta("", 42 * 60_000)), "42분 녹음");
+        assert_eq!(recording_name(&meta("", 75 * 60_000)), "1시간 15분 녹음");
+        assert_eq!(recording_name(&meta("", 0)), "제목 없는 녹음");
     }
 
     #[test]

@@ -48,6 +48,12 @@ export const SCENARIOS = {
   languagesRecording: "녹음 중 전사 언어",
   // A mixed meeting waits for the detection model while a Korean one runs past it.
   languagesLid: "판별 모델 받는 중",
+  // Plan 5.7-15 여러 채널: the meta line with two and three channels, the sent meeting's bar (its
+  // sent channels, none left, a send that fails), and the bar signed out.
+  channels: "여러 채널",
+  channelsSignedOut: "여러 채널 (Slack 연결 끊김)",
+  // Plan 5.7-15 녹음 저장: saving takes a moment, an upload has one track, and a disk too full.
+  recordingFile: "녹음 파일 저장",
 } as const;
 export type Scenario = keyof typeof SCENARIOS;
 
@@ -298,6 +304,12 @@ let checking = false;
 /** The meeting whose next `set_meeting_language` fails once (design-system 8.7 적용 실패). */
 let flaky: string | null = null;
 
+/** Plan 5.4-3, 5.4 (decided before building): the `recordingFile` scenario's meetings that save to
+ * a full disk, and that hold one track. */
+const NO_ROOM = "공간 부족 회의";
+const ONE_TRACK = "가져온 녹음";
+/** Plan 5.5-5: the `channels` scenario's meeting whose next send fails. */
+const SEND_FAILS = "보내기 실패 회의";
 const find = (id: unknown) => {
   const m = meetings.find((x) => x.meta.id === id);
   if (!m) throw `회의를 찾을 수 없습니다: ${id}`;
@@ -662,6 +674,43 @@ export function reset(scenario: Scenario) {
     ];
   }
 
+  if (scenario === "recordingFile") {
+    meetings = [
+      summarized("주간 제품 회의", "review", at(0, 10, 0)),
+      summarized(ONE_TRACK, "sent", at(0, 9, 0), {
+        sent: { channel: "#회의록", channel_id: "C1", at: at(0, 9, 50).toISOString(), edit_count: 0 },
+      }),
+      summarized(NO_ROOM, "review", at(1, 14, 0)),
+      // No summary yet: it can be saved all the same.
+      stored("recorded", at(0, 15, 0), { duration_ms: 42 * 60_000 }),
+    ];
+  }
+
+  if (scenario === "channels" || scenario === "channelsSignedOut") {
+    if (scenario === "channelsSignedOut") settings.slack_team = settings.last_channel = null;
+    const sent = (channel: ipc.Channel, day: number, hour: number, minute: number) => ({
+      channel: `#${channel.name}`,
+      channel_id: channel.id,
+      at: at(day, hour, minute).toISOString(),
+      edit_count: 2,
+    });
+    const [dev, board, notes] = CHANNELS;
+    meetings = [
+      summarized("주간 제품 회의", "sent", at(0, 10, 0), { sent: sent(notes, 0, 10, 50) }),
+      // Its next send fails (SND-06): the channel stays picked for 다시 보내기.
+      summarized(SEND_FAILS, "sent", at(0, 9, 0), { sent: sent(notes, 0, 9, 40) }),
+      summarized("채용 회의", "sent", at(1, 14, 0), {
+        sent: sent(notes, 1, 14, 52),
+        also_sent: [sent(dev, 1, 15, 3)],
+      }),
+      // Every channel: nothing left to send to; its meta line opens the list.
+      summarized("분기 계획 회의", "sent", at(2, 11, 0), {
+        sent: sent(notes, 2, 11, 48),
+        also_sent: [sent(dev, 2, 12, 2), sent(board, 3, 9, 15)],
+      }),
+    ];
+  }
+
   timers.push(setInterval(tick, 700), setInterval(levels, 40));
 }
 
@@ -919,9 +968,16 @@ function levels() {
 
 // ----- commands -----
 
+/** `value` after `ms`; a throw in it rejects, as a command's error does. */
 const later = <T>(ms: number, value: () => T) =>
-  new Promise<T>((resolve) => {
-    const timer = setTimeout(() => resolve(value()), ms);
+  new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      try {
+        resolve(value());
+      } catch (e) {
+        reject(e);
+      }
+    }, ms);
     timers.push(timer);
   });
 const oneLine = (title: string) => title.replace(/\p{Cc}+/gu, " ");
@@ -960,6 +1016,7 @@ type Commands = {
   retry_summary: typeof ipc.retrySummary;
   list_connections: typeof ipc.listConnections;
   export_markdown: typeof ipc.exportMarkdown;
+  export_recording: typeof ipc.exportRecording;
   slack_length: typeof ipc.slackLength;
   send_to_slack: typeof ipc.sendToSlack;
   slack_sign_in: typeof ipc.slackSignIn;
@@ -1152,6 +1209,13 @@ const handlers: Handlers = {
   },
   list_connections: connections,
   export_markdown: (a) => `/Users/hong/Documents/${find(a.id).meta.title || a.id}.md`,
+  export_recording: (a) => {
+    const meta = find(a.id).meta;
+    return later(1500, () => {
+      if (meta.title === NO_ROOM) throw "필요 약 115MB, 남은 공간 40MB. 다른 폴더를 골라 주세요";
+      return { path: `/Users/hong/Documents/${meta.title || "42분 녹음"}.wav`, mixed: meta.title !== ONE_TRACK };
+    });
+  },
 
   slack_length: (a) => {
     const meta = find(a.id).meta;
@@ -1163,21 +1227,29 @@ const handlers: Handlers = {
   send_to_slack: (a) => {
     const m = find(a.id);
     if (m.sending) throw "이 회의를 이미 보내고 있습니다";
-    m.meta.title = oneLine(a.title as string);
-    m.summary = a.body as string;
+    const channel = a.channel as ipc.Channel;
+    // Plan 5.5-3..5: a sent meeting goes elsewhere as it is, and stays as it was when that fails.
+    const again = m.meta.status === "sent" && m.meta.sent;
+    if (!again) {
+      m.meta.title = oneLine(a.title as string);
+      m.summary = a.body as string;
+    }
     m.sending = true;
     return later(1000, () => {
-      const lines = new Set(m.generated.split("\n"));
-      Object.assign(m.meta, {
-        status: "sent",
-        error: null,
-        sent: {
-          channel: `#${(a.channel as ipc.Channel).name}`,
-          at: new Date().toISOString(),
-          edit_count: m.summary.split("\n").filter((l) => !lines.has(l)).length,
-        },
-      });
       m.sending = false;
+      if (again && m.meta.title === SEND_FAILS) {
+        send("slack://finished", a.id);
+        throw "채널이 없거나 보관됐습니다(channel_not_found). 다른 채널을 골라 주세요";
+      }
+      const lines = new Set(m.generated.split("\n"));
+      const sent = {
+        channel: `#${channel.name}`,
+        channel_id: channel.id,
+        at: new Date().toISOString(),
+        edit_count: again ? again.edit_count : m.summary.split("\n").filter((l) => !lines.has(l)).length,
+      };
+      if (again) m.meta.also_sent = [...(m.meta.also_sent ?? []), sent];
+      else Object.assign(m.meta, { status: "sent", error: null, sent });
       settings.last_channel = (a.channel as ipc.Channel).id;
       send("slack://finished", a.id);
       return clone(m.meta);
