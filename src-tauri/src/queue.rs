@@ -3276,11 +3276,36 @@ mod tests {
                 while !done() {
                     assert!(
                         Instant::now() < until,
-                        "timed out: {what}; queue {:?}",
-                        self.queue().snapshot()
+                        "timed out: {what}; queue {:?}; meetings {:#?}",
+                        self.queue().snapshot(),
+                        self.meetings()
                     );
                     thread::sleep(Duration::from_millis(10));
                 }
+            }
+
+            /// Each meeting's status, error and files, so a timeout explains itself.
+            fn meetings(&self) -> Vec<(String, Status, Option<String>, Vec<String>)> {
+                let store = self.store();
+                let files = |id: &str| -> Vec<String> {
+                    let dir = store.dir_for(id).ok().and_then(|d| fs::read_dir(d).ok());
+                    let mut names: Vec<_> = dir
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect();
+                    names.sort();
+                    names
+                };
+                store
+                    .list()
+                    .into_iter()
+                    .map(|m| {
+                        let names = files(&m.id);
+                        (m.id, m.status, m.error, names)
+                    })
+                    .collect()
             }
 
             /// A transcribe worker of `id` is alive.
@@ -3361,6 +3386,9 @@ mod tests {
                 self.store()
                     .update(&id, |m| {
                         m.status = Status::Transcribed;
+                        // Its one chunk done: at 0 a stopped summary is `paused` but not summary
+                        // only (`summary_only`), so it would transcribe again.
+                        (m.chunks_done, m.chunks_total) = (1, 1);
                         m.llm_connection = pinned.map(String::from);
                         Ok(())
                     })
@@ -4192,6 +4220,8 @@ mod tests {
 
             f.queue().recording_finished();
             f.wait("review", || f.status(&id) == Status::Review);
+            // Only the summary ran again: no worker, which is `sh` here and fails on Windows.
+            assert!(!f.store().dir_for(&id).unwrap().join("worker.log").exists());
             let asked = fs::read_to_string(f.tmp.path().join("engine/models/asked.log"));
             assert_eq!(f.asked(), 2, "{asked:?}");
             let meta = f.store().get(&id).unwrap();
@@ -4375,6 +4405,7 @@ mod tests {
             );
             f.wait("review", || f.status(&id) == Status::Review);
             assert!(!f.store().get(&id).unwrap().held);
+            assert!(!f.store().dir_for(&id).unwrap().join("worker.log").exists());
             f.engine_gone();
         }
 
