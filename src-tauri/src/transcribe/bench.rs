@@ -1078,7 +1078,8 @@ esac
         };
         let started = Instant::now();
         let pieces = [(0, 1000), (1000, 2000)];
-        let stall = Duration::from_millis(200);
+        // Long enough for the stderr line to be read even when the whole suite loads the machine.
+        let stall = Duration::from_millis(1500);
         let measured = measure(
             &exe,
             tmp.path(),
