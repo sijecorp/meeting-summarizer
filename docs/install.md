@@ -132,6 +132,7 @@ IT 담당자용:
 |---|---|---|---|
 | 전사 모델 | `ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q8_0.bin` | 874188075 | `317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1` |
 | 음성 구간 감지(VAD) 모델 | `ggml-org/whisper-vad/resolve/9ffd54a1e1ee413ddf265af9913beaf518d1639b/ggml-silero-v6.2.0.bin` | 885098 | `2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987` |
+| 언어 판별 모델(회의에 언어를 둘 이상 고를 때만 필요, 1.1.0) | `ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-tiny.bin` | 77691713 | `be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21` |
 | 요약 모델 | `unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q4_K_M.gguf` | 2497281120 | `3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597` |
 
 - 앱은 받기 전에 서버가 알려 준 전체 크기를 위 크기와 비교하고, 다르면 받지 않고 그 주소를 오류에 적습니다. 다 받은 뒤에는 sha256을 확인합니다.

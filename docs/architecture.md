@@ -75,6 +75,7 @@ src-tauri/src/
     model.rs         모델 다운로드·가져오기·검증
     engine.rs        whisper-rs 실행, 백엔드·GPU 선택, 진단 줄, VAD 기반 10분 구간 나누기
     bench.rs         전사 실측(`--transcribe-bench`): 조합마다 워커를 띄워 회의 폴더의 `bench.tsv`에 한 줄씩
+    lang.rs          전사 언어 표(코드, 화면 이름, 환각 문구 파일, 토큰 비율), 언어 목록 검사 (1.1.0)
     filter.rs        환각 필터, 비정상 결과 검사 (순수 로직)
   summarize.rs       OpenAI 호환 클라이언트, 연결 고르기, 프롬프트, 구간 요약, 실패 분류, 요약 eval(12.3)
   sidecar.rs         이 PC 요약 엔진(`llama-server`)의 감독·띄우기·끄기·다시 띄우기, 내장 실패 문구 (6.6)
@@ -202,6 +203,7 @@ for 각 20ms 프레임:
 - **회의 만들기**: 먼저 `meetings/.import-{시각}.wav`에 풀고, 다 풀리면 `Store::import`가 회의 폴더를 만들어 그 파일을 `mic.wav`로 옮긴 뒤(같은 볼륨의 이름 바꾸기) `meta.json`을 `recorded`로 마지막에 쓴다. 그래서 대기열은 오디오 없는 회의를 만나지 않는다. 실패하면 임시 파일과 폴더를 지운다. 풀다가 앱이 꺼지면 남은 임시 파일은 다음 시작의 복구(8.4)가 지운다.
 - **회의 시작** (`created_at`): 녹음기는 끝날 때 파일을 저장하므로, 파일의 마지막 수정 시각(지금보다 늦으면 지금)에서 길이를 뺀다. 다운로드한 파일은 받은 시각이 기준이 된다. 홈 목록 순서와 Slack 머리말의 일시가 이것을 따른다. id는 지금 시각으로 만든다(겹치지 않게).
 - **두 입구** (`App.tsx`): 홈의 버튼은 파일 고르기 창(`plugin-dialog`), 창 어디에나 놓는 것은 웹뷰의 파일 드롭 이벤트(`getCurrentWebview().onDragDropEvent`, `dragDropEnabled` 기본값)다. 끌고 들어온 파일 중 녹음 파일(확장자, `isRecordingFile`)이 있으면 창 전체에 "놓으면 녹음 파일을 가져옵니다"를 보이고, 놓으면 녹음 파일만 순서대로 하나씩 `import_recording`한다. 녹음 파일이 하나도 없으면 "녹음 파일만 가져올 수 있습니다: …"다. 가져오기 상태는 App이 쥔다(여러 번 겹칠 수 있어 수로 센다). 하나만 가져왔고 그때 홈이면 그 회의 문서를 연다. 설정 화면처럼 다른 화면에 있으면 그대로 둔다(저장하지 않은 설정을 버리지 않게).
+- `import_recording(path, languages)`는 새 회의의 `languages`를 받는다(1.1.0). 화면은 파일을 가져오거나 놓은 뒤 처리 전에 전사 언어 대화상자("가져와서 전사", 설정의 기본 목록이 미리 골라짐)를 띄우고, 취소하면 가져오지 않는다. 언어 코드는 같은 검사를 거친다(5.3).
 - `import_recording`은 blocking 스레드에서 돈다(1시간 파일을 푸는 데 몇 초). 파일을 얼마나 읽었는지(바이트, 컨테이너마다 프레임 수를 주지는 않는다)를 퍼센트가 바뀔 때마다 `import://progress` `{ name, percent }`로 보낸다. 독이 그동안 "녹음 파일 가져오기 · {파일 이름} · 가져오는 중 N%"를 보인다(처리 중보다 앞선다). "로컬로 요약"은 녹음처럼 설정의 기본값으로 시작한다(SUM-08). 녹음 중에 가져오면 대기열에 들어가 녹음이 끝나기를 기다린다(TRN-09).
 
 ## 5. 전사
@@ -216,7 +218,7 @@ for 각 20ms 프레임:
 | 원본(선택) | `ggerganov/whisper.cpp` / `ggml-large-v3-turbo.bin` | 1,624,555,275 B | `1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69` |
 | CPU 폴백 후보 **[S2]** | `ggerganov/whisper.cpp` / `ggml-medium-q5_0.bin` | 539,212,467 B | `19fea4b380c3a618ec4723c3eef2eb785ffba0d0538cf43f8f235e7b3b34220f` |
 | VAD | `ggml-org/whisper-vad` / `ggml-silero-v6.2.0.bin` | 885,098 B | `2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987` |
-| 개발·시험용 | `ggerganov/whisper.cpp` / `ggml-tiny.bin` | 77,691,713 B | `be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21` (2026-10-14 확인) |
+| 언어 판별(1.1.0), 개발·시험용 | `ggerganov/whisper.cpp` / `ggml-tiny.bin` | 77,691,713 B | `be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21` (2026-10-14 확인). 언어가 둘 이상인 회의에서 조각마다 언어를 가리는 데 쓴다(5.3). 한국어만 쓰는 회의는 받지 않아도 된다 |
 | 요약 모델 (M6.5, D7) | `unsloth/Qwen3-4B-Instruct-2507-GGUF` / `Qwen3-4B-Instruct-2507-Q4_K_M.gguf` | 2,497,281,120 B | `3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597` |
 
 - 요약 모델은 Qwen3-4B-Instruct-2507(D7, 2026-10-19)이다. 처음의 Qwen3.5-4B는 긴 회의에서 같은 줄을 반복하다 구간 제한에 걸려 요약을 자주 내지 못했다. 이 PC 요약 엔진의 최대 메모리(RSS)는 M5 Mac 실측으로 짧은 회의 약 3.8GB, 1시간 분량 약 5.1GB다(q8_0 KV, 6.6). 16GB Windows 노트북에서는 전사가 끝난 뒤에 돌지만(8.4) 다른 앱과 합쳐 여유가 있는지 7단계에서 본다.
@@ -245,7 +247,7 @@ for 각 20ms 프레임:
 3. 구간마다 워커를 띄워 Whisper를 실행한다. VAD상 음성이 0인 구간은 워커를 띄우지 않고 빈 결과로 둔다.
    - **VAD는 워커가 직접 한다.** whisper.cpp는 VAD 단계(음성만 잘라 이어 붙이기)를 `whisper_full` 안에서만 한다. whisper-rs 0.16의 `WhisperState::full`은 `whisper_full_with_state`를 불러 이 단계를 건너뛰므로, `enable_vad`만 켜면 무음과 잡음까지 전사한다(tiny 모델로 잡음을 넣으면 "MBC 뉴스 …입니다"가 나왔다). 그래서 워커가 같은 Silero 모델(기본 파라미터)로 구간의 음성을 찾고, whisper.cpp와 같은 방식으로 이어 붙인다(구간마다 뒤로 0.1초 더, 사이에 0.1초 무음). 세그먼트 시각은 원래 녹음 시각으로 되돌린다. 음성이 없으면 Whisper 모델을 불러오지 않는다.
    - 시각 되돌리기는 일부러 whisper.cpp와 다르다. whisper.cpp는 이어 붙인 오디오와 원래 오디오 사이를 선형으로 보간한다. 여기서는 음성 조각 안에서는 1:1로 옮기고, 조각 사이(잘라 낸 무음 자리)에 떨어진 시각은 가까운 발화 쪽으로 붙인다. 세그먼트 시작은 다음 조각의 시작으로, 끝은 앞 조각의 끝으로 간다. 그래서 세그먼트가 잘라 낸 무음만큼 일찍 시작하거나 늦게 끝나지 않는다.
-   - 파라미터: `language="ko"`, 위의 VAD, `no_context=true`, `suppress_nst=true`, `temperature` 폴백 기본값 유지, flash attention(1.0.3). flash attention은 UI 없는 설정 키 `transcribe_flash_attn`(기본 true)을 대기열이 `--fa`로 넘기므로, 어떤 GPU에서 결과가 이상하면 `settings.json`만 고쳐 끈다.
+   - 파라미터: `language`(회의의 전사 언어, 기본 `ko`, 5.3의 `--lang`과 "언어"), 위의 VAD, `no_context=true`, `suppress_nst=true`, `temperature` 폴백 기본값 유지, flash attention(1.0.3). flash attention은 UI 없는 설정 키 `transcribe_flash_attn`(기본 true)을 대기열이 `--fa`로 넘기므로, 어떤 GPU에서 결과가 이상하면 `settings.json`만 고쳐 끈다.
    - 샘플링은 beam search(beam 5)다. S2가 쓰는 `whisper-cli`의 기본값과 같아야 S2의 속도·정확도가 앱에 그대로 맞는다.
    - 스레드 수는 논리 CPU의 절반이다. 워커가 2개까지 동시에 돌기 때문이다(TRN-01). SMT 기기에서는 물리 코어 수, Apple Silicon에서는 코어의 절반이다.
    - beam과 스레드 수의 기본값은 전사 실측(5.3) 뒤에 다시 정한다(계획 5.1-15). 워커 플래그로는 이미 바꿀 수 있다.
@@ -265,6 +267,7 @@ queue.rs ──spawn── 앱 실행 파일 --transcribe-worker {회의 폴더}
    ▲                    │ stdout: JSON 한 줄씩
    │                    │   {"type":"device","device":"gpu","name":"NVIDIA GeForce RTX 3050"}
    │                    │   {"type":"progress","pct":42}
+   │                    │   {"type":"detecting","on":true}   (언어가 둘 이상일 때 조각마다 언어를 가리는 동안)
    │                    │   {"type":"diag","line":"chunk device=gpu gpu=\"NVIDIA …\" … rtf=0.120 …"}
    │                    │   {"type":"result","device":"gpu","segments":[{"start_ms","end_ms","text"}]}
    └──── 종료 코드 ─────┘ 0 = 정상, 그 외 = 실패/크래시
@@ -276,8 +279,8 @@ queue.rs ──spawn── 앱 실행 파일 --plan-chunks {회의 폴더} {VAD 
 
 - 워커 인자는 회의 id 대신 경로를 받는다. 워커는 Tauri 앱을 띄우지 않으므로 앱 데이터 폴더를 알 수 없고, 알 필요도 없다. `main.rs`가 Tauri 빌더보다 먼저 인자를 보므로 워커는 창을 열지 않고 단일 실행 검사에도 걸리지 않는다.
 - `result`의 `device`는 실제로 돈 장치다. GPU 컨텍스트를 만들지 못하면 워커가 CPU로 바꿔 `cpu`를 보낸다(5.4).
-- **선택 플래그** (1.0.3, 계획 5.1-1): `--lang`(기본 `ko`), `--beam <1..8>`(5, 1은 greedy), `--threads <n>`(논리 CPU의 절반), `--fa <0|1>`(1), `--gpu-device <n>`(자동, 5.4). 플래그를 빼면 `engine.rs` 한 곳의 제품 기본값이다. 모르는 플래그, 중복, 범위 밖 값, 값 없는 플래그는 종료 코드 `2`와 새 인자까지 담은 사용법 문구로 끝난다. 대기열은 `--lang ko --beam 5 --threads <절반> --fa <설정>`을 넘기고 GPU는 워커가 고른다.
-- **장치 줄과 진단 줄** (계획 5.1-3, 5.1-4): 모델을 불러온 직후 `device` 줄(실제 장치와 고른 GPU 이름, GPU를 하나도 못 찾았으면 빈 값)을, 결과 줄 바로 앞에 `diag` 줄을 낸다. 진단 줄은 `chunk` 뒤에 `key=value`이고, 공백이나 따옴표가 있는 값은 큰따옴표로 감싸며 안의 `"`·`\`는 백슬래시로 막는다. 키: `device gpu gpus gpu_device threads beam fa lang audio_s speech_s load_s run_s rtf power saver ecoqos`(단위는 키 이름의 `_s`). macOS는 `power=? saver=? ecoqos=-`다. 대기열은 이 줄에 회의 id와 앱 버전을 붙여 `app.log`에 옮긴다(8.1).
+- **선택 플래그** (1.0.3, 계획 5.1-1): `--lang`(쉼표로 나눈 언어 목록, 기본 `ko`, 아래 "언어"), `--lid-model <파일>`(언어가 둘 이상일 때만, 아래), `--beam <1..8>`(5, 1은 greedy), `--threads <n>`(논리 CPU의 절반), `--fa <0|1>`(1), `--gpu-device <n>`(자동, 5.4). 플래그를 빼면 `engine.rs` 한 곳의 제품 기본값이다. 모르는 플래그, 중복, 범위 밖 값, 값 없는 플래그는 종료 코드 `2`와 새 인자까지 담은 사용법 문구로 끝난다. 대기열은 `--lang <meta.languages> --beam 5 --threads <절반> --fa <설정>`을 넘기고(언어가 둘 이상이면 `--lid-model`도), GPU는 워커가 고른다. 대기열은 구간 워커를 띄울 때마다 디스크의 `meta.languages`를 읽는다. 코드 검사에 걸리면 `["ko"]`로 고쳐 쓰고 `app.log`에 남긴다(1.1.0).
+- **장치 줄과 진단 줄** (계획 5.1-3, 5.1-4): 모델을 불러온 직후 `device` 줄(실제 장치와 고른 GPU 이름, GPU를 하나도 못 찾았으면 빈 값)을, 결과 줄 바로 앞에 `diag` 줄을 낸다. 진단 줄은 `chunk` 뒤에 `key=value`이고, 공백이나 따옴표가 있는 값은 큰따옴표로 감싸며 안의 `"`·`\`는 백슬래시로 막는다. 키: `device gpu gpus gpu_device threads beam fa langs runs lid_s pieces lid_margin audio_s speech_s load_s run_s rtf power saver ecoqos`(단위는 키 이름의 `_s`). macOS는 `power=? saver=? ecoqos=-`다. 대기열은 이 줄에 회의 id와 앱 버전을 붙여 `app.log`에 옮긴다(8.1).
 - **EcoQoS 끄기 (Windows, 계획 5.1-7)**: 워커는 시작하자마자 자기 프로세스에 `SetProcessInformation(ProcessPowerThrottling)`으로 실행 속도 조절(EcoQoS)을 끄고 결과(`ok`, `err:N`)를 진단 줄 `ecoqos`에 남긴다. 앱 프로세스도 시작할 때 자기에게, 그리고 띄운 `llama-server`에 같은 설정을 건다. Windows가 효율 코어와 낮은 클럭으로 옮기지 않게 하려는 것이다. 우선순위는 바꾸지 않고, 실패는 로그만 남기고 계속한다.
 - 워커는 stdin을 읽고 있다가 닫히면(앱이 크래시·강제 종료됨) 바로 끝난다. 자식 프로세스는 부모가 죽어도 남기 때문에, 이게 없으면 다시 켠 앱의 새 워커 옆에서 남은 워커가 GPU와 메모리를 계속 쓴다. 이 감시는 `--plan-chunks`·`--transcribe-worker`에만 있다. 전사 실측은 앱이 띄우지 않고, Windows GUI 프로그램에는 stdin이 아예 없다.
 - Windows는 `CREATE_NO_WINDOW`로 띄워 콘솔 창이 뜨지 않게 한다.
@@ -289,10 +292,19 @@ queue.rs ──spawn── 앱 실행 파일 --plan-chunks {회의 폴더} {VAD 
 - **동시 실행** (TRN-01, 사용자 결정 2026-10-14): 워커 프로세스는 회의 2개까지 동시에 돈다(요약 모델이 설치돼 있으면 1개, 8.4). 나머지 회의는 대기열에서 들어온 순서(FIFO)대로 기다리고, 화면에 대기 순서를 보여 준다. 워커마다 모델을 따로 올리므로 메모리 사용이 두 배다. 8GB 기기에서 문제가 되는지 파일럿에서 본다.
 - 워커는 구간 하나를 처리하고 끝난다. 모델 로딩(수 초)은 구간마다 반복되지만, 구간이 10분 분량이라 비중이 작다.
 - 결과는 부모(`queue.rs`)가 받아 `transcript.partial.jsonl`에 쓴다. 워커는 회의 폴더의 오디오를 읽기만 한다.
-- **중단**: 녹음이 시작되면 부모가 실행 중인 워커 프로세스를 모두 kill한다. 그 구간의 결과는 버리고, 녹음이 끝나면 회의마다 그 구간부터 다시 처리한다. abort 콜백에 기대지 않는다. kill하기 전에 "멈춘 이유"(녹음, 삭제, 종료)를 먼저 기록하므로 kill은 크래시로 세지 않는다. 멈춘 회의는 `paused`로 기록하고 대기열 맨 앞으로 돌아간다(원래 순서대로). 워커 스레드가 끝나기 전에는 같은 회의를 다시 시작하지 않는다.
+- **중단**: 멈춤 이유(`Stop`)는 `Recording < Quit < User < Delete` 순서이고 낮은 이유가 높은 이유를 덮지 않는다(삭제가 늘 이긴다). `User`는 회의 문서의 "일시정지"(`pause_meeting`)다: 워커를 kill하고 `meta.held`를 쓰며, 끝나면 `paused`로 기록하고 줄에 넣지 않는다(8.3). 녹음이 시작되면 부모가 실행 중인 워커 프로세스를 모두 kill한다. 그 구간의 결과는 버리고, 녹음이 끝나면 회의마다 그 구간부터 다시 처리한다. abort 콜백에 기대지 않는다. kill하기 전에 "멈춘 이유"(녹음, 삭제, 종료)를 먼저 기록하므로 kill은 크래시로 세지 않는다. 멈춘 회의는 `paused`로 기록하고 대기열 맨 앞으로 돌아간다(원래 순서대로). 워커 스레드가 끝나기 전에는 같은 회의를 다시 시작하지 않는다.
 - 워커의 stderr는 회의 폴더의 `worker.log`에 덧붙인다(크래시 원인 확인용). 실행마다 `--- {인자} ---` 줄을 먼저 쓴다. 실패 원인으로는 그 머리줄을 뺀 마지막 줄을 보여 준다.
 - **종료 코드 계약**: `0` 정상, `2` 입력·파일 오류(오디오 없음, 인자 오류), `3` 모델 로드 실패(파일 손상·경로 오류), 그 외 코드나 시그널 종료는 **크래시**. 5.4의 GPU 실패 판정은 크래시(무응답 감시로 kill한 것 포함)만 센다. `2`·`3`은 GPU와 무관하므로 바로 `transcribe_failed`로 바꾸고 원인을 보여준다(`3`이면 해시를 확인해 "모델 다시 받기" 또는 메모리 안내, 5.1).
   - 대기열이 보내지 않은 SIGKILL(macOS 메모리 부족 시 OS가 보냄)은 크래시로 세지 않는다. 그 회의만 `transcribe_failed`로 바꾸고 "메모리가 부족해 전사가 중단되었습니다"를 보여 준다. `gpu_failed`는 쓰지 않는다.
+
+**언어** (1.1.0, 계획 5.6):
+- 회의는 `meta.languages`(`ko`·`en`·`vi`·`id` 중 하나 이상, 기본 `["ko"]`), 설정은 `transcribe_languages`(새 회의의 기본 목록)를 가진다. 언어 표(코드, 화면 이름, 환각 문구 파일, 글자당 토큰 비율)는 `transcribe/lang.rs` 한 곳이고, 화면은 `transcribe_languages` 명령으로 받는다. 코드는 목록 안에서 중복·빈 값·모르는 코드를 거부한다.
+- 언어가 하나면 그 언어로 `full`을 구간당 한 번 부르고 언어 판별은 하지 않는다. 한국어만 쓰는 회의는 1.0.x와 같은 비용이다.
+- 언어가 둘 이상이면 워커가 VAD 조각마다 `lang_detect`(`ggml-tiny.bin`, `--lid-model`)로 언어를 가린다. 회의 목록 안의 언어만 보고, 30초보다 긴 조각은 판별할 때만 30초씩 나눠 보며, 1.5초보다 짧은 조각은 앞 조각의 언어를 따른다. 같은 언어 조각을 모아 언어마다 `full`을 한 번 부르고(구간당 최대 4번), 세그먼트를 시각순으로 합쳐 세그먼트마다 `lang`을 단다(`transcript.json`의 `Segment.lang`, 언어가 둘 이상인 회의에만 쓴다). 판별하는 동안 `detecting` 줄을 낸다.
+- `ggml-tiny.bin`(77.7MB)은 5.1 모델 표에 있다. `Models::ready()`와 홈의 준비 확인은 전사·VAD 모델만 본다. 언어가 둘 이상인 회의만 tiny가 필요하고, 없으면 대기열이 그 회의만 기다리게 한다(실패로 치지 않는다). 받기는 처음 두 번째 언어를 고를 때 배경에서 시작한다. 한국어만 쓰는 회의는 tiny 없이 돈다.
+- 진행률은 구간에서 끝난 음성 길이의 합이고 언어 묶음을 건너 이어진다.
+- 구간 결과 줄(`transcript.partial.jsonl`)에 언어 목록을 찍고, 목록이 지금 회의와 다른 줄은 읽지 않는다. 다시 전사 뒤 옛 언어의 결과를 이어 쓰지 않게 하려는 것이다.
+- 1.1.0은 vi·id를 실제 녹음으로 확인한 뒤에만 낸다(UC2 관문, 계획 5.7-18). 통과하지 못한 언어나 조합은 `lang.rs` 표에서 뺀다.
 
 ### 5.4 백엔드 선택과 크래시 판정 (TRN-05, TRN-06)
 
@@ -379,6 +391,7 @@ queue.rs ──spawn── 앱 실행 파일 --plan-chunks {회의 폴더} {VAD 
 
 - 결정사항 두 규칙은 eval의 내용 검사(12.3)가 보는 것이다: 기각된 제안, 부정문, 뒤집히기 전 결정이 결정사항에 나오면 실패다.
 - 사용자 메시지는 한 줄 안내 + 빈 줄 + 내용이다. 내용은 전사본이면 세그먼트 텍스트를 한 줄에 하나씩(시각 없이), 부분 요약을 합칠 때는 부분 요약들을 `---` 줄로 나눠 넣는다. 안내는 셋 중 하나다: 전사본 전체("회의 전사본이다."), 전사본의 한 구간("…한 구간이다. 이 구간만 같은 형식으로 요약한다."), 부분 요약 합치기("…같은 형식의 요약 하나로 합친다. 겹치는 내용은 한 번만 쓰고, 앞에서 정한 것이 뒤에서 바뀌었으면 마지막 상태만 결정사항에 쓴다.").
+- **회의 언어(1.1.0)**: 요약은 늘 한국어로 쓴다. 프롬프트는 `["ko"]`면 그대로이고, 그 밖에는 "한국어 회의 전사본"을 회의 언어("영어 회의 전사본", "한국어·베트남어가 섞인 회의 전사본")로 바꾸고 사람 이름·제품명은 전사본 표기 그대로 쓰라고 한다. 언어가 둘 이상이면 전사본 줄 앞에 `[vi]` 같은 표시를 붙이고 모든 언어의 발언을 빠짐없이 한국어로 반영하라고 한다. 근거 검사(6.3)는 이름을 전사본 표기 그대로 찾고 라틴 문자는 성조·발음 부호를 빼고 비교한다. 날짜는 한국어 표현만 읽을 수 있어, 목록에 한국어가 아닌 언어가 있으면 날짜를 "미정"으로 바꾸지 않고 확인하지 않은 것으로 센다.
 - 한국어만, 연도를 붙이지 않는 날짜, 날짜 없는 제목, 미룬 제안은 미해결 질문이라는 규칙은 처음 요약 모델 Qwen3.5-4B의 실측(M6.5 4단계)에서 본 실패(한자 섞임, 지어낸 연도가 든 20자 넘는 제목, 기각·보류가 결정사항에 들어감)를 줄이려고 더했다. 합치기에 "앞의 미해결 질문을 뒤에서 정했으면 뺀다"를 더하는 것도 시험했다가 뺐다(합성 1시간본에서 액션 아이템이 5~7줄로 줄었다, 빼면 7~14줄). 액션 아이템을 빠짐없이 쓰라는 규칙도 시험했다가 뺐다: 할 일이 많은 긴 회의에서 부분 요약이 같은 줄을 늘어놓다 1,500토큰 제한에 걸려 요약 전체가 실패했다(3판 모두 3회 중 3회). 줄 형식은 바꾸지 않았다(근거 검사와 `parseDoc`이 읽는다).
 - LLM이 쓴 첫 줄 `# 제목`은 `meta.title`이 되고, 회의 문서의 요약 본문에서는 빠진다. `summary.raw.md`에는 제목 줄까지 LLM이 쓴 그대로, `summary.generated.md`에는 근거 검사(6.3)를 거친 요약을 제목 줄까지 남긴다(SUM-05).
 
@@ -392,6 +405,8 @@ queue.rs ──spawn── 앱 실행 파일 --plan-chunks {회의 폴더} {VAD 
 - **끝이 보장된다**: 한 단계가 부분 요약 수를 줄이지 못하면(둘씩도 묶이지 않으면) 실패한다. 요청 하나가 부분 요약 하나(1,500토큰 = 1,500자)도 담지 못할 만큼 컨텍스트가 작으면 요청을 보내기 전에 바로 실패한다. 둘 다 "컨텍스트 토큰 설정이 너무 작습니다"이고, 설정에서 모델의 실제 컨텍스트 길이를 넣으라고 안내한다. 기본값 8,192는 충분하고, 나눠야 하는 긴 회의에서 약 3,900 미만(용어집이 길면 조금 더)이면 바로 실패한다.
 - 로컬 서버가 이 예산과 다른 컨텍스트로 돌면 입력을 말없이 자를 수 있다. 응답의 `usage.prompt_tokens`로 잡는다(6.1 입력 잘림 감지).
 - **내장 경로**: `context_tokens`는 코드의 상수 16,384이고 서버도 같은 `-c`로 띄운다. 그래도 토큰은 글자 수로 어림하므로 예산 검사와 입력 잘림 감지를 그대로 둔다. 문구만 내장 경로의 것이다(용어집 때문에 예산이 모자라면 "용어집이 너무 길어…", 잘림은 엔진 오류로 보고 로그에 남긴다, 6.4).
+- **부분 결과 저장** (1.1.0): 부분 요약이 하나 끝날 때마다 `summary.partial.json`에 더한다. 키는 전사본 sha256, 렌더된 시스템 프롬프트 해시(용어집과 회의 언어 목록이 들어간다), 연결·모델, 부분 경계와 번호다. 다시 요약할 때 키가 모두 같은 부분만 다시 쓰고 남은 부분부터 한다. 저장하는 것은 부분 요약뿐이고 병합은 늘 다시 한다. 요약이 끝나면 파일을 지운다. 일시정지와 녹음(SUM-09)으로 멈춘 요약이 같은 이득을 본다.
+- **언어별 토큰 어림** (1.1.0): 토큰은 위처럼 글자 수로 어림하되 회의 언어 목록의 글자당 비율(`lang.rs`: ko 1.0, en·id 약 0.3, vi는 fixture로 잰다)을 곱하고, 섞인 회의는 언어별 글자 수로 합한다. 그래서 영어·인도네시아어 회의의 구간 수가 부풀지 않는다.
 - 부분 요약 중 하나라도 실패하면 요약 전체를 실패로 처리한다(SUM-06).
 - 진행률은 요청 수로 센다: 끝난 요청 / 지금까지 알려진 요청(구간 수 + 최종 1, 재귀 축약 단계가 생기면 그만큼 늘어난다). `meeting://progress`의 `chunk`/`chunks`다(10.2).
 - **근거 검사** (SUM-11, M6.5 계획 5.6, `grounding.rs`): 모든 경로에서 요약이 끝나면 큐가 액션 아이템의 담당자와 기한 중 전사본에 근거가 없는 부분만 "미정"으로 바꾼다. LLM이 쓴 원문은 `summary.raw.md`, 검사한 결과는 `summary.generated.md`, 바꾼 수는 `meta.json`의 `grounding_replaced`다(8.2). 줄은 회의 문서의 `parseDoc`과 같은 규칙으로 읽고(줄 파서는 섹션을 모르므로 "액션 아이템" 제목을 따라간다, 제목의 띄어쓰기는 무시), 두 파서가 함께 읽는 예시 파일 `src-tauri/tests/fixtures/summary-lines.json`으로 양쪽을 테스트한다.
@@ -516,6 +531,7 @@ Queue의 Sidecar ──spawn── 앱 실행 파일 --llm-supervisor {llama-ser
 | 429, `ratelimited` | "Slack 전송 한도를 넘었습니다. 잠시 후 다시 보내 주세요" |
 | 그 밖의 코드, JSON이 아닌 400 이상 | "Slack 오류: {코드}" 또는 "Slack 오류: HTTP {상태}" |
 
+- **여러 채널(1.1.0)**: `sent`인 회의도 다른 채널로 다시 보낼 수 있다. 이때는 요약을 다시 저장하지 않고 화면이 보낸 제목·본문을 무시하며, 저장된 요약을 보내고 `meta.also_sent`에 더한다(상태는 `sent` 그대로, 추가 전송의 `edit_count`는 첫 전송 값과 같다). 이미 `sent`나 `also_sent`에 있는 채널은 "이미 보낸 채널입니다"로 거부한다. 같은 채널인지는 `channel_id`로 비교하고 `channel_id`가 없는 이전 전송은 이름으로 비교한다. 추가 전송이 실패해도 `meta.error`는 쓰지 않는다(원인만 돌려준다). 같은 회의의 동시 전송은 기존 회의별 잠금이 막는다.
 - **자동 재시도는 없다**: 응답만 잃었을 뿐 Slack에는 이미 올라갔을 수 있어, 다시 보내면 두 번 올라간다. "다시 보내기"는 녹음자의 클릭이다. 위의 S5 대체 경로만 예외다(거부된 요청은 올라가지 않았다). 대체 경로는 `invalid_blocks`에서만 타고, 확인하지 못한 응답에서는 타지 않는다.
 - **`send_to_slack`의 순서**: 같은 회의의 전송이 이미 돌고 있으면 바로 거부한다(회의별 잠금, 두 번 누름 방지). `no_speech`이면 거부한다(SUM-10). `save_summary`와 같은 경로로 제목·본문을 먼저 저장한다(`review`에서만). 그래서 보낸 것이 저장된 것이다. 이어서 지난 시도의 `error`를 지운다(새 시도가 시작됐으니 더는 맞지 않는 원인이다. 그사이 다시 연 회의 문서에도 보이지 않는다). 그다음 12,000자 검사 → 수정 수(7.2) → 토큰(키체인, 곧 끝나면 갱신, 7.3) → 요청이다. 성공하면 `store.update`로 `sent`와 `meta.sent`(`channel`은 "#{채널 이름}")를 쓰고 `error`를 지운 뒤 `last_channel`을 그 채널의 id로 바꾼다(9.1). 삭제된 회의의 늦은 결과는 다른 쓰기와 같이 버려진다(8.3). 실패하면 `review` 그대로 `error`에 원인을 쓰고 원인을 돌려준다. 보냈는데 `sent`를 쓰지 못했으면 "Slack에는 보냈지만 전송 기록을 저장하지 못했습니다"로 알린다(다시 보내면 두 번 올라간다). 회의별 잠금을 쥔 동안 `get_meeting`의 `sending`이 참이고, 끝나면(성공·실패 모두) `send_to_slack`이 `slack://finished`(회의 id)를 보낸다(10.1, 10.2).
 
@@ -577,11 +593,14 @@ Queue의 Sidecar ──spawn── 앱 실행 파일 --llm-supervisor {llama-ser
   "gaps": [{ "at_ms": 1200000, "len_ms": 45000, "reason": "sleep" }],
   "backend": "gpu",
   "chunks_done": 6,
+  "chunks_total": 6,
+  "languages": ["ko"],
   "llm_connection": "회사 클라우드",
   "summarize_local": false,
   "no_speech": false,
   "error": null,
-  "sent": { "channel": "#회의록", "at": "...", "edit_count": 3 },
+  "sent": { "channel": "#회의록", "channel_id": "C0123456789", "at": "...", "edit_count": 3 },
+  "also_sent": [],
   "grounding_replaced": 1,
   "grounding_checked": true
 }
@@ -592,9 +611,10 @@ Queue의 Sidecar ──spawn── 앱 실행 파일 --llm-supervisor {llama-ser
 - 회의 문서에서 고친 요약 본문은 `summary.md`에 쓴다. `summary.generated.md`는 근거 검사(6.3)를 거친 요약 그대로 두고 수정 수 계산(7.2)이 비교한다. LLM이 쓴 원문은 `summary.raw.md`다.
 - `grounding_replaced`(M6.5)는 근거 검사가 "미정"으로 바꾼 담당자·기한 수이고 없으면 0으로 읽는다. `grounding_checked`는 검사가 액션 아이템을 읽었는지이고, 검사한 요약이 없으면(요약 전, `no_speech`, 근거 검사 전에 만든 요약) 없다. 둘 다 Slack 꼬리말(7.1)에 쓴다.
 - `sent`(M5)는 보낸 회의에만 있다: `channel`은 보낸 채널의 이름(예: "#회의록", 2026-10-20 전에 보낸 회의는 웹훅 이름), `at`은 보낸 시각(UTC, `created_at`과 같은 형식), `edit_count`는 7.2의 N이다. `review`의 `error`는 마지막 전송 실패의 원인이다(큐는 요약을 시작할 때 `error`를 지우므로 `review`에서는 전송만 쓴다). 다음 전송이 성공하면 지운다.
+- **1.1.0 필드**: `held`(사용자가 멈춘 회의, 참일 때만 쓴다. 대기열은 `held` 회의를 스스로 줄에 넣지 않으므로 앱을 다시 켜도 멈춘 채다), `chunks_total`(구간 계획의 구간 수, 없으면 0. 멈춘 회의가 앱을 다시 켜도 "구간 3/7"을 그리게 한다), `languages`(전사 언어 목록, 없으면 `["ko"]`, 5.3), `also_sent`(`sent` 다음의 추가 전송 목록, 없으면 빈 목록), `sent.channel_id`(보낸 채널의 id. 같은 채널인지는 이 값으로 비교하고, 없는 이전 전송은 이름으로 비교한다). `sent`는 첫 전송 그대로 두고 보낸 채널 전체는 `sent` 다음 `also_sent` 순서다.
 - 쓰기는 항상 임시 파일에 쓴 뒤 이름 바꾸기로 한다. 쓰는 도중 크래시가 나도 파일이 깨지지 않는다.
 - **단일 쓰기 경로**: 기록 스레드, 처리 대기열, UI 명령이 모두 `meta.json`을 고친다. 그래서 모든 변경은 `store.rs`의 회의별 잠금(`Mutex`) 안에서 읽고-고치고-쓴다. 원자적 이름 바꾸기는 파일 손상을 막을 뿐, 서로의 변경을 덮어쓰는 것은 막지 못하기 때문이다.
-- **스키마 버전** (STO-05, eng review D9): `meta.json`과 `settings.json`에 `schema_version`을 둔다. 앱이 아는 버전보다 높으면 그 데이터를 읽기 전용으로 열고 "새 버전 앱에서 만든 데이터입니다"를 보여준다. 낮으면 읽을 때 현재 버전으로 옮긴다.
+- **스키마 버전** (STO-05, eng review D9): `meta.json`과 `settings.json`에 `schema_version`을 둔다. 앱이 아는 버전보다 높으면 그 데이터를 읽기 전용으로 열고 "새 버전 앱에서 만든 데이터입니다"를 보여준다. 낮으면 읽을 때 현재 버전으로 옮긴다. 1.1.0은 **회의마다 고른다**: 새 필드를 실제로 쓰는 회의(`held`가 참, `also_sent`가 비어 있지 않음, `languages`가 `["ko"]`가 아님)만 `schema_version` 2로 쓰고, 그 밖의 회의는 1 그대로다. 새 필드가 다시 비면 1로 돌아간다(`Meta::schema`). 이 앱은 2까지 읽고 쓰고, 3 이상은 읽기 전용이다. 이전 버전(1.0.x)은 2인 회의를 읽기 전용으로 열어 다시 쓰거나 다시 돌리지 않는다. 그래서 일시정지·다른 언어·여러 채널 회의를 쓰지 않는 사용자의 회의는 이전 버전으로 돌아가도 그대로 쓸 수 있다.
 
 ### 8.3 상태 전이
 
@@ -610,6 +630,8 @@ recording ─▶ recorded ─▶ transcribing ─▶ transcribed ─▶ summariz
 - 실패 상태는 `transcribe_failed`와 `summarize_failed` 두 가지다. 설계 문서의 "각 단계에는 실패 상태가 있다"를 이렇게 구체화했다.
   - 녹음 단계의 문제(장치 끊김, 절전)는 실패가 아니라 `recorded`로 넘어간다.
   - 전송 실패는 상태가 아니라 `review`에 붙은 `error`로 기록한다. 다시 보낼 수 있어야 하기 때문이다.
+- **일시정지(1.1.0)**: `pause_meeting(id)`는 `Paused`(줄에서 기다리던 회의를 빼 바로 `paused`) \| `Pausing`(돌고 있어 멈춤을 걸었고 `end`가 `paused`를 쓴다) \| `AlreadyDone`(그사이 끝나 아무것도 쓰지 않음)을 돌려준다. `meta.held`=true를 쓰므로 다음 녹음 끝, 설정 저장, 모델 받기, 앱 다시 켜기에도 멈춘 채 있다. `can_transition`에 `recorded`·`transcribed`·`transcribe_failed`·`summarize_failed` → `paused`를 더했다. `resume_meeting`이 `held`를 지우고 줄에 넣는다(이어서 처리). 삭제가 사용자 멈춤을 이기고, 정상 끝이나 실패는 `held`를 지운다. 잠금 순서는 회의 잠금 안에서 대기열 잠금이다.
+- **다시 전사(1.1.0)**: `retranscribe(id, languages)`는 `transcribed`·`review`·`summarize_failed`·`archived`·`transcribe_failed`·`paused`에서만 받는다(→ `recorded`). 한 번에 `meta.json`을 `recorded`, 새 `languages`, `chunks_done`=0, `held`=false로 쓰고 `backend`·`error`·`wait`·`grounding_*`·`llm_connection`을 비운다(제목과 구간 계획은 남긴다). 그다음 `transcript.partial.jsonl`, `transcript.json`, `summary.md`, `summary.generated.md`, `summary.raw.md`, `summary.partial.json`을 지우고 줄에 넣는다. 지우기가 하나라도 실패하면 줄에 넣지 않고 오류를 돌려준다. `sent`, 처리 중, Slack 전송 중인 회의는 거부한다. `recorded`로 넘어갈 때와 시작 복구가 남은 `transcript*`·`summary*` 파일을 한 번 더 지운다. 아직 구간이 끝나지 않은 회의의 언어만 바꾸는 `set_meeting_language(id, languages)`는 `chunks_done`이 0이고 `transcript.json`이 없고 돌고 있지 않을 때만 받는다.
 - `transcribe_failed`, `summarize_failed`에서는 각각 `resume_meeting`, `retry_summary`(10.2)로 다시 시도한다.
 - **삭제 절차** (REV-04, eng review outside voice #4):
   1. `meta.json` 상태를 `deleting`으로 기록한다.
@@ -644,6 +666,8 @@ recording ─▶ recorded ─▶ transcribing ─▶ transcribed ─▶ summariz
   - `deleting` → 폴더 삭제를 마저 한다.
   - 회의 폴더가 아닌 `.import-*` 파일(풀다가 꺼진 가져오기, 4.7) → 지운다.
   - `transcribing`, `summarizing` → 앱 자체가 중간에 꺼진 경우다(워커 크래시와 무관). 디스크에 `paused`로 고쳐 쓴 뒤 대기열에 넣는다. 실제로 돌지 않는 작업을 디스크가 "진행 중"이라고 주장하지 않게 하려는 것이다.
+  - `held`인 회의 → 줄에 넣지 않는다. 앱이 끝날 때 멈추는 중이던 회의는 `paused`가 되고 `held`가 남는다(1.1.0). 줄에 넣는 순간 회의 잠금 아래에서 `meta.held`를 다시 읽는다.
+  - `recorded`인데 `transcript*`·`summary*` 파일이 남은 회의 → 그 파일을 지운다(다시 전사 도중 앱이 꺼진 경우).
   - `paused`, `recorded`, `transcribed` → 대기열에 넣는다. 요약만 남은 회의는 경로가 풀릴 때만 넣는다(위의 회의마다 경로 검사).
 
 ### 8.5 앱 종료 처리 (APP-02, TRN-06)
@@ -685,10 +709,12 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
   "summarize_local_by_default": false,
   "slack_team": "SIJE",
   "last_channel": "C0123456789",
+  "transcribe_languages": ["ko"],
   "glossary": ["{제품명}", "{고객사명}", "{사람 이름}"]
 }
 ```
 
+- `transcribe_languages`(1.1.0)는 새 회의의 기본 전사 언어 목록이다(없으면 `["ko"]`). 녹음 버튼, 단축키, 트레이는 묻지 않고 이 목록으로 회의를 만든다. 저장할 때 언어 코드를 검사한다(5.3).
 - `summary_gpu_failed`는 요약 엔진이 쓴다(6.6): `gpu_failed`와 똑같이 설정 화면의 저장이 저장돼 있던 값을 그대로 두고, 백엔드를 "GPU"로 바꿀 때 함께 지운다. 처리 장치 설정은 전사와 요약에 하나다.
 - `slack_team`은 로그인·로그아웃이 쓴다(7.3, `set_slack_team`). 2026-10-20 전의 파일에 있는 `webhooks`는 읽을 때 무시되고 다음 저장 때 사라진다(키체인의 옛 `slack:{이름}` 항목은 남는다).
 - `last_channel`(채널 id)은 전송이 쓴다(SND-04): 성공한 전송 뒤 `SettingsStore::set_last_channel`이 이 값만 바꾼다. 설정 화면의 저장(`save_settings`)은 `gpu_failed`처럼 저장돼 있던 값을 그대로 둔다(5.4). 설정 화면이 열려 있는 동안 보낸 전송을 옛 값으로 덮지 않게 하려는 것이다.
@@ -812,8 +838,8 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 |---|---|
 | `start_recording` → `{ id, warnings }` (장치는 캡처 스레드에서 열므로 바로 돌아온다), `stop_recording` → id (두 WAV를 닫고 `recorded`가 된 뒤 돌아온다), `recording_state` → 진행 중인 녹음과 남아 있는 경고 | `recording://level` `{ elapsed_ms, mic, system, mic_bands, system_bands, waiting_permission }` (40ms마다. `mic`·`system`은 트랙별 RMS 0~1, `*_bands`는 트랙별 스펙트럼 24개 대역 0~100, 4.1) |
 | `list_meetings` (항목마다 `interrupted`: 중단된 녹음), `get_meeting(id)` → `{ meta, summary, sending }` (`summary`는 요약 본문: 고친 `summary.md`, 없으면 `summary.generated.md`에서 제목 줄을 뺀 것, 둘 다 없으면 빈 문자열. `sending`은 이 회의의 Slack 전송이 돌고 있는지, 7.1), `get_transcript(id)` → `[{ start_ms, end_ms, text }]` (`transcript.json`의 세그먼트, 읽기 전용. 경로는 `store.rs`의 `dir_for`로만 만든다), `delete_meeting` (녹음 중이면 먼저 녹음을 끝낸다) | `recording://warning` `{ kind, message }` (`disk`, `mic_permission`, `mic_device`, `system_device`, `silence`, `length`, `sleep`. 같은 `kind`는 앞의 경고를 바꾼다) |
-| `resume_meeting(id)`: 중단된 녹음의 "처리 계속", `transcribe_failed` 재시도. 둘 다 대기열에 넣는다 | `recording://stopped` `{ id, message }` (녹음 종료. 스스로 끝난 경우 `message`에 이유) |
-| `summary_route(id)` → `{ connection, local, local_available, locked, toggle_matters }` (`connection`은 요약이 갈 연결(`LlmConnection`, 비밀값 없음), 고를 수 없으면 `null`. 아무것도 보내지 않은 회의(`no_speech`, 또는 `llm_connection` 없이 `review`·`sent`·`archived`가 된 회의)도 `null`이라 SUM-07의 "전송됨"이 거짓으로 뜨지 않는다. `local`은 회의의 "로컬로 요약", `local_available`은 요약 모델이 설치돼 있거나(`builtin_ready`) 저장한 로컬 연결이 있는지, `locked`는 요약이 시작돼 바꿀 수 없는지, `toggle_matters`는 "로컬로 요약"을 뒤집으면 요약이 갈 곳이나 기다리는 이유가 바뀌는지(`route`를 두 번 풀어 비교한다. 로컬 기본, 모델이 있는 "이 PC" 기본, 고정된 회의는 거짓). 6.1), `set_summarize_local(id, local)` → 같은 값 (잠긴 뒤, 또는 `local_available`이 아닌데 켜면 실패. 기다리던 회의면 대기열에 넣기를 다시 한다). 내장 경로의 `connection`은 이름이 `builtin`이고 주소가 빈 값이다 | `meeting://progress` `{ id, status, chunk, chunks, percent, eta_secs, position, engine_since }` (아래). 상태 변경 이벤트는 따로 두지 않는다. 화면은 이 이벤트의 `status`가 바뀔 때 목록을 다시 읽는다 |
+| `resume_meeting(id)`: 중단된 녹음의 "처리 계속", `transcribe_failed` 재시도, `held` 회의의 "이어서 처리"(`held`를 지운다). 모두 대기열에 넣는다. `pause_meeting(id)` → `Paused` \| `Pausing` \| `AlreadyDone`(8.3). `set_meeting_language(id, languages)`, `retranscribe(id, languages)`(8.3), `transcribe_languages` → 언어 표(`lang.rs`, 코드와 화면 이름). `export_recording(id)` → 저장한 경로, 취소하면 `null`: `recording`·`deleting`·`unknown`이면 거부하고, 저장 대화상자를 Rust가 열며(기본 이름 `{제목}.wav`), 마이크와 시스템 소리를 합친 16kHz 모노 16비트 WAV를 10분 창씩 써서(전사가 듣는 것과 같은 게이팅·리미터를 거친 소리) 고른 폴더의 임시 이름에서 바꾼다. 쓰기 전에 남은 공간을 예상 크기(1시간 약 115MB)와 비교해 모자라면 수치와 함께 거부하고, 삭제가 내보내기를 취소한다. 새 명령은 시작과 결과를 `app.log`에 남긴다 | `recording://stopped` `{ id, message }` (녹음 종료. 스스로 끝난 경우 `message`에 이유) |
+| `summary_route(id)` → `{ connection, local, local_available, locked, toggle_matters }` (`connection`은 요약이 갈 연결(`LlmConnection`, 비밀값 없음), 고를 수 없으면 `null`. 아무것도 보내지 않은 회의(`no_speech`, 또는 `llm_connection` 없이 `review`·`sent`·`archived`가 된 회의)도 `null`이라 SUM-07의 "전송됨"이 거짓으로 뜨지 않는다. `local`은 회의의 "로컬로 요약", `local_available`은 요약 모델이 설치돼 있거나(`builtin_ready`) 저장한 로컬 연결이 있는지, `locked`는 요약이 시작돼 바꿀 수 없는지, `toggle_matters`는 "로컬로 요약"을 뒤집으면 요약이 갈 곳이나 기다리는 이유가 바뀌는지(`route`를 두 번 풀어 비교한다. 로컬 기본, 모델이 있는 "이 PC" 기본, 고정된 회의는 거짓). 6.1), `set_summarize_local(id, local)` → 같은 값 (잠긴 뒤, 또는 `local_available`이 아닌데 켜면 실패. 기다리던 회의면 대기열에 넣기를 다시 한다). 내장 경로의 `connection`은 이름이 `builtin`이고 주소가 빈 값이다 | `meeting://progress` `{ id, status, chunk, chunks, percent, eta_secs, position, engine_since, slow, detecting }` (아래. `detecting`은 언어가 둘 이상인 회의의 구간 워커가 조각마다 언어를 가리는 동안 참이다, 5.3). 상태 변경 이벤트는 따로 두지 않는다. 화면은 이 이벤트의 `status`가 바뀔 때 목록을 다시 읽는다 |
 | `save_summary(id, title, body)` → `Meta` (`review`에서만. 본문은 `summary.md`, 제목은 `meta.title`. 제목은 줄바꿈·제어 문자를 공백 하나로 바꿔 한 줄로 저장한다. `.md` 내보내기의 `# 제목` 줄과 파일 이름이 되기 때문이다), `archive_meeting(id)` → `Meta` ("전송 안 함", `review` → `archived`) | `model://download` `{ file, received, total, all_received, all_total, bps }` (파일의 약 1%마다와 받는 동안 1초마다. `all_*`는 받기 전체의 합계, `bps`는 최근 10초 평균 속도이고 처음 10초는 `null`, 5.1) |
 | `retry_summary(id, connection)` → `Meta` (`summarize_failed`, `transcribed`, 전사본이 있는 `paused`에서. `connection`은 `list_connections`의 이름이고 `builtin`도 된다. 그 연결로 경로가 풀리지 않으면 거부한다: 없는 연결이면 "…찾을 수 없습니다. 다른 연결을 골라 주세요", 요약 모델 없는 `builtin`이면 "…요약 모델을 먼저 받아 주세요". 고른 연결을 `llm_connection`에 쓰고 `wait`를 지운 뒤 대기열에 넣는다, SUM-06, 8.4), `list_connections` → `[{ name, label, host, is_local, builtin }]` (저장한 연결과 마지막의 내장 경로. 내장 경로는 `name` `builtin`, `label` "이 PC", `host` 빈 값이다. 예약 이름으로 저장된 연결은 빠진다. 비밀값 없음, 6.1), `export_markdown(id)` → 저장한 경로, 취소하면 `null` (REV-05. 저장 대화상자를 Rust가 열어 웹뷰가 쓸 경로를 넘기지 않는다. 파일은 `# 제목`, 요약 본문, `---`, `## 전사본`, `[mm:ss] 텍스트` 줄 순서다. 기본 파일 이름은 제목(없으면 회의 id)에서 경로 구분자, Windows가 거부하는 문자(`\ / : * ? " < > |`), 제어 문자를 `_`로 바꾼 것이다. Rust 쪽 대화상자 API는 웹뷰 권한(capability) 검사를 거치지 않으므로 권한을 더하지 않는다) | `transcribe://gpu-failed` `{ message }` (GPU 크래시 2번 → CPU로 전환, 5.4) |
 | `slack_length(id, title, body, offset_minutes)` → 글자 수 (REV-02, 7.1. `offset_minutes`는 회의 시작 시각의 현지 UTC 시차(분), JS에서는 `offsetMinutes`), `send_to_slack(id, channel, title, body, offset_minutes)` → `Meta` (`channel`은 `slack_channels`의 `{ id, name, private }`. 먼저 `save_summary`처럼 저장하고 보낸다. 성공하면 `sent`, 실패하면 `review` + `error`와 함께 원인을 돌려준다. 같은 회의의 전송이 돌고 있으면 거부한다, 7.1) | `app://open-meeting` (회의 id. 그 회의의 OS 알림을 눌렀다. 창은 이미 보인다, 10.1) |
@@ -946,7 +972,9 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 | `writer.rs` 기록 경로 | 쓰기 오류 주입 시 상태 `recorded` + 마지막 flush 길이만큼 읽히는 WAV (D7), `recorded`를 못 쓰면 중단된 녹음, 5분 넘는 절전은 절전 시점에서 종료, 3시간 50분 경고와 4시간 종료, 마이크 3초 0버퍼 경고, 48k 스테레오·44.1k 모노 → 16kHz 길이와 주파수 |
 | `filter.rs` | 정확히 일치할 때만 제거, 비슷한 문장은 남김, 반복 토큰·빈 결과 검사 |
 | `grounding.rs` | 근거 검사(6.3): 공유 예시 파일의 줄마다 `parseDoc`과 같은 결과(Vitest도 같은 파일을 읽는다), 있는 이름·없는 이름·여러 담당자 중 일부·호칭과 띄어쓰기·직함·구분자 및·&, 낱말 경계를 넘어 이어 붙인 이름은 근거가 아님("끝나서 연락"/"서연"), 용어집 세 글자 한글 이름의 두 글자 조각("김민수"/"민수 씨")과 두 글자 이름, 한글이 아닌 이름은 전체(대소문자 무시), "전원" 같은 담당자는 판단 안 함, 날짜 변형·조사·다른 달·ISO·기간, 상대 표현, 다른 섹션은 그대로, 읽지 못한 줄·제목 없음 → 검사 못 함. 큐 테스트로 `summary.raw.md`·`summary.generated.md`·`grounding_replaced`·`grounding_checked` |
-| `queue.rs` | 판단은 순수 함수로 확인한다: 2개 동시 실행(요약 모델이 있으면 1개)과 FIFO 대기 순서, 녹음 시작 → 실행 중인 회의가 원래 순서로 맨 앞에 돌아가고(클라우드 요약은 자리를 지킴) 녹음 중에는 시작 안 함, 크래시 → GPU 1회 재시도 → `gpu_failed` → CPU (D5), 종료 코드 2·3과 OS의 SIGKILL → `gpu_failed` 아님 (5.3), 무응답은 크래시로 셈, GPU 결과가 비정상이면 CPU로 한 번, 마지막 완료 구간 다음부터 재개(찢어진 줄·계획과 다른 줄에서 멈춤), 진행률·남은 시간. 프로세스 처리는 `sh`를 가짜 워커로 써서 확인한다(unix): stdout 줄(잡음·UTF-8 아닌 줄 건너뜀)과 종료 코드·시그널, 녹음 시작 → 1초 안에 kill되고 크래시로 세지 않음, 무응답 → kill. 상태를 쓰는 경로 전체는 `tauri::test` 모의 런타임에서 셸 스크립트 워커, 스텁 LLM 서버, 가짜 키체인으로 확인한다: 요약 모델도 저장한 연결도 없으면 끝까지 → `transcript.json` + `transcribed`, 연결이 있으면 같은 자리에서 요약까지 → `review` + `summary.generated.md` + 제목, 연결을 나중에 저장하면 다시 전사하지 않고 요약, 30자 미만 → 요청 없이 `review` + `no_speech`, LLM 오류 → `summarize_failed` + `error` → 다른 연결로 다시 실행, 로컬 요약 중 녹음 → 요청 취소·`paused`·맨 앞 → 녹음 뒤 요약만 다시, 클라우드 요약 중 녹음 → 계속 돌아 녹음 중에 `review`, 요약 중 삭제 → 요청 취소 후 폴더 삭제, 클라우드 요약 중 종료 → 요청 취소 후 `paused`, `transcript.json`이 있어도 `transcribe_failed`면 다시 전사(상태로 판단), 녹음으로 멈춘 뒤 끝을 쓰기 전에 삭제가 오면 대기열에 다시 들어가지 않음, 녹음 → 디스크에 `paused` + 맨 앞 → 같은 구간부터 다시, CPU 크래시 → `transcribe_failed` + `error`, GPU 크래시 2번 → `gpu_failed` + CPU로 완료, 종료 코드 3 → 해시 확인 후 손상 안내와 파일 삭제, 동시에 두 번 삭제해도 둘 다 성공하고 처리가 끝난 뒤 폴더 삭제. 모델 실패 문구(메모리·손상·없음)는 따로 확인한다 |
+| `queue.rs` | 판단은 순수 함수로 확인한다: 2개 동시 실행(요약 모델이 있으면 1개)과 FIFO 대기 순서, 녹음 시작 → 실행 중인 회의가 원래 순서로 맨 앞에 돌아가고(클라우드 요약은 자리를 지킴) 녹음 중에는 시작 안 함, 크래시 → GPU 1회 재시도 → `gpu_failed` → CPU (D5), 종료 코드 2·3과 OS의 SIGKILL → `gpu_failed` 아님 (5.3), 무응답은 크래시로 셈, GPU 결과가 비정상이면 CPU로 한 번, 마지막 완료 구간 다음부터 재개(찢어진 줄·계획과 다른 줄에서 멈춤), 진행률·남은 시간. 프로세스 처리는 `sh`를 가짜 워커로 써서 확인한다(unix): stdout 줄(잡음·UTF-8 아닌 줄 건너뜀)과 종료 코드·시그널, 녹음 시작 → 1초 안에 kill되고 크래시로 세지 않음, 무응답 → kill. 상태를 쓰는 경로 전체는 `tauri::test` 모의 런타임에서 셸 스크립트 워커, 스텁 LLM 서버, 가짜 키체인으로 확인한다: 요약 모델도 저장한 연결도 없으면 끝까지 → `transcript.json` + `transcribed`, 연결이 있으면 같은 자리에서 요약까지 → `review` + `summary.generated.md` + 제목, 연결을 나중에 저장하면 다시 전사하지 않고 요약, 30자 미만 → 요청 없이 `review` + `no_speech`, LLM 오류 → `summarize_failed` + `error` → 다른 연결로 다시 실행, 로컬 요약 중 녹음 → 요청 취소·`paused`·맨 앞 → 녹음 뒤 요약만 다시, 클라우드 요약 중 녹음 → 계속 돌아 녹음 중에 `review`, 요약 중 삭제 → 요청 취소 후 폴더 삭제, 클라우드 요약 중 종료 → 요청 취소 후 `paused`, `transcript.json`이 있어도 `transcribe_failed`면 다시 전사(상태로 판단), 녹음으로 멈춘 뒤 끝을 쓰기 전에 삭제가 오면 대기열에 다시 들어가지 않음, 녹음 → 디스크에 `paused` + 맨 앞 → 같은 구간부터 다시, CPU 크래시 → `transcribe_failed` + `error`, GPU 크래시 2번 → `gpu_failed` + CPU로 완료, 종료 코드 3 → 해시 확인 후 손상 안내와 파일 삭제, 동시에 두 번 삭제해도 둘 다 성공하고 처리가 끝난 뒤 폴더 삭제. 모델 실패 문구(메모리·손상·없음)는 따로 확인한다. 1.1.0: `Stop` 순서와 `halt`, 사용자 멈춤 뒤 녹음 시작·끝에도 `paused`+`held`, 삭제가 사용자 멈춤을 이김, 이미 끝난 회의의 멈춤은 `AlreadyDone`, 요약 시작과 일시정지를 동시에 돌려도 교착이 없음, `held` 회의는 줄에 들어가지 않음, 다시 전사(상태 전이, 파일 정리와 필드 초기화, 처리 중 거부, 각 삭제 지점의 시작 복구, 남은 부분 전사본 무시), 언어가 둘 이상인데 tiny가 없으면 그 회의만 기다림, `detecting` 진행 |
+| 언어 (`lang.rs`, `engine.rs`, `filter.rs`) | 언어 표와 코드 검사, `languages` serde 왕복, 조각 언어 고르기(목록 밖 언어 무시, 짧은 조각 이어받기, 같은 언어 묶기), 단일 언어 회의는 `lang_detect`를 부르지 않음, ko/vi/ko/vi 조각 → `full` 두 번과 세그먼트 시각순, 언어별 환각 문구(라틴 문자는 소문자 비교). 합성 fixture(`src-tauri/tests/fixtures`의 `synthetic-en`, `synthetic-vi`, `synthetic-ko-vi`)로 요약 형식·근거 검사·부분 수 상한을 본다(`summary_eval`). 실제 녹음 확인은 UC2 관문(계획 5.7-18) |
+| `store.rs` 1.1.0 | 새 필드(`held`, `also_sent`, `["ko"]`가 아닌 `languages`)가 있는 회의만 `schema_version` 2로 쓰고 비면 1로 돌아감, 3 이상은 읽기 전용, `also_sent`와 `channel_id` 비교, 추가 전송이 `meta.error`를 쓰지 않음, 같은 채널 동시 전송 → 게시 한 번, 내보내기 중 삭제 |
 | 구간 나누기 (`engine.rs`) | 겹친 창의 음성 구간 합치기, 10분에 가장 가까운 무음에서 자름, 5~12분 범위, 무음 없는 연속 발화는 10분에서 자름, 무음·짧은 녹음 |
 | 음성만 잘라 잇기 (`engine.rs` `Speech`) | whisper.cpp와 같은 이어 붙이기(0.1초 겹침, 0.1초 무음), 조각 안은 1:1, 무음 자리에 떨어진 시작은 다음 조각 시작·끝은 앞 조각 끝, 오디오 끝을 넘은 시각, 음성이 없을 때 |
 | 워커 종료 코드 (`engine.rs`) | 인자 오류·녹음 없음 → 2, 모델 없음 → 3 |
