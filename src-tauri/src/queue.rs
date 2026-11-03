@@ -647,7 +647,7 @@ fn cpu_failure(features: &[bool]) -> Option<&'static str> {
 }
 
 /// The last thing the worker said on stderr: the reason shown for a failure.
-fn last_log_line(log: &Path) -> String {
+pub(crate) fn last_log_line(log: &Path) -> String {
     let text = fs::read(log).unwrap_or_default();
     String::from_utf8_lossy(&text)
         .lines()

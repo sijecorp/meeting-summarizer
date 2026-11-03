@@ -123,6 +123,36 @@ pub(crate) fn diag_line(kind: &str, pairs: &[(&str, String)]) -> String {
     line
 }
 
+/// The reading side of `diag_line`: the kind and the pairs, up to anything malformed.
+pub(super) fn read_diag(line: &str) -> (&str, Vec<(String, String)>) {
+    let (kind, mut rest) = line.split_once(' ').unwrap_or((line, ""));
+    let mut pairs = Vec::new();
+    while let Some((key, after)) = rest.split_once('=') {
+        let (value, left) = match after.strip_prefix('"') {
+            Some(quoted) => {
+                let (mut value, mut chars) = (String::new(), quoted.char_indices());
+                let end = loop {
+                    match chars.next() {
+                        Some((_, '\\')) => value.extend(chars.next().map(|(_, c)| c)),
+                        Some((i, '"')) => break Some(i + 1),
+                        Some((_, c)) => value.push(c),
+                        None => break None,
+                    }
+                };
+                let Some(end) = end else { break };
+                (value, &quoted[end..])
+            }
+            None => {
+                let end = after.find(' ').unwrap_or(after.len());
+                (after[..end].to_string(), &after[end..])
+            }
+        };
+        pairs.push((key.to_string(), value));
+        rest = left.strip_prefix(' ').unwrap_or(left);
+    }
+    (kind, pairs)
+}
+
 /// Union of the speech spans found by overlapping windows: speech seen by two windows, or cut
 /// off at one window's end, becomes one span.
 pub fn merge(mut spans: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
@@ -184,7 +214,7 @@ pub fn plan(speech: &[(u64, u64)], len_ms: u64) -> Vec<Chunk> {
     chunks
 }
 
-enum Fail {
+pub(super) enum Fail {
     Input(String),
     Model(String),
     Crash(String),
@@ -663,12 +693,13 @@ fn mode(args: &[OsString]) -> Option<Mode> {
     match args.first().and_then(|a| a.to_str()) {
         Some("--plan-chunks") => Some(plan_chunks),
         Some("--transcribe-worker") => Some(transcribe_chunk),
+        Some("--transcribe-bench") => Some(super::bench::bench),
         _ => None,
     }
 }
 
 /// The exit code for how a mode ended. A failure's message goes to stderr (`worker.log`).
-fn code_of(result: Result<(), Fail>) -> i32 {
+pub(super) fn code_of(result: Result<(), Fail>) -> i32 {
     let (code, message) = match result {
         Ok(()) => return 0,
         Err(Fail::Input(m)) => (EXIT_INPUT, m),
@@ -701,19 +732,25 @@ fn exit_now(code: i32) -> ! {
 
 /// Runs the worker and exits when this process was started as one; returns for the app.
 pub fn worker_main() {
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    run_as(std::env::args_os().skip(1).collect());
+}
+
+fn run_as(args: Vec<OsString>) {
     let Some(run) = mode(&args) else {
         return;
     };
     #[cfg(windows)]
     let _ = ECOQOS
         .set(crate::no_ecoqos(None).map_or_else(|code| format!("err:{code}"), |()| "ok".into()));
-    // The app holds our stdin open. If it goes away (a crash, a force quit), so do we, instead of
-    // keeping the GPU busy next to the workers the restarted app starts.
-    std::thread::spawn(|| {
-        let _ = std::io::stdin().read(&mut [0; 1]);
-        exit_now(EXIT_CRASH);
-    });
+    // The app holds a worker's stdin open. If it goes away (a crash, a force quit), so does the
+    // worker, instead of keeping the GPU busy next to the workers the restarted app starts. Not the
+    // bench (plan 5.1-2): no app stands behind it, and a Windows GUI program has no stdin at all.
+    if args[0] != "--transcribe-bench" {
+        std::thread::spawn(|| {
+            let _ = std::io::stdin().read(&mut [0; 1]);
+            exit_now(EXIT_CRASH);
+        });
+    }
     exit_now(code_of(run(&args[1..])));
 }
 
@@ -912,6 +949,28 @@ mod tests {
         }
     }
 
+    /// Plan 5.1-2: the bench runs without a stdin (a Windows GUI program has none) and gets to its
+    /// own argument check, where a worker would have exited at the closed stdin. This test binary
+    /// is the bench, in a child whose stdin is null.
+    #[test]
+    fn the_bench_outlives_a_closed_stdin() {
+        const CHILD: &str = "MS_BENCH_STDIN_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            run_as(os(&["--transcribe-bench", "/no/meeting", "--range", "5-1"]));
+            unreachable!("the bench exits");
+        }
+        let name = "transcribe::engine::tests::the_bench_outlives_a_closed_stdin";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(EXIT_INPUT), "{stderr}");
+        assert!(stderr.contains("잘못된 인자: --range"), "{stderr}");
+    }
+
     #[test]
     fn flags_default_to_the_product_values() {
         let parsed = options(&[]).ok().unwrap();
@@ -948,35 +1007,6 @@ mod tests {
         assert_eq!(gpu_order(&[], Some(0)), None);
     }
 
-    /// The reading side of `diag_line`, as a log reader would do it.
-    fn parse_diag(line: &str) -> (String, Vec<(String, String)>) {
-        let (kind, mut rest) = line.split_once(' ').unwrap_or((line, ""));
-        let mut pairs = Vec::new();
-        while !rest.is_empty() {
-            let (key, after) = rest.split_once('=').unwrap();
-            let (value, left) = match after.strip_prefix('"') {
-                Some(quoted) => {
-                    let (mut value, mut chars) = (String::new(), quoted.char_indices());
-                    let end = loop {
-                        match chars.next().unwrap() {
-                            (_, '\\') => value.push(chars.next().unwrap().1),
-                            (i, '"') => break i + 1,
-                            (_, c) => value.push(c),
-                        }
-                    };
-                    (value, &quoted[end..])
-                }
-                None => {
-                    let end = after.find(' ').unwrap_or(after.len());
-                    (after[..end].to_string(), &after[end..])
-                }
-            };
-            pairs.push((key.to_string(), value));
-            rest = left.strip_prefix(' ').unwrap_or(left);
-        }
-        (kind.to_string(), pairs)
-    }
-
     #[test]
     fn diag_values_with_spaces_or_quotes_are_quoted_and_read_back() {
         let pairs = [
@@ -993,7 +1023,7 @@ mod tests {
             line,
             r#"chunk device=gpu gpu="NVIDIA GeForce RTX 3060" gpus=2 odd="a \"b\" \\c" path=C:\x empty= rtf=0.250"#
         );
-        let (kind, read) = parse_diag(&line);
+        let (kind, read) = read_diag(&line);
         assert_eq!(kind, "chunk");
         let expected: Vec<_> = pairs
             .iter()

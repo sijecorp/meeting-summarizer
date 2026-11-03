@@ -9,9 +9,11 @@
 | 컴퓨터 | 파일 |
 |---|---|
 | Mac (Apple 실리콘: M1 이후, macOS 14.6 이상) | `meeting-summarizer_버전_aarch64.dmg` |
-| Windows 10/11 (64비트) | `meeting-summarizer_버전_x64-setup.exe` |
+| Windows 10(1809 이상)/11 (64비트) | `meeting-summarizer_버전_x64-setup.exe` |
 
 Intel 칩 Mac은 지원하지 않습니다. Mac의 칩은 Apple 메뉴 > 이 Mac에 관하여에서 볼 수 있습니다.
+
+Windows 10은 버전 1809(2018년 10월 업데이트) 이상이어야 합니다. 그 전 버전에서는 앱이 열리지 않습니다. 버전은 시작 > 설정 > 시스템 > 정보의 "Windows 사양"에서 볼 수 있습니다.
 
 앱은 처음 쓸 때 전사 모델과 요약 모델(합쳐 약 3.4 GB)을 받습니다. 받는 동안 디스크에 1 GB가 더 남아 있어야 하므로, 처음에는 약 4.4 GB의 빈 공간이 필요합니다. 모자라면 앱이 몇 GB가 더 필요한지 알려 줍니다.
 

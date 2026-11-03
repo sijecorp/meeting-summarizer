@@ -9,11 +9,65 @@
 | 컴퓨터 | 파일 |
 |---|---|
 | Mac (Apple 실리콘: M1 이후, macOS 14.6 이상) | `meeting-summarizer_<버전>_aarch64.dmg` |
-| Windows 10/11 (64비트) | `meeting-summarizer_<버전>_x64-setup.exe` |
+| Windows 10(1809 이상)/11 (64비트) | `meeting-summarizer_<버전>_x64-setup.exe` |
 
 설치와 첫 실행(Mac의 "그래도 열기", Slack 로그인)은 [설치 안내](docs/install.md)를 따른다. 저장소가 비공개라 접근 권한이 있어야 받을 수 있다. 지난 버전은 [모든 릴리스](https://github.com/sijecorp/meeting-summarizer/releases)에 있다.
 
+## 느릴 때 보낼 것
+
+처리가 느리거나 실패한다는 동료에게는 두 파일을 받는다.
+
+- `app.log`: 앱의 설정 > 일반 > "로그 폴더 열기"가 여는 폴더에 있다. 전사 구간마다 처리 장치, GPU 이름, 스레드·beam·flash attention, 걸린 시간, 실시간 배수(`rtf`), 전원 상태가 `chunk device=… rtf=… power=…` 한 줄로 남고, 회의의 전사가 끝나면 `meeting id=…` 한 줄, 모델을 받으면 `download file=… bps=…` 한 줄이 남는다.
+- `settings.json`: macOS `~/Library/Application Support/com.sije.meeting-summarizer/settings.json`, Windows `%APPDATA%\com.sije.meeting-summarizer\settings.json`. 전사 백엔드, GPU 실패로 CPU에 묶였는지(`gpu_failed`), flash attention(`transcribe_flash_attn`)이 여기 있다. API 키와 Slack 로그인은 키체인에 있어 이 파일에 없다.
+
+## 전사 실측
+
+설치한 앱의 실행 파일로 그 PC의 전사 속도와 정확도를 잰다(계획 5.1-14). 개발 환경은 필요 없다. 처리를 마친 회의 하나의 앞 10분을 설정 조합마다 전사하고, 조합 하나가 끝날 때마다 그 회의 폴더의 `bench.tsv`에 한 줄을 쓴다. 중간에 끊어도 끝난 줄은 남는다. 녹음은 임시 폴더에 복사해서 돌고, 회의 폴더에는 `bench.tsv`만 쓴다.
+
+1. 앱을 끄고 시작한다(메뉴 막대나 트레이의 앱 아이콘 > 종료). 앱이 전사하는 동안 재면 둘이 CPU·GPU를 나눠 써서 숫자가 틀어진다.
+2. 잴 회의의 폴더를 찾는다. 폴더 이름이 회의 id(녹음을 시작한 UTC 시각)다.
+   - macOS: `~/Library/Application Support/com.sije.meeting-summarizer/meetings/<id>`
+   - Windows: `%LOCALAPPDATA%\com.sije.meeting-summarizer\meetings\<id>`
+3. 먼저 `--smoke`(제품 기본 조합 하나)로 도는지 본 뒤, `--smoke`를 빼고 모든 조합을 돈다. 시작할 때 예상 시간을 `bench.tsv` 첫 줄에 쓴다. GPU 없는 노트북에서는 모든 조합이 몇 시간 걸릴 수 있다.
+
+macOS:
+
+```sh
+dir="$HOME/Library/Application Support/com.sije.meeting-summarizer/meetings/<id>"
+/Applications/meeting-summarizer.app/Contents/MacOS/meeting-summarizer --transcribe-bench "$dir" --smoke
+```
+
+Windows(PowerShell). 설치한 앱은 콘솔이 없는 프로그램이라 `Start-Process -Wait`로 끝날 때까지 기다리고, 진행과 오류 메시지는 `bench.log`로 받는다.
+
+```powershell
+$dir = "$env:LOCALAPPDATA\com.sije.meeting-summarizer\meetings\<id>"
+Start-Process -Wait -FilePath "$env:LOCALAPPDATA\meeting-summarizer\meeting-summarizer.exe" -ArgumentList "--transcribe-bench `"$dir`" --smoke" -RedirectStandardError "$env:TEMP\bench.log"
+Get-Content "$env:TEMP\bench.log" -Tail 3
+```
+
+- 기준 전사본이 있으면 `--reference <파일>`을 더해 CER(글자 오류율)도 잰다.
+- 다른 구간은 `--range 600000-1200000`(ms), 일부 조합만은 `--only <조합,...>`(조합 이름은 `bench.tsv` 첫 열), 한국어가 아닌 회의는 `--lang en`처럼 준다.
+- 모델은 설치한 앱의 모델 폴더에서 `large-v3-turbo-q8_0`과 `medium-q5_0` 중 받아 둔 것을 쓴다. 다른 파일은 `--model <파일> --vad <파일>`로 준다.
+
+**기준 전사본 만들기**: 같은 구간(기본은 앞 10분)을 사람이 들으며 고친 UTF-8 텍스트 파일이다. 회의 문서의 전사본에서 "전사본 복사"를 눌러 메모장 같은 편집기에 붙이고, 녹음을 들으며 틀린 글자를 고친 뒤 `[10:00]` 뒤의 줄을 지운다. 줄 앞의 `[분:초]`, 줄바꿈, 띄어쓰기, 문장부호는 CER에 세지 않으므로 그대로 둬도 된다. 파일은 회의 폴더 밖에 저장한다.
+
+**`bench.tsv` 읽기**: 탭으로 나눈 글 파일이라 스프레드시트에 붙여 넣으면 열로 나뉜다. 실행할 때마다 `#` 머리 줄(앱 버전, 잰 구간, 조합 수, 예상 시간)과 열 이름 줄이 새로 붙는다. 열 이름 다음 행이 제품 기본값이고, 그 아래로 설정 하나만 바꾼 조합, 둘을 바꾼 조합 순이다. 전원을 연결했을 때와 배터리일 때는 따로 돌려 따로 비교한다.
+
+| 열 | 뜻 |
+|---|---|
+| `combo` | `<장치>/<모델>/b<beam>/fa<0·1>/<half·cores>`. `--only`에 그대로 쓴다. half는 논리 CPU의 절반(지금 제품 값), cores는 물리 코어 수다 |
+| `device`, `gpu` | 실제로 돈 장치와 찾은 GPU 이름. GPU를 쓰지 못하면 gpu 조합도 `cpu`다 |
+| `threads`, `beam`, `fa` | 그 조합의 스레드 수, beam 크기(1은 greedy), flash attention |
+| `audio_s`, `speech_s` | 잰 구간의 길이와 그중 음성(초) |
+| `run_s`, `rtf` | 전사에만 걸린 시간과 그것을 구간 길이로 나눈 값. 작을수록 빠르고, 1이면 회의 길이만큼 걸린다 |
+| `load_s`, `wall_s` | 모델을 불러오는 데 걸린 시간, 워커를 띄워 끝날 때까지 걸린 전체 시간 |
+| `cer_pct` | 기준 전사본과 다른 글자의 비율(%). 기준 전사본이 없거나 실패한 조합은 빈칸 |
+| `power`, `saver`, `ecoqos` | 전원(`ac`·`battery`), 절전 모드(`1`·`0`), Windows 효율 모드를 끈 결과. macOS는 `?`와 `-` |
+| `status` | `ok`, 아니면 종료 코드와 워커의 마지막 오류 줄 |
+
 ## 개발 시작
+
+화면만 보려면 Bun만 있으면 된다(아래 "가장 빠른 길").
 
 ### 준비물
 

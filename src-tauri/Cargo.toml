@@ -47,6 +47,8 @@ whisper-rs = "0.16.0"
 whisper-rs-sys = "=0.15.0"
 # Model hashes. Same version the tree already has.
 sha2 = "0.10.9"
+# The bench's CER compares NFC text (plan 5.1-14). The version and data idna already pull in.
+icu_normalizer = { version = "2.3.0", default-features = false, features = ["compiled_data"] }
 # Model download, LLM and Slack. The OS TLS stack and certificate store, so a company mirror
 # with an in-house CA just works; system-proxy for company proxies.
 reqwest = { version = "0.13.5", default-features = false, features = ["native-tls", "system-proxy"] }
@@ -98,9 +100,9 @@ whisper-rs = { version = "0.16.0", features = ["metal"] }
 whisper-rs = { version = "0.16.0", features = ["vulkan"] }
 # Reference clocks and disk space (architecture 4.2, 4.6); for the summary engine (sidecar.rs) its
 # kill-on-close Job Object (whose functions and limits structs also need Security and Threading),
-# the supervisor's error mode (Diagnostics_Debug), EcoQoS (Threading) and the power state (Power).
-# Same version tauri already pulls in.
-windows-sys = { version = "0.61.2", features = ["Win32_System_WindowsProgramming", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_Debug", "Win32_System_Power"] }
+# the supervisor's error mode (Diagnostics_Debug), EcoQoS (Threading), the power state (Power) and
+# the bench's physical core count (SystemInformation). Same version tauri already pulls in.
+windows-sys = { version = "0.61.2", features = ["Win32_System_WindowsProgramming", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_Debug", "Win32_System_Power", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

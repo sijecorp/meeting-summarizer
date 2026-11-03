@@ -64,6 +64,7 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.rust-targets }}
+          components: clippy
 
       # Cargo, tauri-cli (cargo metadata) and tauri-action all follow CARGO_TARGET_DIR. rust-cache
       # does not, and joins an absolute target onto the workspace, hence the relative target-dir.
@@ -159,6 +160,16 @@ jobs:
         run: |
           if ($env:VULKAN_SDK) { $env:PATH = "$env:VULKAN_SDK\runtime\x64;$env:PATH" }
           cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+      # Windows-only code (EcoQoS, power mode, the bench's core count) is linted nowhere else: local
+      # clippy runs on macOS. Same profile, target dir and generator as cargo test, so whisper.cpp's
+      # CMake build is reused.
+      - name: cargo clippy (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CMAKE_GENERATOR_x86_64_pc_windows_msvc: Ninja
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:

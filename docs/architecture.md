@@ -59,7 +59,7 @@
 
 ```
 src-tauri/src/
-  main.rs            진입점 (기존). `--plan-chunks`·`--transcribe-worker` 인자로 실행되면 앱을 띄우지 않고 전사 워커로 동작 (5.3), `--llm-supervisor`면 요약 엔진의 감독으로 동작 (6.6)
+  main.rs            진입점 (기존). `--plan-chunks`·`--transcribe-worker` 인자로 실행되면 앱을 띄우지 않고 전사 워커로 동작 (5.3), `--transcribe-bench`면 전사 실측 (5.3), `--llm-supervisor`면 요약 엔진의 감독으로 동작 (6.6)
   lib.rs             Builder, 플러그인, 트레이, 명령 등록
   commands.rs        React에서 부르는 명령 모음
   settings.rs        settings.json 읽기·쓰기 + keyring 래퍼
@@ -73,7 +73,8 @@ src-tauri/src/
     mix.rs           게이팅 + 합산 (순수 로직)
   transcribe/
     model.rs         모델 다운로드·가져오기·검증
-    engine.rs        whisper-rs 실행, 백엔드 선택, 중단 콜백, VAD 기반 10분 구간 나누기
+    engine.rs        whisper-rs 실행, 백엔드·GPU 선택, 진단 줄, VAD 기반 10분 구간 나누기
+    bench.rs         전사 실측(`--transcribe-bench`): 조합마다 워커를 띄워 회의 폴더의 `bench.tsv`에 한 줄씩
     filter.rs        환각 필터, 비정상 결과 검사 (순수 로직)
   summarize.rs       OpenAI 호환 클라이언트, 연결 고르기, 프롬프트, 구간 요약, 실패 분류, 요약 eval(12.3)
   sidecar.rs         이 PC 요약 엔진(`llama-server`)의 감독·띄우기·끄기·다시 띄우기, 내장 실패 문구 (6.6)
@@ -228,7 +229,8 @@ for 각 20ms 프레임:
   - 파일마다 받기 전에 디스크를 본다. 남은 크기(표의 크기에서 `.part`를 뺀 것) + 1GB가 `audio::free_space`보다 크면 받지 않고 "요약 모델을 받으려면 디스크에 N GB가 더 필요합니다"(전사 모델·VAD는 "전사 모델을 받으려면")를 알린다. 다 찬 `.part`는 해시 확인만 남았으므로 보지 않는다.
   - 파일마다 3번까지 시도한다. 연결 실패·시간 초과·끊김만 다시 시도하고(이어받기), HTTP 오류와 해시 불일치는 바로 실패다. 실패해도 `.part`는 남아 다음 "받기"가 이어받는다.
   - 서버가 알려 준 전체 크기(200이면 `Content-Length`, 206이면 `Content-Range`의 `/전체`)가 표의 크기와 다르면 쓰기 전에 바로 멈추고 그 주소를 오류에 적는다. 헤더가 없으면 그대로 받고 끝의 해시로 본다. 이어받을 때는 응답의 `Content-Range` 시작이 `.part` 크기와 같을 때만 덧붙인다. 다르면 `.part`를 지우고 처음부터 받는다. `Range`를 보냈는데 200(파일 전체)이 오면 크기를 알려 주지 않아도 `.part`를 비우고 받고, 끝의 해시로 본다. 크기가 다 찬 `.part`는 받지 않고 해시 검증부터 한다.
-  - 진행률은 `model://download`로 파일의 약 1%마다, 그리고 이미 있던 파일이나 실패한 파일을 센 뒤에 보낸다. 파일의 `received`는 줄지 않고(처음부터 다시 받아도 가장 많이 보인 값을 지킨다) 파일 크기를 넘지 않는다. 받기 전체의 합계(`all_received`/`all_total`)에서 실패한 파일은 받은 만큼만 남으므로 전체 비율도 줄지 않는다. 취소(`cancel_model_download`)는 다운로드 작업을 어디서 기다리든 바로 끊고, 다음 파일도 받지 않는다. 범위를 주면 그 범위의 파일만 취소한다. 받는 중인 파일이면 다운로드 전체를 끊고, 아직 차례가 오지 않은 파일이면 받기 목록에서 빼기만 한다. 받은 만큼은 `.part`에 남고, 바로 직접 가져오기를 할 수 있다. 결과는 "모델 다운로드를 취소했습니다"다. 해시 확인(블로킹 작업)은 끊을 수 없어 끝까지 돌지만, 취소된 다운로드는 그 뒤로 파일 이름 바꾸기·삭제를 하지 않는다. 다운로드마다 취소 표시를 두고, 이름 바꾸기·삭제는 그 표시의 잠금 안에서 표시가 꺼져 있을 때만 한다. 취소도 같은 잠금 안에서 표시를 켠다.
+  - 진행률은 `model://download`로 파일의 약 1%마다, 받는 동안 1초마다(바이트가 오지 않아도), 그리고 이미 있던 파일이나 실패한 파일을 센 뒤에 보낸다. `bps`는 최근 10초의 평균 속도(바이트/초)이고 받기를 시작하고 10초가 지나야 생긴다. 이 창은 받기 전체에 걸쳐 이어져 파일이 바뀌어도 비우지 않는다(계획 5.2-2). 파일의 `received`는 줄지 않고(처음부터 다시 받아도 가장 많이 보인 값을 지킨다) 파일 크기를 넘지 않는다. 받기 전체의 합계(`all_received`/`all_total`)에서 실패한 파일은 받은 만큼만 남으므로 전체 비율도 줄지 않는다. 취소(`cancel_model_download`)는 다운로드 작업을 어디서 기다리든 바로 끊고, 다음 파일도 받지 않는다. 범위를 주면 그 범위의 파일만 취소한다. 받는 중인 파일이면 다운로드 전체를 끊고, 아직 차례가 오지 않은 파일이면 받기 목록에서 빼기만 한다. 받은 만큼은 `.part`에 남고, 바로 직접 가져오기를 할 수 있다. 결과는 "모델 다운로드를 취소했습니다"다. 해시 확인(블로킹 작업)은 끊을 수 없어 끝까지 돌지만, 취소된 다운로드는 그 뒤로 파일 이름 바꾸기·삭제를 하지 않는다. 다운로드마다 취소 표시를 두고, 이름 바꾸기·삭제는 그 표시의 잠금 안에서 표시가 꺼져 있을 때만 한다. 취소도 같은 잠금 안에서 표시를 켠다.
+  - 받는 동안은 받기 전용 스레드가 `keepawake`(`idle`, 화면은 꺼져도 됨)를 쥐어 PC가 잠들지 않게 한다(계획 5.2-4). 파일마다 받은 바이트, 걸린 시간, 평균 속도를 `app.log`에 한 줄 남긴다(8.1).
   - 대기열이 시작할 수 있는지 볼 때는 크기만 확인한다. 크기가 맞아도 내용이 틀릴 수 있으므로 "받기"는 설치된 파일의 해시를 다시 확인하고, 틀리면 지우고 다시 받는다. 워커가 모델을 불러오지 못하면(종료 코드 3) 대기열이 두 파일의 해시를 확인한다. 틀린 파일은 지우고 "손상됐습니다. 다시 받아 주세요", 없거나 읽을 수 없으면 "없거나 읽을 수 없습니다. 다시 받아 주세요", 둘 다 맞으면 파일 문제가 아니므로(예: 메모리 부족) 다른 앱을 닫고 다시 시도하라고 안내한다. 다운로드·가져오기가 도는 동안에는 해시만 보고 지우지 않는다(그 파일을 설치하는 중일 수 있다).
 - **직접 가져오기**: 녹음자가 고른 파일의 크기로 어느 모델인지 고르고(맞는 것이 없으면 거부), `{파일}.import`로 복사해 디스크에 내린(`sync_all`) 뒤 같은 방식으로 해시를 검증한다. 다운로드의 `.part`는 이어받기용으로 그대로 둔다. 다운로드 중에는 가져오기를 받지 않는다.
 - **모델이 없을 때**: 대기열은 회의를 시작하지 않고 기다리게 둔다. 파일 하나가 받아지거나 가져와질 때마다, 받기가 끝날 때, 설정을 저장할 때 대기열을 다시 돌린다. 시작한 뒤에 모델이 없어졌으면 그 회의를 실패로 두지 않고 대기열 맨 앞에 돌려놓는다.
@@ -243,9 +245,10 @@ for 각 20ms 프레임:
 3. 구간마다 워커를 띄워 Whisper를 실행한다. VAD상 음성이 0인 구간은 워커를 띄우지 않고 빈 결과로 둔다.
    - **VAD는 워커가 직접 한다.** whisper.cpp는 VAD 단계(음성만 잘라 이어 붙이기)를 `whisper_full` 안에서만 한다. whisper-rs 0.16의 `WhisperState::full`은 `whisper_full_with_state`를 불러 이 단계를 건너뛰므로, `enable_vad`만 켜면 무음과 잡음까지 전사한다(tiny 모델로 잡음을 넣으면 "MBC 뉴스 …입니다"가 나왔다). 그래서 워커가 같은 Silero 모델(기본 파라미터)로 구간의 음성을 찾고, whisper.cpp와 같은 방식으로 이어 붙인다(구간마다 뒤로 0.1초 더, 사이에 0.1초 무음). 세그먼트 시각은 원래 녹음 시각으로 되돌린다. 음성이 없으면 Whisper 모델을 불러오지 않는다.
    - 시각 되돌리기는 일부러 whisper.cpp와 다르다. whisper.cpp는 이어 붙인 오디오와 원래 오디오 사이를 선형으로 보간한다. 여기서는 음성 조각 안에서는 1:1로 옮기고, 조각 사이(잘라 낸 무음 자리)에 떨어진 시각은 가까운 발화 쪽으로 붙인다. 세그먼트 시작은 다음 조각의 시작으로, 끝은 앞 조각의 끝으로 간다. 그래서 세그먼트가 잘라 낸 무음만큼 일찍 시작하거나 늦게 끝나지 않는다.
-   - 파라미터: `language="ko"`, 위의 VAD, `no_context=true`, `suppress_nst=true`, `temperature` 폴백 기본값 유지.
+   - 파라미터: `language="ko"`, 위의 VAD, `no_context=true`, `suppress_nst=true`, `temperature` 폴백 기본값 유지, flash attention(1.0.3). flash attention은 UI 없는 설정 키 `transcribe_flash_attn`(기본 true)을 대기열이 `--fa`로 넘기므로, 어떤 GPU에서 결과가 이상하면 `settings.json`만 고쳐 끈다.
    - 샘플링은 beam search(beam 5)다. S2가 쓰는 `whisper-cli`의 기본값과 같아야 S2의 속도·정확도가 앱에 그대로 맞는다.
-   - 스레드 수는 논리 CPU의 절반이다. 워커가 2개까지 동시에 돌기 때문이다(TRN-01). SMT 기기에서는 물리 코어 수, Apple Silicon에서는 코어의 절반이다. S2에서 측정해 조정한다.
+   - 스레드 수는 논리 CPU의 절반이다. 워커가 2개까지 동시에 돌기 때문이다(TRN-01). SMT 기기에서는 물리 코어 수, Apple Silicon에서는 코어의 절반이다.
+   - beam과 스레드 수의 기본값은 전사 실측(5.3) 뒤에 다시 정한다(계획 5.1-15). 워커 플래그로는 이미 바꿀 수 있다.
    - 용어집을 initial prompt에 넣을지는 **[S2]**로 정한다. 지금은 넣지 않는다. S2에서 넣기로 하면 용어집을 워커 인자 하나로 더 넘겨 `set_initial_prompt`에 넣는다(Whisper는 앞쪽 약 224토큰만 쓴다).
 4. 구간 결과(환각 필터를 거친 세그먼트)를 `transcript.partial.jsonl`의 한 줄로 저장한다. 형식: `{"chunk":3,"start_ms":...,"end_ms":...,"segments":[{"start_ms","end_ms","text"}]}`. 시각은 녹음 시작 기준 ms다. 파일에 덧붙이지 않고 매번 전체를 원자적으로 다시 쓴다(구간 24개 이하, 각 수 KB). 강제 종료가 반쯤 쓴 줄을 남기지 않게 하려는 것이다. `meta.json`의 `chunks_done`과 `backend`(마지막 구간을 처리한 장치)도 함께 고친다.
 5. 마지막 구간이 끝나면 합쳐서 `transcript.json`을 쓰고 상태를 `transcribed`로 바꾼다. 형식: `{"segments":[{"start_ms","end_ms","text"}]}` (모든 구간의 세그먼트를 순서대로). 요약(M4)은 이 파일을 읽는다.
@@ -258,8 +261,11 @@ for 각 20ms 프레임:
 
 ```
 queue.rs ──spawn── 앱 실행 파일 --transcribe-worker {회의 폴더} {시작 ms} {끝 ms} {gpu|cpu} {모델} {VAD 모델}
+   │                    [--lang ko] [--beam 5] [--threads n] [--fa 1] [--gpu-device n]
    ▲                    │ stdout: JSON 한 줄씩
+   │                    │   {"type":"device","device":"gpu","name":"NVIDIA GeForce RTX 3050"}
    │                    │   {"type":"progress","pct":42}
+   │                    │   {"type":"diag","line":"chunk device=gpu gpu=\"NVIDIA …\" … rtf=0.120 …"}
    │                    │   {"type":"result","device":"gpu","segments":[{"start_ms","end_ms","text"}]}
    └──── 종료 코드 ─────┘ 0 = 정상, 그 외 = 실패/크래시
 
@@ -270,9 +276,13 @@ queue.rs ──spawn── 앱 실행 파일 --plan-chunks {회의 폴더} {VAD 
 
 - 워커 인자는 회의 id 대신 경로를 받는다. 워커는 Tauri 앱을 띄우지 않으므로 앱 데이터 폴더를 알 수 없고, 알 필요도 없다. `main.rs`가 Tauri 빌더보다 먼저 인자를 보므로 워커는 창을 열지 않고 단일 실행 검사에도 걸리지 않는다.
 - `result`의 `device`는 실제로 돈 장치다. GPU 컨텍스트를 만들지 못하면 워커가 CPU로 바꿔 `cpu`를 보낸다(5.4).
-- 워커는 stdin을 읽고 있다가 닫히면(앱이 크래시·강제 종료됨) 바로 끝난다. 자식 프로세스는 부모가 죽어도 남기 때문에, 이게 없으면 다시 켠 앱의 새 워커 옆에서 남은 워커가 GPU와 메모리를 계속 쓴다.
+- **선택 플래그** (1.0.3, 계획 5.1-1): `--lang`(기본 `ko`), `--beam <1..8>`(5, 1은 greedy), `--threads <n>`(논리 CPU의 절반), `--fa <0|1>`(1), `--gpu-device <n>`(자동, 5.4). 플래그를 빼면 `engine.rs` 한 곳의 제품 기본값이다. 모르는 플래그, 중복, 범위 밖 값, 값 없는 플래그는 종료 코드 `2`와 새 인자까지 담은 사용법 문구로 끝난다. 대기열은 `--lang ko --beam 5 --threads <절반> --fa <설정>`을 넘기고 GPU는 워커가 고른다.
+- **장치 줄과 진단 줄** (계획 5.1-3, 5.1-4): 모델을 불러온 직후 `device` 줄(실제 장치와 고른 GPU 이름, GPU를 하나도 못 찾았으면 빈 값)을, 결과 줄 바로 앞에 `diag` 줄을 낸다. 진단 줄은 `chunk` 뒤에 `key=value`이고, 공백이나 따옴표가 있는 값은 큰따옴표로 감싸며 안의 `"`·`\`는 백슬래시로 막는다. 키: `device gpu gpus gpu_device threads beam fa lang audio_s speech_s load_s run_s rtf power saver ecoqos`(단위는 키 이름의 `_s`). macOS는 `power=? saver=? ecoqos=-`다. 대기열은 이 줄에 회의 id와 앱 버전을 붙여 `app.log`에 옮긴다(8.1).
+- **EcoQoS 끄기 (Windows, 계획 5.1-7)**: 워커는 시작하자마자 자기 프로세스에 `SetProcessInformation(ProcessPowerThrottling)`으로 실행 속도 조절(EcoQoS)을 끄고 결과(`ok`, `err:N`)를 진단 줄 `ecoqos`에 남긴다. 앱 프로세스도 시작할 때 자기에게, 그리고 띄운 `llama-server`에 같은 설정을 건다. Windows가 효율 코어와 낮은 클럭으로 옮기지 않게 하려는 것이다. 우선순위는 바꾸지 않고, 실패는 로그만 남기고 계속한다.
+- 워커는 stdin을 읽고 있다가 닫히면(앱이 크래시·강제 종료됨) 바로 끝난다. 자식 프로세스는 부모가 죽어도 남기 때문에, 이게 없으면 다시 켠 앱의 새 워커 옆에서 남은 워커가 GPU와 메모리를 계속 쓴다. 이 감시는 `--plan-chunks`·`--transcribe-worker`에만 있다. 전사 실측은 앱이 띄우지 않고, Windows GUI 프로그램에는 stdin이 아예 없다.
 - Windows는 `CREATE_NO_WINDOW`로 띄워 콘솔 창이 뜨지 않게 한다.
-- 워커는 결과 줄을 출력한 뒤 stdout을 비우고 소멸자 없이 바로 끝난다(macOS `_exit`, Windows `process::exit`). Metal·Vulkan 정리 단계의 크래시가 이미 보낸 결과를 지우고 `gpu_failed`를 남기지 않게 하려는 것이다. stdin 감시로 끝날 때도 같다.
+- 워커는 결과 줄을 출력한 뒤 stdout을 비우고 소멸자 없이 바로 끝난다(macOS `_exit`, Windows `TerminateProcess(GetCurrentProcess())`. `process::exit`는 정적 소멸자를 돌려 Vulkan 정리 중에 죽을 수 있다). Metal·Vulkan 정리 단계의 크래시가 이미 보낸 결과를 지우고 `gpu_failed`를 남기지 않게 하려는 것이다. stdin 감시로 끝날 때도 같다.
+- **전사 실측** (`bench.rs`, 계획 5.1-14): `--transcribe-bench <회의 폴더>`는 설치된 앱 실행 파일로 돈다. 녹음(`mic.wav`, 있으면 `system.wav`)을 임시 폴더에 복사하고, 회의의 `chunks.json`(없으면 `--plan-chunks`)의 구간 중 잴 범위(기본 앞 10분)에 든 것을 조합마다 자기 자신을 `--transcribe-worker`로 띄워 전사한다. 자식의 stdin은 pipe로 쥔다. 조합은 beam(5, 1), fa(1, 0), 스레드(절반, 물리 코어), 모델(설치된 `large-v3-turbo-q8_0`·`medium-q5_0`), 장치(gpu, cpu)이고, 제품 기본값이 먼저, 하나만 바꾼 조합이 그다음이다. 시작 전에 예상 시간을 쓰고, 조합 하나가 끝날 때마다 회의 폴더의 `bench.tsv`에 진단 줄 값을 구간에 걸쳐 더한 한 줄을 덧붙인다. 회의 폴더에는 이 파일만 쓴다. 기준 전사본이 있으면 CER(NFC 정규화 뒤 글자·숫자만 남긴 편집 거리 ÷ 기준 글자 수)도 적는다. 실행법과 열은 README "전사 실측"이다. 무시된 테스트 `transcribe_eval`(`cargo test --release`)은 같은 함수를 부른다.
 - **무응답 감시**: 워커가 stdout에 5분 동안 한 줄도 내지 않으면 부모가 kill하고 크래시로 센다(5.4의 GPU 재시도 대상). 워커는 Whisper 창(30초 분량)마다, 구간 나누기는 10분 창마다 진행률을 낸다. 874MB 모델 로딩도 수 초다.
 - 부모는 stdout을 바이트로 읽어 한 줄씩 JSON으로 해석한다. 우리 줄이 아니거나 UTF-8이 아닌 줄은 건너뛴다. stdout이 닫힌 뒤에도 프로세스가 실제로 끝날 때까지는 kill할 수 있게 둔다.
 
@@ -290,8 +300,10 @@ queue.rs ──spawn── 앱 실행 파일 --plan-chunks {회의 폴더} {VAD 
 - **Vulkan 로더 동봉**: Vulkan 빌드는 `vulkan-1.dll`에 로드 타임 의존성이 있다. 이 DLL이 없는 PC에서는 앱이 아예 시작되지 않는다. 그래서 LunarG Vulkan Loader(Apache-2.0)의 `vulkan-1.dll`을 실행 파일 옆에 함께 설치한다. `src-tauri/tauri.windows.conf.json`의 `bundle.resources`(`"vulkan-1.dll": "vulkan-1.dll"`)로 NSIS가 `$INSTDIR`(실행 파일 옆)에 설치하고, 제거할 때 지운다. 원본은 CI가 Vulkan SDK 1.4.313.2의 런타임에서 `src-tauri/vulkan-1.dll`로 복사한다(11.3). CI 빌드는 통과했다(11.3). 설치한 뒤 DLL이 실행 파일 옆에 놓이고 앱이 뜨는지는 실제 Windows PC에서 확인한다.
 - **자동 선택 순서**:
   1. `settings.json`에 `gpu_failed=true`가 있으면 CPU를 쓴다.
-  2. GPU 컨텍스트 생성을 시도하고, 실패하면 CPU로 바꾼다. GPU 장치가 아예 없으면 whisper.cpp가 스스로 CPU로 돈다. 이 경우 워커는 `gpu`로 보고하므로 `meta.json`의 `backend`가 실제와 다를 수 있다.
+  2. GPU 컨텍스트 생성을 시도하고, 실패하면 CPU로 바꾼다. GPU 장치가 아예 없으면 처음부터 CPU로 불러오고 `cpu`로 보고한다.
+- **GPU 고르기** (1.0.3, 계획 5.1-8): 워커가 ggml 장치를 whisper.cpp와 같은 방식으로 센다(GPU와 내장 GPU, 등록 순서). 외장 GPU가 있으면 첫 외장 GPU, 없으면 첫 내장 GPU를 쓰고, `--gpu-device`가 있으면 그 번호를 쓴다. whisper.cpp의 기본(0번)이 아닌 GPU에서 모델 불러오기가 실패하면 0번으로 한 번 더 불러 본 뒤 CPU로 간다. 내장 GPU가 먼저 등록되는 노트북에서 외장 GPU를 쓰게 하려는 것이다. 실행 중 충돌은 아래 크래시 판정 그대로다.
 - **강제 설정**: 설정에서 백엔드를 "GPU"로 바꾸면 `gpu_failed`를 `false`로 되돌린다. "CPU"로 바꾸면 항상 CPU를 쓴다. "GPU"일 때는 `gpu_failed`와 상관없이 구간마다 GPU로 시작한다.
+- **새 버전에서 한 번 풀기** (계획 5.1-10): 앱 버전마다 처음 켤 때 한 번 `gpu_failed`를 지우고 처리한 버전을 설정(`gpu_reset_version`)에 남긴다. 예전 버전의 GPU 충돌로 CPU에 묶인 PC도 새 버전의 GPU 처리를 한 번 받는다. 그 뒤에 다시 생긴 표시는 그대로 둔다.
 - **`gpu_failed`는 대기열이 쓴다**: 설정 화면의 저장(`save_settings`)은 저장돼 있던 `gpu_failed` 값을 그대로 두고, 백엔드가 "GPU"로 바뀔 때만 `false`로 만든다. 설정 화면이 대기열이 쓴 값을 예전 값으로 덮어쓰지 않게 하려는 것이다. 대기열은 `mark_gpu_failed`로 따로 쓴다.
 - 장치는 구간마다 설정을 다시 읽어 정한다. 그래서 한 회의가 `gpu_failed`를 쓰면 함께 돌던 다른 회의도 다음 구간부터 CPU를 쓴다.
 - **GPU 워커 크래시** (5.3 종료 코드 계약의 "크래시", 또는 kill하지 않았는데 결과 없이 끝남):
@@ -530,6 +542,7 @@ Queue의 Sidecar ──spawn── 앱 실행 파일 --llm-supervisor {llama-ser
 - `settings.json`은 앱 데이터 폴더(Tauri `app_data_dir`, Windows는 `%APPDATA%`)에 둔다.
 - 용량이 큰 `models/`와 `meetings/`는 **로컬 앱 데이터 폴더**(Tauri `app_local_data_dir`, Windows는 `%LOCALAPPDATA%`)에 둔다. Windows Roaming 프로필 동기화에 녹음 파일과 GB 단위 모델이 섞이지 않게 하려는 것이다(M1 코드 리뷰). macOS는 두 경로가 같다.
 - 앱 로그 `app.log`는 Tauri `app_log_dir()`에 둔다(macOS `~/Library/Logs/com.sije.meeting-summarizer/`, Windows `%LOCALAPPDATA%\com.sije.meeting-summarizer\logs\`). Windows 릴리스는 stderr를 버리므로 `tauri-plugin-log`로 이 파일에 info 이상을 남긴다. 터미널(stdout)에도 같이 쓴다. 5MB를 넘으면 날짜를 붙여 돌려쓰고 이전 파일은 2개까지 둔다(최대 약 15MB). 줄의 시각과 돌려쓴 파일 이름의 날짜는 UTC다. 로그 때문에 앱이 멈추지는 않는다: 시작할 때 `app.log`를 열거나 돌려쓰지 못하면(다른 프로그램이 파일을 잡고 있음, 읽기 전용 프로필) 그 실행 동안은 stdout에만 쓰고 그 사실을 첫 줄로 남긴다. 실행 중에 돌려쓰기가 막히면 그동안의 줄을 메모리에 모아 두고 다음 줄마다 다시 시도해, 파일이 풀리면 한꺼번에 쓴다. 패닉도 이 로그에 남긴다(릴리스는 패닉 때 바로 끝난다). 전사 워커는 이 로그를 쓰지 않는다(stderr는 `worker.log`, 5.3). 요약 엔진의 출력은 같은 폴더의 `llama-server.log`에 남긴다(6.6). 첫 줄은 실행 인자다. 키는 인자에 없고, 로그에 남는 것은 `llama-server`가 쓰는 키의 끝 4자(`****abcd`)뿐이다(요약마다 새 키). 한 실행에 5MB까지 쓴다. 띄울 때마다 이전 파일을 `llama-server.prev.log`로 옮겨 GPU에서 죽은 기록이 CPU 재시작에 지워지지 않게 한다. 설정 일반 탭의 "로그 폴더 열기"가 이 폴더를 연다.
+  - **측정 줄** (1.0.3, 계획 5.1-13, 5.2-1): 느린 PC의 원인을 이 로그 하나로 가르게 `종류 key=value …` 한 줄씩 남긴다. 전사 구간마다 워커의 진단 줄(5.3)에 `id=`(회의)와 `app=`(앱 버전)을 붙인 `chunk device=… gpu=… threads=… beam=… fa=… audio_s=… run_s=… rtf=… power=… saver=… ecoqos=…`, 회의의 전사가 끝나면 `meeting id=… audio_s=… run_s=… rtf=… device=…`, 모델 파일을 받을 때마다 `download file=… bytes=… secs=… bps=… connections=1`이다.
 
 ```
 {앱 데이터}/
@@ -621,6 +634,8 @@ recording ─▶ recorded ─▶ transcribing ─▶ transcribed ─▶ summariz
 - **대기열에 들어가는 때** (TRN-01): 앱 시작(복구 뒤), 녹음이 끝날 때, 설정 저장, 요약 모델 도착, `resume_meeting`(중단된 녹음의 "처리 계속", `transcribe_failed` 재시도), `retry_summary`(`summarize_failed` 다시 실행, 기다리는 회의의 연결 바꾸기). 앞의 네 경우는 `recorded`·`paused` 회의를 모두 오래된 순서로 넣되, 요약만 남은 회의(`transcribed`, 전사본이 있는 `paused`)는 경로가 풀릴 때만 넣고 풀리지 않으면 `wait`를 쓴다. 이미 줄에 있거나 실행 중인 회의는 다시 넣지 않는다.
 - 전사 모델 파일이 없으면 전사할 회의는 시작하지 않고 기다린다(5.1). 받기·가져오기가 끝나면 시작한다.
 - 삭제는 `deleting`을 먼저 쓰고, 대기열에서 빼고, 워커를 kill하고, 그 회의의 처리가 끝날 때까지 기다린 뒤 폴더를 지운다(8.3 2~3단계). 같은 회의를 두 번 지우면 두 번째도 처리가 끝나기를 기다린다. 먼저 끝난 쪽이 폴더를 지웠으면 두 번째는 그대로 성공한다.
+- **처리 중 잠자기 방지** (1.0.3, 계획 5.1-9): 대기열의 전원 스레드 하나가 처리 중인 회의(전사·요약)가 하나라도 있는 동안 `keepawake`(`idle`, 화면은 꺼져도 됨)를 쥐고, 0이 되면 놓는다. Windows는 이 요청을 요청한 스레드에 묶으므로 처리 스레드가 아니라 이 스레드가 쥔다. 모델 받기도 같은 방식으로 쥔다(5.1).
+- **느림 이유** (1.0.3, 계획 5.1-11): 같은 스레드가 30초마다, 그리고 진행 줄마다 처리 중인 회의의 이유를 다시 판단해 바뀌면 `meeting://progress`의 `slow`로 보낸다(10.2). 대기열 잠금을 쥔 채 OS를 부르지 않고, 앱이 끝나면 멈춘다. 실시간 배수는 이번 실행에서 걸린 시간 ÷ 처리한 오디오 길이이고, GPU에서 CPU로 바뀌면 다시 잰다. 재기 시작하고 60초 동안은 마지막 판단을 그대로 둔다. Windows의 전원 모드는 `PowerRegisterForEffectivePowerModeNotifications`로 받는다(그래서 지원 최소 버전이 Windows 10 1809다, 11.2).
 - 처리 스레드가 패닉해도(디버그 빌드) 실패로 기록하고 자리를 비운다. 릴리스 빌드는 `panic = "abort"`라 앱이 끝나고, 다음 실행 때 복구가 처리한다.
 - **단일 실행** (APP-06, eng review D14): `tauri-plugin-single-instance`를 빌더에 가장 먼저 등록한다. 두 번째 실행은 즉시 끝나고, 실행 중인 인스턴스가 메인 창을 보여 주고 앞으로 가져온다. 그래서 아래 복구는 항상 회의 폴더를 소유한 인스턴스 하나에서만 돈다.
 - 앱 시작 시 `store.rs`의 복구 함수가 모든 `meta.json`을 읽어 다음을 한다.
@@ -798,7 +813,7 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 | `list_meetings` (항목마다 `interrupted`: 중단된 녹음), `get_meeting(id)` → `{ meta, summary, sending }` (`summary`는 요약 본문: 고친 `summary.md`, 없으면 `summary.generated.md`에서 제목 줄을 뺀 것, 둘 다 없으면 빈 문자열. `sending`은 이 회의의 Slack 전송이 돌고 있는지, 7.1), `get_transcript(id)` → `[{ start_ms, end_ms, text }]` (`transcript.json`의 세그먼트, 읽기 전용. 경로는 `store.rs`의 `dir_for`로만 만든다), `delete_meeting` (녹음 중이면 먼저 녹음을 끝낸다) | `recording://warning` `{ kind, message }` (`disk`, `mic_permission`, `mic_device`, `system_device`, `silence`, `length`, `sleep`. 같은 `kind`는 앞의 경고를 바꾼다) |
 | `resume_meeting(id)`: 중단된 녹음의 "처리 계속", `transcribe_failed` 재시도. 둘 다 대기열에 넣는다 | `recording://stopped` `{ id, message }` (녹음 종료. 스스로 끝난 경우 `message`에 이유) |
 | `summary_route(id)` → `{ connection, local, local_available, locked, toggle_matters }` (`connection`은 요약이 갈 연결(`LlmConnection`, 비밀값 없음), 고를 수 없으면 `null`. 아무것도 보내지 않은 회의(`no_speech`, 또는 `llm_connection` 없이 `review`·`sent`·`archived`가 된 회의)도 `null`이라 SUM-07의 "전송됨"이 거짓으로 뜨지 않는다. `local`은 회의의 "로컬로 요약", `local_available`은 요약 모델이 설치돼 있거나(`builtin_ready`) 저장한 로컬 연결이 있는지, `locked`는 요약이 시작돼 바꿀 수 없는지, `toggle_matters`는 "로컬로 요약"을 뒤집으면 요약이 갈 곳이나 기다리는 이유가 바뀌는지(`route`를 두 번 풀어 비교한다. 로컬 기본, 모델이 있는 "이 PC" 기본, 고정된 회의는 거짓). 6.1), `set_summarize_local(id, local)` → 같은 값 (잠긴 뒤, 또는 `local_available`이 아닌데 켜면 실패. 기다리던 회의면 대기열에 넣기를 다시 한다). 내장 경로의 `connection`은 이름이 `builtin`이고 주소가 빈 값이다 | `meeting://progress` `{ id, status, chunk, chunks, percent, eta_secs, position, engine_since }` (아래). 상태 변경 이벤트는 따로 두지 않는다. 화면은 이 이벤트의 `status`가 바뀔 때 목록을 다시 읽는다 |
-| `save_summary(id, title, body)` → `Meta` (`review`에서만. 본문은 `summary.md`, 제목은 `meta.title`. 제목은 줄바꿈·제어 문자를 공백 하나로 바꿔 한 줄로 저장한다. `.md` 내보내기의 `# 제목` 줄과 파일 이름이 되기 때문이다), `archive_meeting(id)` → `Meta` ("전송 안 함", `review` → `archived`) | `model://download` `{ file, received, total, all_received, all_total }` (파일의 약 1%마다. `all_*`는 받기 전체의 합계) |
+| `save_summary(id, title, body)` → `Meta` (`review`에서만. 본문은 `summary.md`, 제목은 `meta.title`. 제목은 줄바꿈·제어 문자를 공백 하나로 바꿔 한 줄로 저장한다. `.md` 내보내기의 `# 제목` 줄과 파일 이름이 되기 때문이다), `archive_meeting(id)` → `Meta` ("전송 안 함", `review` → `archived`) | `model://download` `{ file, received, total, all_received, all_total, bps }` (파일의 약 1%마다와 받는 동안 1초마다. `all_*`는 받기 전체의 합계, `bps`는 최근 10초 평균 속도이고 처음 10초는 `null`, 5.1) |
 | `retry_summary(id, connection)` → `Meta` (`summarize_failed`, `transcribed`, 전사본이 있는 `paused`에서. `connection`은 `list_connections`의 이름이고 `builtin`도 된다. 그 연결로 경로가 풀리지 않으면 거부한다: 없는 연결이면 "…찾을 수 없습니다. 다른 연결을 골라 주세요", 요약 모델 없는 `builtin`이면 "…요약 모델을 먼저 받아 주세요". 고른 연결을 `llm_connection`에 쓰고 `wait`를 지운 뒤 대기열에 넣는다, SUM-06, 8.4), `list_connections` → `[{ name, label, host, is_local, builtin }]` (저장한 연결과 마지막의 내장 경로. 내장 경로는 `name` `builtin`, `label` "이 PC", `host` 빈 값이다. 예약 이름으로 저장된 연결은 빠진다. 비밀값 없음, 6.1), `export_markdown(id)` → 저장한 경로, 취소하면 `null` (REV-05. 저장 대화상자를 Rust가 열어 웹뷰가 쓸 경로를 넘기지 않는다. 파일은 `# 제목`, 요약 본문, `---`, `## 전사본`, `[mm:ss] 텍스트` 줄 순서다. 기본 파일 이름은 제목(없으면 회의 id)에서 경로 구분자, Windows가 거부하는 문자(`\ / : * ? " < > |`), 제어 문자를 `_`로 바꾼 것이다. Rust 쪽 대화상자 API는 웹뷰 권한(capability) 검사를 거치지 않으므로 권한을 더하지 않는다) | `transcribe://gpu-failed` `{ message }` (GPU 크래시 2번 → CPU로 전환, 5.4) |
 | `slack_length(id, title, body, offset_minutes)` → 글자 수 (REV-02, 7.1. `offset_minutes`는 회의 시작 시각의 현지 UTC 시차(분), JS에서는 `offsetMinutes`), `send_to_slack(id, channel, title, body, offset_minutes)` → `Meta` (`channel`은 `slack_channels`의 `{ id, name, private }`. 먼저 `save_summary`처럼 저장하고 보낸다. 성공하면 `sent`, 실패하면 `review` + `error`와 함께 원인을 돌려준다. 같은 회의의 전송이 돌고 있으면 거부한다, 7.1) | `app://open-meeting` (회의 id. 그 회의의 OS 알림을 눌렀다. 창은 이미 보인다, 10.1) |
 | `queue_state` → `meeting://progress`와 같은 항목의 배열. 이벤트가 오기 전 첫 화면용 (실행 중인 회의 먼저, 그다음 대기 순서) | `slack://finished` (회의 id. 그 회의의 전송이 끝났다, 성공이든 실패든. 앱은 목록을, 그 회의의 문서는 회의를 다시 읽는다, 7.1) |
@@ -821,6 +836,7 @@ Tauri 2는 종료 경로에 따라 보내는 이벤트가 다르다(tauri #9198,
 | `eta_secs` | 남은 시간(초). 이번 실행에서 처리한 오디오 길이와 걸린 시간의 비율을 남은 길이에 곱한다. 처리한 오디오가 1분이 안 되거나 10초가 안 지났으면 `null`. 요약 중에는 항상 `null` |
 | `position` | 기다리는 동안 1부터 세는 대기 순서. 실행 중이면 `null` |
 | `engine_since` | 내장 요약의 엔진이 뜨기 시작한 시각(유닉스 초). 큐의 처리 스레드가 `Sidecar::start` 직전에 쓰고, 준비되거나 실패하면 `null`로 보낸다(플랜 5.3, 최대 120초). 화면은 이 값에서 "요약 엔진 준비 중 · N초"를 센다. 요약 중 다시 띄우기(`on_failure`)에는 싣지 않는다 |
+| `slow` | 느림 이유(8.4). `saver`(Windows에서 배터리이고 전원 모드가 BatterySaver·BetterBattery, 전사·요약 모두), `cpu`(실시간 배수가 1보다 크고 백엔드가 자동·GPU인데 CPU로 전사), `cpu_nogpu`(같은데 GPU를 하나도 못 찾음), `slow`(그 밖에 배수가 1보다 큼), 아니면 `null`. 요약 중에는 `saver`만 |
 
 ### 10.3 색상 토큰
 
@@ -895,6 +911,7 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 - **WebView2**: Tauri 기본값(`downloadBootstrapper`)을 그대로 쓴다. Windows 10/11 대부분에는 WebView2가 이미 설치돼 있다. 없는 PC에서는 WebView2 설치에 관리자 권한을 요구할 수 있다(NFR-06의 예외).
 - **Vulkan 로더**: `vulkan-1.dll`을 `$INSTDIR`(실행 파일 옆)에 설치한다(5.4).
 - **공용 컨트롤 v6 매니페스트** (2026-10-20): `build.rs`가 tauri-build의 매니페스트를 끄고(`new_without_app_manifest`) 같은 내용(`src-tauri/windows-app-manifest.xml`)을 링커(`/MANIFEST:EMBED`, `/MANIFESTINPUT`)로 모든 실행 파일에 넣는다. tauri-build는 앱 실행 파일에만 넣어서, 테스트 실행 파일이 comctl32 v5를 읽고 dialog 플러그인의 `TaskDialogIndirect`를 찾지 못해 테스트 전에 `STATUS_ENTRYPOINT_NOT_FOUND`(0xc0000139)로 죽었다(tauri-apps/tauri#13419, CI에서 Windows `cargo test`를 처음 돌린 v1.0.0 빌드).
+- **지원 최소 버전**: Windows 10 1809. 앱이 `PowerRegisterForEffectivePowerModeNotifications`(8.4)를 실행 파일이 뜰 때 찾으므로 그 전 버전에서는 앱이 시작하지 않는다. 대신 보기 경로는 두지 않는다(`docs/install.md`).
 - **CPU**: 전사 빌드의 기준은 AVX2·FMA·F16C·BMI2다(M6.5 계획의 H4, 11.3). 이것이 없는 CPU에서는 워커가 잘못된 명령어로 죽어 GPU 실패로 오인되므로, 전사를 시작할 때 워커를 띄우기 전에 확인해(`queue.rs`의 `cpu_failure`) 그 회의를 `transcribe_failed`로 끝내고 "이 PC의 CPU는 전사에 필요한 AVX2 등의 명령어를 지원하지 않아 전사할 수 없습니다. AVX2를 지원하는 PC(대부분의 Intel Core·AMD Ryzen)에서 실행해 주세요"를 보여 준다. `gpu_failed`로 세지 않고, 자동 재시도나 CPU 전환도 없다.
 - **OS 알림** (APP-03): 토스트(`tauri-winrt-notification`)의 클릭은 토스트가 화면에 있는 동안만 앱으로 온다. 알림 센터로 넘어간 뒤 누르면 OS가 앱을 실행하고, 단일 실행(APP-06)이 메인 창만 앞으로 가져온다(회의로 가지 않는다). 토스트의 앱 ID(AUMID)는 설치된 앱에서만 번들 식별자이고, `target\debug`·`target\release`에서 실행하면 PowerShell의 것을 쓴다. 실제 토스트 클릭은 아직 Windows에서 확인하지 않았다(로드맵 M5). 기다리는 스레드는 토스트가 화면에서 사라질 때(`Dismissed`, 시간 초과 포함) 끝나 쌓이지 않으므로, 11.1의 포커스 때 지우기는 Windows에서 하지 않는다.
 
@@ -910,7 +927,7 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
   - CMake 옵션은 `scripts/llama-server.flags` 한 곳에 있다. 빌드는 `scripts/build-llama-server.sh`(macOS)와 `.ps1`(Windows)이 하고, CI도 같은 스크립트를 부른다.
   - 결과는 저장소 밖 캐시에 커밋·대상·옵션 해시별로 남는다(macOS `~/Library/Caches/meeting-summarizer/llama-server`, Windows `%LOCALAPPDATA%\meeting-summarizer-dev\llama-server`(설치 폴더 `%LOCALAPPDATA%\meeting-summarizer`와 겹치지 않게), `MS_LLAMA_SERVER_CACHE`로 바꾼다). Windows는 260자 한계 때문에 `C:\t\lls`에서 빌드한다(`MS_LLAMA_SERVER_WORK`로 바꾼다).
   - 바이너리 옆 도장(`llama-server-<target-triple>.stamp`, 커밋과 옵션 해시)을 `build.rs`가 본다. 개발 빌드는 사이드카가 없으면 빈 자리표시를 만들고, 자리표시이거나 도장이 다르면 경고만 한다. release 빌드와 `tauri build`(`--debug` 포함)는 자리표시, 도장 없음, 도장 불일치에서 멈춘다.
-  - 워크플로는 사이드카를 빌드한 뒤 캐시를 바로 저장하고, `bun run app:dev --check`와 테스트를 돌린다. 설치 파일을 만든 뒤에는 이것을 확인한다. macOS: 앱과 dmg 안의 사이드카, `otool -L`이 시스템 라이브러리뿐, Hardened Runtime 서명. Windows: `dumpbin /dependents`가 시스템 DLL과 `vulkan-1.dll`뿐, zmm 명령 없음, 설치 파일 안에서 앱·`llama-server.exe`·`vulkan-1.dll`이 한 폴더.
+  - 워크플로는 사이드카를 빌드한 뒤 캐시를 바로 저장하고, `bun run app:dev --check`와 테스트를 돌린다. Windows는 `cargo clippy --all-targets -- -D warnings`도 돌린다. 로컬 clippy는 macOS라 `cfg(windows)` 코드를 보지 않기 때문이다. 설치 파일을 만든 뒤에는 이것을 확인한다. macOS: 앱과 dmg 안의 사이드카, `otool -L`이 시스템 라이브러리뿐, Hardened Runtime 서명. Windows: `dumpbin /dependents`가 시스템 DLL과 `vulkan-1.dll`뿐, zmm 명령 없음, 설치 파일 안에서 앱·`llama-server.exe`·`vulkan-1.dll`이 한 폴더.
 - **Windows 빌드 환경**: `windows-latest`(Visual Studio 18 2026, CMake 4.4)에서 두 가지를 맞췄다. (1) Visual Studio 생성기로는 ggml-vulkan이 따로 구성하는 `vulkan-shaders-gen`이 컴파일러를 찾지 못해, MSVC 개발 환경(`ilammy/msvc-dev-cmd`)에서 Ninja로 빌드한다(`CMAKE_GENERATOR_x86_64_pc_windows_msvc: Ninja`, cmake 크레이트가 대상 이름이 붙은 변수를 먼저 읽어 macOS에는 닿지 않는다). (2) `src-tauri\target` 아래에서는 그 하위 빌드의 pdb 경로가 269자로 MSVC의 260자 한계를 넘어(C1041), `CARGO_TARGET_DIR`을 `D:\a\t`로 둔다. rust-cache는 `CARGO_TARGET_DIR`을 읽지 않아 같은 폴더를 `src-tauri` 기준 상대 경로로 받는다.
 - 확인: 2026-10-16 첫 성공 실행(run 38839884897)에서 두 설치 파일이 나왔다(macOS dmg 12MiB, Windows setup.exe 17MiB, Windows 빌드 약 27분). 앞의 두 실행은 위 두 문제로 Windows만 실패했다. 실제 PC에서 설치·실행은 아직이다(12.2).
 
@@ -932,6 +949,7 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 | 구간 나누기 (`engine.rs`) | 겹친 창의 음성 구간 합치기, 10분에 가장 가까운 무음에서 자름, 5~12분 범위, 무음 없는 연속 발화는 10분에서 자름, 무음·짧은 녹음 |
 | 음성만 잘라 잇기 (`engine.rs` `Speech`) | whisper.cpp와 같은 이어 붙이기(0.1초 겹침, 0.1초 무음), 조각 안은 1:1, 무음 자리에 떨어진 시작은 다음 조각 시작·끝은 앞 조각 끝, 오디오 끝을 넘은 시각, 음성이 없을 때 |
 | 워커 종료 코드 (`engine.rs`) | 인자 오류·녹음 없음 → 2, 모델 없음 → 3 |
+| 전사 실측 (`bench.rs`) | 인자(범위, `--only`, `--smoke`, 모르는 플래그), 조합 순서와 고르기, 설치된 모델 찾기, CER(NFC, 공백·문장부호, 줄 앞 `[분:초]`), 가짜 워커로 `bench.tsv` 행·실패 행·회의 폴더에는 `bench.tsv`만, null stdin에서 인자 검사까지 도는지(`engine.rs`) |
 | `settings.rs` | 설정 화면 저장이 `gpu_failed`를 덮어쓰지 않고, 백엔드를 GPU로 바꾸면 지움. 전송이 쓴 `last_channel`도 설정 화면의 옛 값으로 덮지 않음 |
 | `slack.rs` | 순수 로직: 머리말(시차, 자정 넘김, 한국어 요일, 길이 "1분 미만"·"42분"·"2시간"·"1시간 5분", 녹음자 이름이 없으면 뺌, 제목이 없으면 "제목 없음"), 페이로드 형식(`text` 이스케이프, `markdown` 블록, 꼬리말), mrkdwn 변환(굵게, 제목, 링크와 링크가 아닌 대괄호, `https`·`http`·`mailto`가 아닌 링크 대상 `!here`·`@U…`·`!channel`·`!subteam^…`·`#C…`·`ftp`는 글자 그대로, 이스케이프), 멘션 무력화(제목·녹음자 이름·본문의 `<!`·`<@`·`<#`가 `markdown` 블록, 대체 경로, `text` 어디에도 남지 않음), 3,000자 section 나누기(줄 경계, 긴 줄 자르기, 이스케이프 뒤에도 한도), 실패 분류(로그인 필요 코드들·`channel_not_found`·`is_archived`·`not_in_channel`·`restricted_action…`·429·`ratelimited`·`invalid_blocks`·그 밖, `"ok": true`만 성공이고 HTML이나 빈 본문의 200·204·302는 확인하지 못함, 코드 모양이 아닌 오류는 `unknown_error`), 토큰 꺼내기(로그인 답의 `authed_user`, 갱신 답의 맨 위, 회전하지 않는 토큰). 로컬 스텁 서버(`summarize.rs`의 것, 폼 본문도 받음)로: 응답 없는 서버는 짧은 제한에 "시간 초과"이고 요청 1번, 답 없이 끊는 서버는 "응답을 받지 못했습니다"이고 요청 1번(재시도 없음), 연결 거부는 "연결하지 못했습니다", 어디에도 토큰이 나오지 않음, 302와 HTML 본문의 200은 둘 다 `review` + "응답을 확인하지 못했습니다"이고 연결이 1번. 로그인(브라우저 역할 스레드): 파비콘은 404이고 콜백만 받음, PKCE challenge가 검증값의 SHA-256, `user_scope`만 있고 봇 `scope`와 Client Secret이 없음, 토큰과 `slack_team` 저장, `access_denied`와 다른 `state`는 아무것도 남기지 않음, 취소는 `null`, `CLIENT_ID`가 빈 빌드는 거부. 곧 끝나는 토큰은 한 번 갱신되고 새 쌍이 저장되며 다음 요청은 갱신하지 않음, 거부된 갱신은 로그인 필요, 채널 목록은 커서로 쪽을 넘기며 이름순, 로그아웃은 `auth.revoke` 뒤 토큰·`slack_team`·`last_channel`을 지움. 전송 경로(임시 저장소, 가짜 키체인, 스텁 Web API, Wry 없이 `Slack::send`): 요청이 도착했을 때 고친 본문이 이미 `summary.md`에 있음, `chat.postMessage`의 채널 id·`Bearer` 토큰·`unfurl_*`, `sent`의 채널 이름·시각·수정 수와 `last_channel`(채널 id), 꼬리말 "(수정 N곳)"(경로·근거 검사 줄: 세 경로와 외부 로컬 서버 이름, 미정 처리 0곳은 뺌, 근거 검사 못 함), `invalid_blocks`면 요청이 정확히 2번이고 두 번째가 section 블록, 12,000자는 가고 12,001자는 요청 없이 거부(꼬리말은 세지 않음), 실패하면 `review` + `error`이고 다시 보내기가 되면 지움, 로그인하지 않았으면 요청 없이 설정 안내, 보내는 중 두 번째 전송은 거부되고 요청은 1번이며 그동안만 `is_sending`, 멘션을 무력화한 본문은 한 글자 늘어 12,000자 검사에 걸림, `no_speech`와 `review`가 아닌 회의는 요청 없이 거부 |
 | 수정 수 계산 (`slack::edit_count`) | 그대로면 0, 한 줄 변경은 1, 추가와 다른 곳의 삭제는 2, 두 줄을 세 줄로 바꾸면 3, 제목 변경 +1, LLM 제목은 한 줄로 만든 뒤 비교, 생성본이 없으면 빈 요약과 비교 |
