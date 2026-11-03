@@ -207,14 +207,55 @@ impl Sched {
 }
 
 /// Why the queue stopped a run. Set before its worker is killed, so the kill never counts as a
-/// crash.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// crash. Plan 5.7-4: ordered, and `Job::halt` keeps the larger, so a delete always wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Stop {
     /// TRN-09: back in line; the chunk runs again from its start once the recording ends.
     Recording,
-    Delete,
     /// App exit: `Store::pause_busy` writes `paused`.
     Quit,
+    /// Plan 5.3 "일시정지": `end` writes `paused`, and `held` keeps it out of line.
+    User,
+    Delete,
+}
+
+/// Plan 5.3-4: what `pause_meeting` did.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Pause {
+    /// It was in line: `paused` now.
+    Paused,
+    /// It runs: stopped, and `end` writes `paused`.
+    Pausing,
+    /// It finished meanwhile: nothing was written.
+    AlreadyDone,
+}
+
+/// Where a run that ended goes back in line.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Place {
+    First,
+    Last,
+}
+
+/// Plan 5.3-5: where a run that ended goes in line, from how it ended, its job's stop (the
+/// largest it was given) and the meeting's `held` read as it ends.
+fn back_in_line(end: &End, stop: Option<Stop>, held: bool) -> Option<Place> {
+    let stop = match end {
+        End::Stopped(s) => stop.max(Some(*s)),
+        _ => stop,
+    };
+    match (end, stop) {
+        (End::Done(_) | End::Failed(_), _) => None,
+        // The recorder paused it: it waits, `paused`, for "이어서 처리".
+        _ if held => None,
+        // A delete or quit that landed after the run stopped wins: no ghost back in line.
+        (_, Some(Stop::Delete | Stop::Quit)) => None,
+        // Paused, then taken back while it was stopping.
+        (End::Stopped(_), Some(Stop::User)) => Some(Place::Last),
+        (End::Stopped(_) | End::Requeue, _) => Some(Place::First),
+        (End::Skipped(_), _) => None,
+    }
 }
 
 #[derive(Default)]
@@ -246,9 +287,7 @@ impl Job {
 
     fn halt(&mut self, why: Stop) {
         // A delete wins: its run must not write `paused` over `deleting` afterwards.
-        if self.stop != Some(Stop::Delete) {
-            self.stop = Some(why);
-        }
+        self.stop = self.stop.max(Some(why));
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
         }
@@ -274,10 +313,15 @@ fn lock(inner: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
 
 impl Inner {
     /// TRN-09, SUM-09: running meetings back in line, their workers killed and local summaries
-    /// aborted. A cloud summary runs on through the recording.
+    /// aborted. A cloud summary runs on through the recording, and a paused one goes on stopping
+    /// out of line, so it never holds up the line (plan 5.3-6).
     fn suspend(&mut self) {
         let Inner { sched, jobs, .. } = self;
-        for id in sched.suspend(|id| jobs.get(id).is_some_and(|j| j.cloud)) {
+        let keep = |id: &str| {
+            jobs.get(id)
+                .is_some_and(|j| j.cloud || j.stop == Some(Stop::User))
+        };
+        for id in sched.suspend(keep) {
             if let Some(job) = jobs.get_mut(&id) {
                 job.halt(Stop::Recording);
             }
@@ -883,8 +927,21 @@ impl<R: Runtime> Queue<R> {
         all
     }
 
+    /// Plan 5.7-3: `held` is read again under the meeting's lock as it joins the line, never
+    /// trusted from a list read before.
     fn add(&self, id: &str, status: Status) {
-        let mut inner = lock(&self.inner);
+        let store = self.app.state::<Store>();
+        let added = store.with_lock(id, |m| {
+            if !m.held {
+                self.line_up(&mut lock(&self.inner), id, status);
+            }
+        });
+        if let Err(e) = added {
+            log::warn!("대기열에 넣지 못했습니다 ({id}): {e}");
+        }
+    }
+
+    fn line_up(&self, inner: &mut Inner, id: &str, status: Status) {
         if inner.closed || !inner.sched.enqueue(id) {
             return;
         }
@@ -902,7 +959,7 @@ impl<R: Runtime> Queue<R> {
                 slow: None,
             },
         );
-        self.publish_positions(&mut inner);
+        self.publish_positions(inner);
     }
 
     /// Plan 5.1-11: every running meeting's slow reason again, sent where it changed. Whether any
@@ -934,15 +991,20 @@ impl<R: Runtime> Queue<R> {
 
     /// TRN-01: every `recorded` and `paused` meeting, oldest first, but one with only its summary
     /// left (`transcribed`, `paused` after transcribing) once its route resolves (plan 5.4); until
-    /// then it says why it waits. At startup (after recovery paused what was running), when a
-    /// recording ends, when settings are saved and when the summary model arrives.
+    /// then it says why it waits. Never one the recorder paused (plan 5.3). At startup (after
+    /// recovery paused what was running), when a recording ends, when settings are saved and when
+    /// the summary model arrives.
     pub fn enqueue_pending(&self) {
+        self.enqueue_listed(self.app.state::<Store>().list());
+    }
+
+    /// `enqueue_pending` from `metas`, newest first as `Store::list` reads them.
+    fn enqueue_listed(&self, mut metas: Vec<Meta>) {
         let (settings, ready) = (self.settings(), self.builtin_ready());
         let store = self.app.state::<Store>();
-        let mut metas = store.list();
         metas.reverse();
         for meta in metas {
-            if meta.schema_version > SCHEMA_VERSION {
+            if meta.schema_version > SCHEMA_VERSION || meta.held {
                 continue;
             }
             let pending = match meta.status {
@@ -984,6 +1046,79 @@ impl<R: Runtime> Queue<R> {
         self.add(id, status);
         self.pump();
         crate::refresh_tray(&self.app);
+    }
+
+    /// Plan 5.3-4, 5.7-1: "일시정지", decided and written at once under the meeting's lock, then
+    /// the queue's. A running meeting is stopped, even a cloud summary, and its `end` writes
+    /// `paused`; one in line leaves it, `paused` now. Either way `held` keeps it out of line until
+    /// "이어서 처리". Nothing here calls `store.update` while holding `inner`.
+    pub fn pause(&self, store: &Store, id: &str) -> Result<Pause, String> {
+        let (mut paused, mut done) = (Pause::AlreadyDone, false);
+        let written = store.update(id, |m| {
+            let mut inner = lock(&self.inner);
+            if inner.sched.running.iter().any(|r| r == id) {
+                // Out of line too, where a recording starting put it back first.
+                inner.sched.waiting.retain(|w| w != id);
+                if let Some(job) = inner.jobs.get_mut(id) {
+                    job.halt(Stop::User);
+                }
+                if inner.sched.lease.as_deref() == Some(id) {
+                    self.sidecar.stop("일시정지");
+                }
+                paused = Pause::Pausing;
+            } else if inner.sched.waiting.iter().any(|w| w == id) {
+                // One `paused` already (a recording stopped it) keeps its status.
+                if m.status != Status::Paused {
+                    if !can_transition(m.status, Status::Paused) {
+                        return Err(format!("일시정지할 수 없는 상태입니다: {:?}", m.status));
+                    }
+                    m.status = Status::Paused;
+                }
+                inner.sched.waiting.retain(|w| w != id);
+                if let Some(mut p) = inner.progress.remove(id) {
+                    (p.status, p.position) = (Status::Paused, None);
+                    self.emit(&p);
+                }
+                paused = Pause::Paused;
+            } else {
+                // Finished meanwhile: nothing to write.
+                done = true;
+                return Err(String::new());
+            }
+            m.held = true;
+            self.publish_positions(&mut inner);
+            Ok(())
+        });
+        if done {
+            return Ok(Pause::AlreadyDone);
+        }
+        written?;
+        crate::refresh_tray(&self.app);
+        Ok(paused)
+    }
+
+    /// Plan 5.3-7: "이어서 처리", in the same shape as `pause`. `held` goes; a held meeting is taken
+    /// whatever its status, a run still stopping is put back in line by its `end`. Otherwise as
+    /// before: a continued interrupted recording, a `paused` one, a `transcribe_failed` retry.
+    pub fn resume(&self, store: &Store, id: &str) -> Result<Meta, String> {
+        let meta = store.update(id, |m| {
+            let mut inner = lock(&self.inner);
+            let again = matches!(
+                m.status,
+                Status::Recorded | Status::Paused | Status::TranscribeFailed
+            );
+            if !m.held && !again {
+                return Err("다시 처리할 수 있는 회의가 아닙니다".into());
+            }
+            m.held = false;
+            if !inner.sched.running.iter().any(|r| r == id) {
+                self.line_up(&mut inner, id, m.status);
+            }
+            Ok(())
+        })?;
+        self.pump();
+        crate::refresh_tray(&self.app);
+        Ok(meta)
     }
 
     /// Plan 5.4: the summary model is installed, so the built-in route can summarize.
@@ -1184,7 +1319,8 @@ impl<R: Runtime> Queue<R> {
         };
         let bytes = serde_json::to_vec(&plan).map_err(|e| End::Failed(e.to_string()))?;
         store
-            .update(id, |_| {
+            .update(id, |m| {
+                m.chunks_total = plan.chunks.len() as u32;
                 write_atomic(&path, &bytes).map_err(|e| format!("chunks.json 저장 실패: {e}"))
             })
             .map_err(End::Failed)?;
@@ -1376,7 +1512,8 @@ impl<R: Runtime> Queue<R> {
             });
             let saved = store.update(id, |m| {
                 write_partial(&partial, &done).map_err(|e| format!("{PARTIAL} 저장 실패: {e}"))?;
-                m.chunks_done = done.len() as u32;
+                // Also for a plan made before `chunks_total` was written.
+                (m.chunks_done, m.chunks_total) = (done.len() as u32, chunks);
                 if let Some(device) = device {
                     m.backend = Some(device.name().into());
                 }
@@ -1598,6 +1735,7 @@ impl<R: Runtime> Queue<R> {
         let (cloud, builtin) = (!connection.is_local, recover.is_some());
         let (transcript, glossary) = (lines.join("\n"), settings.glossary);
         let (app, run_id, asked) = (self.app.clone(), id.to_string(), glossary.clone());
+        let partial = dir.join(summarize::PARTIAL);
         let task = async move {
             let on_step = |done: u32, known: u32| {
                 app.state::<Queue<R>>().set_progress(&run_id, |p| {
@@ -1606,7 +1744,8 @@ impl<R: Runtime> Queue<R> {
                     p.percent = (done * 100 / known.max(1)) as u8;
                 });
             };
-            summarize::summarize(&connection, key, &asked, &lines, on_step, recover).await
+            let partial = Some(partial.as_path());
+            summarize::summarize(&connection, key, &asked, &lines, on_step, recover, partial).await
         };
         let (summary, timings) = match self.request(id, cloud, task) {
             Ok(Ok(done)) => done,
@@ -1665,23 +1804,25 @@ impl<R: Runtime> Queue<R> {
     }
 
     /// Writes how the run ended, frees its slot and the lease and starts the next meeting. Only a
-    /// recording stop and `Requeue` keep the meeting in line.
+    /// recording stop, `Requeue` and a pause taken back while stopping keep the meeting in line
+    /// (`back_in_line`).
     fn end(&self, store: &Store, id: &str, end: End) {
-        let requeue = matches!(end, End::Stopped(Stop::Recording) | End::Requeue);
         let finished = matches!(end, End::Done(_) | End::Failed(_));
-        let status = match end {
-            End::Done(status) => Some(status),
-            End::Stopped(Stop::Recording) => {
-                // Nothing on disk claims work that is not running (same as recovery, 8.4).
-                if let Err(e) = store.set_status(id, Status::Paused) {
-                    log::error!("일시정지 기록 실패 ({id}): {e}");
-                }
-                Some(Status::Paused)
-            }
-            End::Stopped(Stop::Delete | Stop::Quit) => None,
-            End::Failed(message) => {
-                log::error!("처리 실패 ({id}): {message}");
-                let failed = store.update(id, |m| {
+        match &end {
+            End::Failed(message) => log::error!("처리 실패 ({id}): {message}"),
+            End::Skipped(reason) => log::info!("처리 건너뜀 ({id}): {reason}"),
+            _ => {}
+        }
+        // Plan 5.3-5, 5.7-1: `held` is read and the slot freed at once, under the meeting's lock
+        // then the queue's, so a pause lands either before this (and is kept) or after it
+        // (`AlreadyDone`).
+        let (mut freed, mut status) = (false, None);
+        let written = store.update(id, |m| {
+            let mut inner = lock(&self.inner);
+            let place = back_in_line(&end, inner.jobs.get(id).and_then(|j| j.stop), m.held);
+            match &end {
+                End::Done(_) => m.held = false,
+                End::Failed(message) => {
                     let to = if m.status == Status::Summarizing {
                         Status::SummarizeFailed
                     } else {
@@ -1689,70 +1830,42 @@ impl<R: Runtime> Queue<R> {
                     };
                     if can_transition(m.status, to) {
                         m.status = to;
-                        m.error = Some(message);
+                        m.error = Some(message.clone());
                     }
-                    Ok(())
-                });
-                match failed {
-                    Ok(m) => Some(m.status),
-                    Err(e) => {
-                        log::error!("실패 상태 기록 실패 ({id}): {e}");
-                        None
-                    }
+                    m.held = false;
                 }
+                // Nothing on disk claims work that is not running (same as recovery, 8.4).
+                End::Stopped(_) | End::Skipped(_) | End::Requeue
+                    if (m.held || place.is_some() && matches!(end, End::Stopped(_)))
+                        && can_transition(m.status, Status::Paused) =>
+                {
+                    m.status = Status::Paused;
+                }
+                _ => {}
             }
-            End::Skipped(reason) => {
-                log::info!("처리 건너뜀 ({id}): {reason}");
-                store.get(id).ok().map(|m| m.status)
-            }
-            // Its place in line shows the status it waits in, maybe `transcribed` by now.
-            End::Requeue => store.get(id).ok().map(|m| m.status),
-        };
-        {
-            let mut inner = lock(&self.inner);
-            // A delete or quit that landed after the run stopped wins: no ghost back in line.
-            let halted = matches!(
-                inner.jobs.get(id).and_then(|j| j.stop),
-                Some(Stop::Delete | Stop::Quit)
-            );
-            let requeue = requeue && !halted;
-            // Plan 5.3: no idle engine. It would hold 4 GB while the next transcription runs. The
-            // meetings passed over for the lease may start now.
-            if inner.sched.release_lease(id) {
-                self.sidecar.stop("요약 끝");
-            }
-            inner.sched.finished(id);
-            inner.jobs.remove(id);
-            if !requeue {
-                // Finished while a recording put it back in line: nothing left to run.
-                inner.sched.waiting.retain(|w| w != id);
-            } else if !inner.sched.waiting.contains(&id.to_string()) {
-                inner.sched.waiting.push_front(id.to_string());
-            }
-            let waiting = requeue;
-            let entry = if waiting {
-                inner.progress.get_mut(id).cloned()
-            } else {
-                inner.progress.remove(id)
+            status = match end {
+                End::Done(status) => Some(status),
+                // A quit leaves `paused` to `Store::pause_busy`.
+                End::Stopped(Stop::Quit) => None,
+                _ => Some(m.status),
             };
-            if let (Some(mut p), Some(status)) = (entry, status) {
-                p.status = status;
-                p.eta_secs = None;
-                p.slow = None;
-                if !waiting {
-                    // Out of line, even if a recording put it back before this run could stop.
-                    p.position = None;
-                }
-                if matches!(status, Status::Transcribed | Status::Review) {
-                    p.percent = 100;
-                }
-                if waiting {
-                    inner.progress.insert(id.to_string(), p.clone());
-                }
-                self.emit(&p);
+            self.free(&mut inner, id, place);
+            freed = true;
+            Ok(())
+        });
+        match written {
+            Err(e) if freed => log::error!("처리 끝 기록 실패 ({id}): {e}"),
+            // Deleted, or being deleted: only the slot is freed.
+            Err(e) => {
+                log::info!("처리 끝을 기록하지 않습니다 ({id}): {e}");
+                let mut inner = lock(&self.inner);
+                let place = back_in_line(&end, inner.jobs.get(id).and_then(|j| j.stop), false);
+                self.free(&mut inner, id, place);
             }
-            self.publish_positions(&mut inner);
+            Ok(_) => {}
         }
+        // The status is on disk before the event that tells the screens to read it.
+        self.report(id, status);
         self.pump();
         // After the next one started, so the system is not let go between them.
         let _ = self.wake.send(());
@@ -1775,6 +1888,57 @@ impl<R: Runtime> Queue<R> {
             }
         }
         crate::refresh_tray(&self.app);
+    }
+
+    /// A run's end in the line: its slot and the lease freed, and back in line at `place` or out
+    /// of it.
+    fn free(&self, inner: &mut Inner, id: &str, place: Option<Place>) {
+        // Plan 5.3: no idle engine. It would hold 4 GB while the next transcription runs. The
+        // meetings passed over for the lease may start now.
+        if inner.sched.release_lease(id) {
+            self.sidecar.stop("요약 끝");
+        }
+        inner.sched.finished(id);
+        inner.jobs.remove(id);
+        match place {
+            // Finished while a recording put it back in line: nothing left to run.
+            None => inner.sched.waiting.retain(|w| w != id),
+            // A recording put it back already, in the order the runs started.
+            Some(_) if inner.sched.waiting.iter().any(|w| w == id) => {}
+            Some(Place::First) => inner.sched.waiting.push_front(id.to_string()),
+            Some(Place::Last) => inner.sched.waiting.push_back(id.to_string()),
+        }
+    }
+
+    /// A run's last progress, with the status it ended in, once that is on disk.
+    fn report(&self, id: &str, status: Option<Status>) {
+        let mut inner = lock(&self.inner);
+        // Not one that started again meanwhile: its own run reports it.
+        let waiting = inner.sched.waiting.iter().any(|w| w == id);
+        let entry = if inner.sched.running.iter().any(|r| r == id) {
+            None
+        } else if waiting {
+            inner.progress.get_mut(id).cloned()
+        } else {
+            inner.progress.remove(id)
+        };
+        if let (Some(mut p), Some(status)) = (entry, status) {
+            p.status = status;
+            p.eta_secs = None;
+            p.slow = None;
+            if !waiting {
+                // Out of line, even if a recording put it back before this run could stop.
+                p.position = None;
+            }
+            if matches!(status, Status::Transcribed | Status::Review) {
+                p.percent = 100;
+            }
+            if waiting {
+                inner.progress.insert(id.to_string(), p.clone());
+            }
+            self.emit(&p);
+        }
+        self.publish_positions(&mut inner);
     }
 }
 
@@ -2218,13 +2382,83 @@ mod tests {
         assert_eq!(judge(&mut job, 211), None);
     }
 
+    /// Plan 5.7-4: a lower stop never covers a higher one, so a delete is never turned back into
+    /// a pause and a pause never into a recording's stop.
     #[test]
-    fn a_delete_is_never_turned_back_into_a_pause() {
+    fn stops_are_ordered_and_halt_keeps_the_larger() {
+        use Stop::*;
+        assert!(Recording < Quit && Quit < User && User < Delete);
         let mut job = Job::default();
-        job.halt(Stop::Recording);
-        job.halt(Stop::Delete);
-        job.halt(Stop::Recording);
-        assert_eq!(job.stop, Some(Stop::Delete));
+        job.halt(Recording);
+        job.halt(User);
+        job.halt(Recording);
+        assert_eq!(job.stop, Some(User));
+        job.halt(Delete);
+        for lower in [Recording, Quit, User] {
+            job.halt(lower);
+        }
+        assert_eq!(job.stop, Some(Delete));
+    }
+
+    /// Plan 5.3-5: where a run goes as it ends.
+    #[test]
+    fn a_run_goes_back_in_line_only_unpaused_and_undeleted() {
+        use Stop::*;
+        let stopped = |s| End::Stopped(s);
+        let skipped = || End::Skipped(String::new());
+        let cases = [
+            (End::Done(Status::Review), Some(User), true, None),
+            (End::Failed(String::new()), None, true, None),
+            // Held: it waits `paused` however it stopped.
+            (stopped(Recording), Some(Recording), true, None),
+            (stopped(User), Some(User), true, None),
+            (End::Requeue, None, true, None),
+            (skipped(), Some(User), true, None),
+            (stopped(Recording), Some(Delete), false, None),
+            (End::Requeue, Some(Quit), false, None),
+            (
+                stopped(Recording),
+                Some(Recording),
+                false,
+                Some(Place::First),
+            ),
+            (End::Requeue, None, false, Some(Place::First)),
+            // Paused during a recording's stop, then taken back.
+            (stopped(Recording), Some(User), false, Some(Place::Last)),
+            (stopped(User), Some(User), false, Some(Place::Last)),
+            (skipped(), None, false, None),
+        ];
+        for (end, stop, held, place) in cases {
+            let what = format!("{stop:?} held={held}");
+            assert_eq!(back_in_line(&end, stop, held), place, "{what}");
+        }
+    }
+
+    /// Plan 5.3-6: a recording starting while a pause winds a run down leaves that run out of
+    /// line, so it never holds up the meetings behind it.
+    #[test]
+    fn a_pausing_run_never_holds_up_the_line_through_a_recording() {
+        let mut inner = Inner::default();
+        for id in ["a", "b", "c"] {
+            inner.sched.enqueue(id);
+        }
+        inner.sched.start_next(2, |_| true);
+        for id in ["a", "b"] {
+            inner.jobs.insert(id.into(), Job::default());
+        }
+        inner.jobs.get_mut("a").unwrap().halt(Stop::User);
+        inner.suspend();
+        assert_eq!(inner.jobs["a"].stop, Some(Stop::User));
+        assert_eq!(inner.jobs["b"].stop, Some(Stop::Recording));
+        let s = &mut inner.sched;
+        assert_eq!((s.position("a"), s.position("b")), (None, Some(1)));
+
+        // The recording is over and b wound down; a is still stopping.
+        s.recording = false;
+        s.finished("b");
+        assert_eq!(s.start_next(2, |_| true), ids(&["b"]));
+        s.finished("a");
+        assert_eq!(s.start_next(2, |_| true), ids(&["c"]));
     }
 
     /// For the unix tests below, which drive real processes through `sh`.
@@ -2467,6 +2701,191 @@ mod tests {
         let mut inner = lock(&queue.inner);
         assert_eq!(inner.sched.start_next(1, |_| true), ids(&["b"]));
         assert!(inner.sched.take_lease("b"));
+    }
+
+    /// A meeting in `status` (`engine_queue`'s store).
+    fn meeting(app: &tauri::App<tauri::test::MockRuntime>, status: Status) -> String {
+        let store = app.state::<Store>();
+        let id = store.create("", false).unwrap().id;
+        store
+            .update(&id, |m| {
+                m.status = status;
+                Ok(())
+            })
+            .unwrap();
+        id
+    }
+
+    fn held(app: &tauri::App<tauri::test::MockRuntime>, id: &str) -> (Status, bool) {
+        let meta = app.state::<Store>().get(id).unwrap();
+        (meta.status, meta.held)
+    }
+
+    /// Plan 5.3-4: a finished meeting's pause writes nothing; a bad id is refused.
+    #[test]
+    fn pausing_a_finished_meeting_is_already_done_and_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, queue) = engine_queue(tmp.path(), "supervisor", Duration::from_secs(10));
+        let store = app.state::<Store>();
+        let id = meeting(&app, Status::Review);
+        let path = store.dir_for(&id).unwrap().join("meta.json");
+        let before = fs::read(&path).unwrap();
+        assert_eq!(queue.pause(&store, &id), Ok(Pause::AlreadyDone));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(queue.pause(&store, "../meetings").is_err());
+        assert!(queue.pause(&store, "2026-11-03T0900-0000").is_err());
+    }
+
+    /// Plan 5.3-3: retried failures waiting in line can be paused too, and stay out of it.
+    #[test]
+    fn failed_meetings_retried_in_line_can_be_paused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, queue) = engine_queue(tmp.path(), "supervisor", Duration::from_secs(10));
+        let store = app.state::<Store>();
+        // Nothing starts: the test reads the line as it is.
+        lock(&queue.inner).sched.recording = true;
+        for status in [Status::TranscribeFailed, Status::SummarizeFailed] {
+            let id = meeting(&app, status);
+            queue.enqueue(&id, status);
+            assert_eq!(lock(&queue.inner).sched.position(&id), Some(1));
+            assert_eq!(queue.pause(&store, &id), Ok(Pause::Paused));
+            assert_eq!(held(&app, &id), (Status::Paused, true));
+            let inner = lock(&queue.inner);
+            assert_eq!(inner.sched.position(&id), None);
+            assert!(!inner.progress.contains_key(&id));
+        }
+        // A list read again lines up neither (as at the next start).
+        queue.enqueue_pending();
+        assert!(queue.snapshot().is_empty());
+    }
+
+    /// Plan 5.3-5, 5.7-4: a delete landing on a pausing run wins; nothing goes back in line.
+    #[test]
+    fn a_delete_beats_a_pause() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, queue) = engine_queue(tmp.path(), "supervisor", Duration::from_secs(10));
+        let store = app.state::<Store>();
+        let id = meeting(&app, Status::Transcribing);
+        running(&queue, &id);
+        assert_eq!(queue.pause(&store, &id), Ok(Pause::Pausing));
+        thread::scope(|s| {
+            let deleting = s.spawn(|| store.delete_with(&id, || queue.cancel(&id)));
+            while lock(&queue.inner).jobs[&id].stop != Some(Stop::Delete) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            // The run ends as the pause stopped it.
+            queue.end(&store, &id, End::Stopped(Stop::User));
+            deleting.join().unwrap().unwrap();
+        });
+        assert!(!store.dir_for(&id).unwrap().exists());
+        let inner = lock(&queue.inner);
+        assert_eq!(inner.sched.position(&id), None);
+        assert!(inner.sched.running.is_empty() && inner.jobs.is_empty());
+    }
+
+    /// Plan 5.3-7: "이어서 처리" while the run still stops: its `end` puts it back, last.
+    #[test]
+    fn resuming_while_it_stops_puts_it_back_last() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, queue) = engine_queue(tmp.path(), "supervisor", Duration::from_secs(10));
+        let store = app.state::<Store>();
+        let id = meeting(&app, Status::Transcribing);
+        running(&queue, &id);
+        let behind = meeting(&app, Status::Recorded);
+        queue.enqueue(&behind, Status::Recorded);
+        assert_eq!(queue.pause(&store, &id), Ok(Pause::Pausing));
+        assert_eq!(held(&app, &id), (Status::Transcribing, true));
+
+        assert!(!queue.resume(&store, &id).unwrap().held);
+        assert_eq!(lock(&queue.inner).sched.position(&id), None);
+        queue.end(&store, &id, End::Stopped(Stop::User));
+        assert_eq!(held(&app, &id), (Status::Paused, false));
+        let inner = lock(&queue.inner);
+        assert_eq!(
+            (inner.sched.position(&behind), inner.sched.position(&id)),
+            (Some(1), Some(2))
+        );
+    }
+
+    /// Plan 5.3-5: a held run that ends skipped or back in line for the lease waits `paused`,
+    /// out of line, until it is resumed.
+    #[test]
+    fn a_held_run_that_skips_or_requeues_ends_paused_and_resumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, queue) = engine_queue(tmp.path(), "supervisor", Duration::from_secs(10));
+        let store = app.state::<Store>();
+        let skips = meeting(&app, Status::Transcribed);
+        let requeues = meeting(&app, Status::Transcribed);
+        for id in [&skips, &requeues] {
+            running(&queue, id);
+            assert_eq!(queue.pause(&store, id), Ok(Pause::Pausing));
+        }
+        queue.end(
+            &store,
+            &skips,
+            End::Skipped("요약 경로를 기다립니다".into()),
+        );
+        queue.end(&store, &requeues, End::Requeue);
+        for id in [&skips, &requeues] {
+            assert_eq!(held(&app, id), (Status::Paused, true));
+            assert_eq!(lock(&queue.inner).sched.position(id), None);
+        }
+        // Nothing starts here (no model): the line is read as it is.
+        assert_eq!(queue.resume(&store, &skips).unwrap().status, Status::Paused);
+        assert_eq!(held(&app, &skips), (Status::Paused, false));
+        assert_eq!(lock(&queue.inner).sched.position(&skips), Some(1));
+    }
+
+    /// Plan 5.3-17: paused while a recording that started has put the run back first in line and
+    /// it still winds down. It leaves the line at once and ends `paused`; the meeting behind it
+    /// is next.
+    #[test]
+    fn a_pause_after_a_recording_stopped_the_run_takes_it_out_of_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, queue) = engine_queue(tmp.path(), "supervisor", Duration::from_secs(10));
+        let store = app.state::<Store>();
+        let id = meeting(&app, Status::Transcribing);
+        running(&queue, &id);
+        let behind = meeting(&app, Status::Recorded);
+        queue.enqueue(&behind, Status::Recorded);
+        queue.recording_started();
+        assert_eq!(lock(&queue.inner).sched.position(&id), Some(1));
+
+        assert_eq!(queue.pause(&store, &id), Ok(Pause::Pausing));
+        assert_eq!(lock(&queue.inner).sched.position(&id), None);
+        queue.end(&store, &id, End::Stopped(Stop::Recording));
+        assert_eq!(held(&app, &id), (Status::Paused, true));
+        let mut inner = lock(&queue.inner);
+        inner.sched.recording = false;
+        assert_eq!(inner.sched.start_next(2, |_| true), ids(&[&behind]));
+    }
+
+    /// Plan 5.7-3: a list read before a pause cannot put the paused meeting back in line, since
+    /// `held` is read again as it joins.
+    #[test]
+    fn a_list_read_before_a_pause_does_not_line_the_meeting_up_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, queue) = engine_queue(tmp.path(), "supervisor", Duration::from_secs(10));
+        let store = app.state::<Store>();
+        let id = meeting(&app, Status::Recorded);
+        queue.enqueue(&id, Status::Recorded);
+        let barrier = std::sync::Barrier::new(2);
+        thread::scope(|s| {
+            s.spawn(|| {
+                let listed = store.list();
+                assert!(!listed[0].held);
+                barrier.wait();
+                // The pause lands here.
+                barrier.wait();
+                queue.enqueue_listed(listed);
+            });
+            barrier.wait();
+            assert_eq!(queue.pause(&store, &id), Ok(Pause::Paused));
+            barrier.wait();
+        });
+        assert_eq!(held(&app, &id), (Status::Paused, true));
+        assert_eq!(lock(&queue.inner).sched.position(&id), None);
+        assert!(queue.snapshot().is_empty());
     }
 
     /// The queue end to end on the mock runtime, with a shell script as the worker, the `tiny`
@@ -3533,7 +3952,13 @@ mod tests {
             f.wait("passed over", || {
                 let queue = f.queue();
                 let inner = lock(&queue.inner);
-                inner.sched.blocked.contains(&id) && inner.sched.running.is_empty()
+                // Its end reported too: back in line, first.
+                inner.sched.blocked.contains(&id)
+                    && inner.sched.running.is_empty()
+                    && inner
+                        .progress
+                        .get(&id)
+                        .is_some_and(|p| p.position == Some(1))
             });
             let events = || f.events.lock().unwrap().len();
             let before = events();
@@ -3600,6 +4025,81 @@ mod tests {
                 (Some("내 Ollama"), None)
             );
             assert_eq!(stub.requests.lock().unwrap().len(), 1);
+        }
+
+        /// Plan 5.3-17: a paused run stays `paused` and held through a recording and a restart,
+        /// and "이어서 처리" picks it up from the chunk it stopped in.
+        #[cfg(unix)]
+        #[test]
+        fn a_paused_meeting_stays_paused_until_it_is_resumed() {
+            // Hangs the first time any chunk runs, answers after that.
+            let f = fixture(
+                &format!(
+                    r#"if [ ! -e "$2/../slept" ]; then touch "$2/../slept"; echo '{{"type":"progress","pct":10}}'; exec sleep 30; fi; {RESULT}"#
+                ),
+                Backend::Auto,
+            );
+            let id = f.recorded();
+            f.queue().enqueue_pending();
+            let marker = f.tmp.path().join("meetings").join("slept");
+            f.wait("chunk hanging", || marker.exists() && f.transcribing(&id));
+
+            assert_eq!(f.queue().pause(&f.store(), &id), Ok(Pause::Pausing));
+            f.wait("paused", || f.queue().snapshot().is_empty());
+            let meta = f.store().get(&id).unwrap();
+            assert_eq!((meta.status, meta.held), (Status::Paused, true));
+            // Plan 5.3-8: where it stopped, for "구간 1/2에서 멈춤" after a restart too.
+            assert_eq!((meta.chunks_done, meta.chunks_total), (0, 2));
+            assert_eq!(f.events.lock().unwrap().last().unwrap()["status"], "paused");
+
+            // A recording, a meeting recorded meanwhile, and the next start leave it as it is.
+            f.queue().recording_started();
+            let other = f.recorded();
+            f.queue().recording_finished();
+            f.wait("the other done", || f.status(&other) == Status::Review);
+            f.queue().enqueue_pending();
+            thread::sleep(Duration::from_millis(200));
+            let meta = f.store().get(&id).unwrap();
+            assert_eq!((meta.status, meta.held), (Status::Paused, true));
+            assert!(f.queue().snapshot().is_empty());
+
+            f.queue().resume(&f.store(), &id).unwrap();
+            f.wait("review", || f.status(&id) == Status::Review);
+            assert!(!f.store().get(&id).unwrap().held);
+            // The stopped chunk ran again from its start.
+            assert_eq!(f.runs(&id), ["gpu", "gpu"]);
+        }
+
+        /// Plan 5.7-1: a built-in summary starting (`begin` takes the meeting's lock, then the
+        /// queue's) beside pauses and resumes (the same order) never deadlocks.
+        #[test]
+        fn a_summary_starting_beside_pauses_and_resumes_never_deadlocks() {
+            let _model = summary_model();
+            let f = fixture(SPEECH, Backend::Auto);
+            f.install_summary();
+            let id = f.transcribed(false, None);
+            let (app, run_id) = (f.app.handle().clone(), id.clone());
+            let (done, finished) = mpsc::channel();
+            thread::spawn(move || {
+                let (queue, store) = (app.state::<Mock>(), app.state::<Store>());
+                queue.enqueue_pending();
+                for _ in 0..20 {
+                    let _ = queue.pause(&store, &run_id);
+                    thread::sleep(Duration::from_millis(5));
+                    let _ = queue.resume(&store, &run_id);
+                    thread::sleep(Duration::from_millis(5));
+                }
+                let _ = done.send(());
+            });
+            let ended = finished.recv_timeout(Duration::from_secs(30));
+            assert!(
+                ended.is_ok(),
+                "deadlocked; queue {:?}",
+                f.queue().snapshot()
+            );
+            f.wait("review", || f.status(&id) == Status::Review);
+            assert!(!f.store().get(&id).unwrap().held);
+            f.engine_gone();
         }
 
         /// A failed summary whose route no longer resolves (its model went) stays failed with its

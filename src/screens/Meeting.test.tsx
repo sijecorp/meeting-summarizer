@@ -1049,7 +1049,8 @@ test("a running meeting shows its step, chunk, percent and time left", async () 
   expect(screen.getByRole("progressbar", { name: "전사 진행률" }).getAttribute("aria-valuenow")).toBe("42");
 });
 
-// Plan 5.1-12: one reason under the memo, with its icon; a CPU reason takes the device off the memo.
+// Plan 5.1-12, 5.3-15: one reason under the memo, with its icon; a CPU reason takes the device off
+// the memo.
 test("a slow meeting says why under its memo", async () => {
   const transcribing = (slow: Progress["slow"]) =>
     progress({ status: "transcribing", chunk: 1, chunks: 5, percent: 42, eta_secs: 3_900, slow });
@@ -1060,8 +1061,9 @@ test("a slow meeting says why under its memo", async () => {
   const cases = [
     ["saver", "에너지 절약 모드라 처리가 느릴 수 있습니다. 전원을 연결하면 빨라질 수 있습니다", "battery-low", true],
     ["cpu", "GPU를 쓰지 못해 CPU로 처리하고 있어 느립니다. 그래픽 드라이버를 업데이트하면 나아질 수 있습니다", "cpu", false],
-    ["cpu_nogpu", "이 PC에는 쓸 수 있는 GPU가 없어 CPU로 처리합니다", "cpu", false],
-    ["slow", "이 PC에서는 전사가 회의 길이보다 오래 걸립니다", "cpu", true],
+    // Plan 5.3-15: what the recorder can do about it, in 1.1.0.
+    ["cpu_nogpu", "이 PC에는 쓸 수 있는 GPU가 없어 CPU로 처리합니다 · 일시정지하고 나중에 이어서 처리할 수 있습니다", "cpu", false],
+    ["slow", "이 PC에서는 전사가 회의 길이보다 오래 걸립니다 · 일시정지하고 나중에 이어서 처리할 수 있습니다", "cpu", true],
   ] as const;
   for (const [slow, copy, icon, device] of cases) {
     rerender(<Meeting id={id} {...props} progress={transcribing(slow)} />);
@@ -1348,4 +1350,132 @@ test("until the title comes, its place turns over a line every 2 seconds, and sc
   render(<Meeting id={id} {...props} progress={progress({ status: "recorded", position: 2 })} />);
   const waiting = await screen.findByRole("heading", { level: 1, name: "제목 준비 중" });
   expect(waiting.querySelector("[aria-hidden]")?.textContent).toBe("차례를 기다리는 중…");
+});
+
+// Plan 5.3-11: one button at the end of the step line whose words change, so the focus stays:
+// 일시정지, 멈추는 중… until the run ends, then 이어서 처리. Each change is said once.
+test("the processing area's button goes from 일시정지 to 멈추는 중… to 이어서 처리, keeping the focus", async () => {
+  const running = progress({ status: "transcribing", chunk: 2, chunks: 7, percent: 30, eta_secs: null });
+  const detail = {
+    meta: meta({ status: "transcribing", title: "", chunks_done: 2, chunks_total: 7, llm_connection: null }),
+    summary: "",
+  };
+  const calls = mock(detail, (cmd) => {
+    if (cmd === "pause_meeting") {
+      detail.meta = { ...detail.meta, held: true };
+      return "pausing";
+    }
+    if (cmd === "resume_meeting") {
+      detail.meta = { ...detail.meta, held: false };
+      return detail.meta;
+    }
+  });
+  const { rerender } = render(<Meeting id={id} {...props} progress={running} />);
+
+  const button = await screen.findByRole("button", { name: "일시정지" });
+  // At the end of the step line, above the memo.
+  const steps = screen.getByRole("list", { name: "처리 단계" });
+  expect(steps.parentElement?.contains(button)).toBe(true);
+  expect(steps.parentElement?.nextElementSibling?.textContent).toBe("구간 3/7");
+  button.focus();
+  fireEvent.click(button);
+
+  await waitFor(() => expect(button.textContent).toBe("멈추는 중…"));
+  expect(disabled(button)).toBe(true);
+  expect(document.activeElement).toBe(button);
+  fireEvent.click(button);
+  expect(calls.filter((c) => c.cmd === "pause_meeting")).toEqual([{ cmd: "pause_meeting", args: { id } }]);
+
+  // The run ends `paused`.
+  detail.meta = { ...detail.meta, status: "paused" };
+  rerender(<Meeting id={id} {...props} progress={progress({ status: "paused" })} />);
+  await waitFor(() => expect(button.textContent).toBe("이어서 처리"));
+  expect(disabled(button)).toBe(false);
+  expect(document.activeElement).toBe(button);
+  expect(within(steps).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+    "녹음완료",
+    "전사일시정지됨",
+    "요약",
+    "검토",
+  ]);
+  expect(screen.getByText("구간 3/7에서 멈춤 · 이어서 처리하면 이 구간부터 다시 합니다")).toBeTruthy();
+  // The bar stays where it stopped.
+  expect(screen.getByRole("progressbar", { name: "전사 진행률" }).getAttribute("aria-valuenow")).toBe("29");
+  expect((await screen.findByText("일시정지했습니다")).getAttribute("role")).toBe("status");
+
+  fireEvent.click(button);
+  await waitFor(() => expect(button.textContent).toBe("일시정지"));
+  expect(calls.filter((c) => c.cmd === "resume_meeting")).toEqual([{ cmd: "resume_meeting", args: { id } }]);
+  expect(document.activeElement).toBe(button);
+  expect((await screen.findByText("이어서 처리합니다")).getAttribute("role")).toBe("status");
+});
+
+// Plan 5.3-10: 멈추는 중… comes from `held` and the running event, never from this screen's state.
+test("a meeting still stopping says so after a redraw", async () => {
+  const running = progress({ status: "summarizing", chunk: 1, chunks: 3, percent: 33 });
+  mock({ meta: meta({ status: "summarizing", title: "", held: true }), summary: "" });
+  render(<Meeting id={id} {...props} progress={running} />);
+  expect(disabled(await screen.findByRole("button", { name: "멈추는 중…" }))).toBe(true);
+  cleanup();
+  render(<Meeting id={id} {...props} progress={running} />);
+  expect(disabled(await screen.findByRole("button", { name: "멈추는 중…" }))).toBe(true);
+});
+
+// Plan 5.3-11: a pause the run beat to the end is no error; the meeting is just read again.
+test("a pause that finds the meeting finished redraws it without a banner", async () => {
+  const detail = { meta: meta({ status: "recorded", title: "" }), summary: "" };
+  const calls = mock(detail, (cmd) => {
+    if (cmd === "pause_meeting") {
+      detail.meta = meta({ status: "review", title: "주간 회의" });
+      detail.summary = "## 결정사항\n- 목요일에 배포한다";
+      return "already_done";
+    }
+  });
+  render(<Meeting id={id} {...props} progress={progress({ status: "recorded", position: 1 })} />);
+  fireEvent.click(await screen.findByRole("button", { name: "일시정지" }));
+  expect(await screen.findByText("목요일에 배포한다")).toBeTruthy();
+  expect(calls.filter((c) => c.cmd === "get_meeting").length).toBeGreaterThan(1);
+  expect(screen.queryByRole("list", { name: "처리 단계" })).toBeNull();
+  expect(document.body.textContent).not.toContain("already_done");
+});
+
+// Plan 5.3-12: the memo follows the step it stopped in, before the chunk plan too; 녹음 중에 이어서
+// 처리하면 it waits for the recording.
+test("a paused meeting's memo says where it stopped and what 이어서 처리 does", async () => {
+  const cases = [
+    [{ chunks_done: 5, chunks_total: 5, llm_connection: "회사 클라우드" }, "요약일시정지됨", "요약 중 멈춤 · 끝난 부분부터 이어서 합니다"],
+    [{ chunks_done: 0, chunks_total: 0, llm_connection: null }, "전사일시정지됨", "구간을 나누기 전에 멈춤 · 이어서 처리하면 처음부터 합니다"],
+  ] as const;
+  for (const [patch, step, memo] of cases) {
+    mock({ meta: meta({ status: "paused", title: "", held: true, ...patch }), summary: "" });
+    render(<Meeting id={id} {...props} />);
+    expect(await screen.findByText(memo)).toBeTruthy();
+    expect(screen.getByRole("listitem", { current: "step" }).textContent).toBe(step);
+    expect(screen.getByRole("button", { name: "이어서 처리" })).toBeTruthy();
+    cleanup();
+  }
+
+  mock({ meta: meta({ status: "paused", title: "", llm_connection: null }), summary: "" });
+  render(<Meeting id={id} {...props} recording progress={progress({ status: "paused", position: 1 })} />);
+  expect(await screen.findByText("대기 중 · 1번째 · 녹음이 끝나면 처리합니다")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "일시정지" })).toBeTruthy();
+});
+
+// Plan 5.3-11: no button where pausing means nothing: a route wait, a failure, review.
+test("the pause button is hidden while it waits for a route, failed or in review", async () => {
+  const cases = [
+    meta({ status: "transcribed", title: "", wait: "summary_model", llm_connection: null }),
+    meta({ status: "transcribe_failed", title: "", error: "전사 중 오류가 났습니다" }),
+  ];
+  for (const m of cases) {
+    mock({ meta: m, summary: "" });
+    render(<Meeting id={id} {...props} />);
+    expect(await screen.findByRole("list", { name: "처리 단계" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /일시정지|이어서 처리|멈추는 중/ })).toBeNull();
+    cleanup();
+  }
+  mock({ meta: meta(), summary: "## 결정사항\n- 목요일에 배포한다" });
+  render(<Meeting id={id} {...props} />);
+  expect(await screen.findByText("목요일에 배포한다")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /일시정지|이어서 처리|멈추는 중/ })).toBeNull();
 });

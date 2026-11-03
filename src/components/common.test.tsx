@@ -2,8 +2,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, expect, test, vi } from "vitest";
-import type { LlmConnection, Meta, Progress, SummaryRoute } from "../lib/ipc";
-import { EngineStarting, phase, RouteNotice } from "./common";
+import { SCHEMA_VERSION, STATUS_LABEL, type LlmConnection, type Meta, type Progress, type SummaryRoute } from "../lib/ipc";
+import { EngineStarting, phase, RouteNotice, stopping } from "./common";
 
 afterEach(() => {
   cleanup();
@@ -202,6 +202,32 @@ test("once locked: where it is being summarized while summarizing, never the swi
 
 // Between transcribing and summarizing the list can read `transcribed` while the last event still
 // says transcribing: the dock must not drop the meeting for that moment (APP-07).
+// Plan 5.3-10, 5.7-9: a running event first, then `held`, then the list. A held meeting whose run
+// still stops is running, and stopping, whatever the list says; once it ended it is held.
+test("phase: a held meeting is held unless an event says it still runs", () => {
+  const held = { schema_version: 2, status: "paused", held: true } as Meta;
+  const running: Progress = {
+    id: "a",
+    status: "transcribing",
+    chunk: 1,
+    chunks: 4,
+    percent: 30,
+    eta_secs: null,
+    position: null,
+  };
+  expect(phase(held, undefined)).toBe("held");
+  expect(phase({ ...held, status: "transcribing" }, undefined)).toBe("held");
+  expect(phase(held, { ...running, status: "paused" })).toBe("held");
+  expect(phase(held, running)).toBe("running");
+  expect(stopping(held, running)).toBe(true);
+  expect(stopping(held, undefined)).toBe(false);
+  expect(stopping({ ...held, held: false }, running)).toBe(false);
+  // This app reads and writes 2 (`held`); 3 is a newer app's.
+  expect(SCHEMA_VERSION).toBe(2);
+  expect(phase({ ...held, schema_version: 3 }, undefined)).toBeNull();
+  expect(STATUS_LABEL.paused).toBe("일시정지됨");
+});
+
 test("phase: an event saying it runs wins over the list's status", () => {
   const meta = { schema_version: 1, status: "transcribed" } as Meta;
   const event = (patch: Partial<Progress>): Progress => ({
@@ -227,5 +253,5 @@ test("phase: an event saying it runs wins over the list's status", () => {
   expect(phase(meta, event({ status: "transcribed" }))).toBeNull();
   expect(phase(meta, event({ status: "transcribed", position: 1 }))).toBe("waiting");
   // A newer app's meeting never runs here.
-  expect(phase({ ...meta, schema_version: 2 }, event({}))).toBeNull();
+  expect(phase({ ...meta, schema_version: 3 }, event({}))).toBeNull();
 });

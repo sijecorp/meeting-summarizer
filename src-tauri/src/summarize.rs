@@ -8,10 +8,13 @@
 
 use crate::settings::{BUILTIN, LlmConnection, Settings};
 use crate::sidecar;
-use crate::store::{Meta, Status, Wait};
+use crate::store::{Meta, Status, Wait, write_atomic};
 use crate::transcribe::engine::Segment;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -58,6 +61,16 @@ const WHOLE: &str = "회의 전사본이다.";
 const PART: &str = "회의 전사본을 앞에서부터 나눈 한 구간이다. 이 구간만 같은 형식으로 요약한다.";
 const MERGE: &str = "한 회의를 앞에서부터 차례로 나눠 만든 부분 요약들이다(구분선 ---). 같은 형식의 요약 하나로 합친다. 겹치는 내용은 한 번만 쓰고, 앞에서 정한 것이 뒤에서 바뀌었으면 마지막 상태만 결정사항에 쓴다.";
 const SEPARATOR: &str = "\n\n---\n\n";
+/// Plan 5.3-9: the partial summaries done so far, kept in the meeting folder until it is summarized.
+pub const PARTIAL: &str = "summary.partial.json";
+
+/// One line of `PARTIAL`. `key` hashes all it was made from: the transcript, the rendered system
+/// prompt (the glossary is in it), the connection and its model, and the part's text and place.
+#[derive(Serialize, Deserialize)]
+struct SavedPart {
+    key: String,
+    summary: String,
+}
 
 /// Why a summary failed (architecture 6.4). `message` is what the recorder sees.
 #[derive(Debug, PartialEq)]
@@ -578,8 +591,9 @@ impl<'a> Llm<'a> {
 /// A transcript over 60% of the context goes in parts whose partial summaries are merged, in
 /// groups again while one request cannot hold them all (6.3). `on_step(done, known)` counts
 /// requests: `known` grows when a merge needs another pass. `recover`: the built-in route's hook,
-/// which also gives its failures the built-in words (`engine_failure`). Returns the summary and
-/// its answers' timings.
+/// which also gives its failures the built-in words (`engine_failure`). `partial`: where the
+/// partial summaries are kept (`PARTIAL`), so a stopped summary asks only for the rest; gone once
+/// it is done. Returns the summary and its answers' timings.
 pub async fn summarize(
     connection: &LlmConnection,
     key: Option<String>,
@@ -587,6 +601,7 @@ pub async fn summarize(
     lines: &[String],
     on_step: impl Fn(u32, u32),
     recover: Option<Recover>,
+    partial: Option<&Path>,
 ) -> Result<(String, Timings), Failure> {
     let builtin = recover.is_some();
     let key = key.filter(|k| !k.is_empty());
@@ -594,11 +609,14 @@ pub async fn summarize(
         return Err(Failure::NoKey);
     }
     let summary = match Llm::new(connection, key.as_deref(), recover) {
-        Ok(mut llm) => parts(&mut llm, glossary, lines, on_step)
+        Ok(mut llm) => parts(&mut llm, glossary, lines, on_step, partial)
             .await
             .map(|text| (text, llm.timings)),
         Err(failure) => Err(failure),
     };
+    if let (Ok(_), Some(path)) = (&summary, partial) {
+        let _ = fs::remove_file(path);
+    }
     if builtin {
         summary.map_err(engine_failure)
     } else {
@@ -644,6 +662,7 @@ async fn parts(
     glossary: &[String],
     lines: &[String],
     on_step: impl Fn(u32, u32),
+    partial: Option<&Path>,
 ) -> Result<String, Failure> {
     let mut system = SYSTEM.to_string();
     if !glossary.is_empty() {
@@ -681,10 +700,47 @@ async fn parts(
         .collect();
     let (mut done, mut known) = (0, parts.len() as u32 + 1);
     on_step(done, known);
+    let mut saved: Vec<SavedPart> = partial
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    let made_from = [
+        &format!("{:x}", Sha256::digest(lines.join("\n"))),
+        &system,
+        &llm.connection.name,
+        &llm.connection.model,
+        &parts.len().to_string(),
+    ];
     let mut summaries = Vec::new();
     for (i, piece) in parts.iter().enumerate() {
-        let summary = llm.ask(&system, &message(PART, piece), part).await;
-        summaries.push(summary.map_err(|e| e.at(i + 1, parts.len()))?);
+        let mut hash = Sha256::new();
+        for field in made_from.iter().copied().chain([&i.to_string(), piece]) {
+            hash.update(field);
+            hash.update([0]);
+        }
+        let key = format!("{:x}", hash.finalize());
+        let summary = match saved.get(i).filter(|s| s.key == key) {
+            Some(kept) => kept.summary.clone(),
+            None => {
+                let summary = llm.ask(&system, &message(PART, piece), part).await;
+                let summary = summary.map_err(|e| e.at(i + 1, parts.len()))?;
+                saved.truncate(i);
+                saved.push(SavedPart {
+                    key,
+                    summary: summary.clone(),
+                });
+                // Losing it only costs the request again.
+                if let Some(path) = partial
+                    && let Err(e) = serde_json::to_vec(&saved)
+                        .map_err(|e| e.to_string())
+                        .and_then(|bytes| write_atomic(path, &bytes).map_err(|e| e.to_string()))
+                {
+                    log::warn!("{PARTIAL} 저장 실패: {e}");
+                }
+                summary
+            }
+        };
+        summaries.push(summary);
         done += 1;
         on_step(done, known);
     }
@@ -862,6 +918,7 @@ pub(crate) mod tests {
             lines,
             |_, _| {},
             None,
+            None,
         ))
         .map(|(summary, _)| summary)
     }
@@ -879,6 +936,7 @@ pub(crate) mod tests {
             &glossary,
             &lines(&format!("{SPEECH}\n둘째 줄")),
             |_, _| {},
+            None,
             None,
         ))
         .unwrap();
@@ -1314,6 +1372,8 @@ pub(crate) mod tests {
             grounding_replaced: 0,
             grounding_checked: None,
             wait: None,
+            held: false,
+            chunks_total: 0,
         }
     }
 
@@ -1500,7 +1560,15 @@ pub(crate) mod tests {
         transcript.insert(20, "끊김 없는 긴 발화".repeat(1000));
         let steps = Mutex::new(Vec::new());
         let on_step = |done, known| steps.lock().unwrap().push((done, known));
-        let summary = block_on(summarize(&small, None, &[], &transcript, on_step, None));
+        let summary = block_on(summarize(
+            &small,
+            None,
+            &[],
+            &transcript,
+            on_step,
+            None,
+            None,
+        ));
         assert_eq!(summary.unwrap().0, SUMMARY);
 
         let requests = stub.requests.lock().unwrap();
@@ -1532,6 +1600,113 @@ pub(crate) mod tests {
         let steps = steps.lock().unwrap();
         assert_eq!(steps.first(), Some(&(0, n + 1)));
         assert_eq!(steps.last(), Some(&(n + 1, n + 1)));
+    }
+
+    /// Plan 5.3-9: a summary stopped in its merge asks only for the merge again; the partial
+    /// summaries come from `PARTIAL`, which is gone once the summary is done.
+    #[test]
+    fn a_summary_stopped_in_its_merge_asks_only_for_the_merge_again() {
+        let open = Arc::new(AtomicBool::new(false));
+        let merging = open.clone();
+        let stub = serve(move |r| {
+            if r.body["max_tokens"] == PART_TOKENS {
+                Some(completion("## 결정사항\n- 부분 요약"))
+            } else {
+                // The first merge is never answered: the pause aborts it.
+                merging.load(Ordering::SeqCst).then(|| completion(SUMMARY))
+            }
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let partial = tmp.path().join(PARTIAL);
+        let (connection, transcript) = (small(&stub), talk(40));
+        let task = {
+            let (connection, transcript, partial) =
+                (connection.clone(), transcript.clone(), partial.clone());
+            tauri::async_runtime::spawn(async move {
+                let partial = Some(partial.as_path());
+                summarize(
+                    &connection,
+                    None,
+                    &[],
+                    &transcript,
+                    |_, _| {},
+                    None,
+                    partial,
+                )
+                .await
+            })
+        };
+        let merge = |r: &Request| r.body["max_tokens"] != PART_TOKENS;
+        let until = Instant::now() + Duration::from_secs(10);
+        while !stub.requests.lock().unwrap().iter().any(merge) {
+            assert!(Instant::now() < until, "no merge asked");
+            thread::sleep(Duration::from_millis(10));
+        }
+        task.abort();
+        let parts = stub.requests.lock().unwrap().len() - 1;
+        assert!(parts > 1, "{parts}");
+        let saved: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(&partial).unwrap()).unwrap();
+        assert_eq!(saved.len(), parts);
+
+        open.store(true, Ordering::SeqCst);
+        let steps = Mutex::new(Vec::new());
+        let on_step = |done, known| steps.lock().unwrap().push((done, known));
+        let summary = block_on(summarize(
+            &connection,
+            None,
+            &[],
+            &transcript,
+            on_step,
+            None,
+            Some(&partial),
+        ));
+        assert_eq!(summary.unwrap().0, SUMMARY);
+        let requests = stub.requests.lock().unwrap();
+        assert_eq!(requests.len(), parts + 2);
+        assert!(merge(requests.last().unwrap()));
+        let n = parts as u32 + 1;
+        assert_eq!(steps.lock().unwrap().last(), Some(&(n, n)));
+        assert!(!partial.exists());
+    }
+
+    /// Plan 5.3-9: kept partial summaries are used only with the same prompt: a glossary changed
+    /// meanwhile asks for every part again.
+    #[test]
+    fn a_changed_glossary_asks_for_every_part_again() {
+        let fail = Arc::new(AtomicBool::new(true));
+        let failing = fail.clone();
+        let stub = serve(move |r| {
+            Some(if r.body["max_tokens"] == PART_TOKENS {
+                completion("## 결정사항\n- 부분 요약")
+            } else if failing.load(Ordering::SeqCst) {
+                reply("500 Internal Server Error", "busy")
+            } else {
+                completion(SUMMARY)
+            })
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let partial = tmp.path().join(PARTIAL);
+        let (connection, transcript) = (small(&stub), talk(40));
+        let ask = |glossary: &[String]| {
+            let partial = Some(partial.as_path());
+            block_on(summarize(
+                &connection,
+                None,
+                glossary,
+                &transcript,
+                |_, _| {},
+                None,
+                partial,
+            ))
+        };
+        assert!(ask(&[]).is_err());
+        let first = stub.requests.lock().unwrap().len();
+        assert!(partial.exists());
+
+        fail.store(false, Ordering::SeqCst);
+        assert_eq!(ask(&["누리패스".into()]).unwrap().0, SUMMARY);
+        assert_eq!(stub.requests.lock().unwrap().len(), first * 2);
     }
 
     fn talk(lines: usize) -> Vec<String> {
@@ -1661,6 +1836,7 @@ pub(crate) mod tests {
             &talk(60),
             |_, _| {},
             None,
+            None,
         ));
         assert_eq!(summary.unwrap().0, SUMMARY);
         let requests = stub.requests.lock().unwrap();
@@ -1747,7 +1923,15 @@ pub(crate) mod tests {
             };
             let key = Some(endpoint.key.clone());
             let recover = Some(sidecar.on_failure(endpoint));
-            let result = block_on(summarize(&connection, key, &[], lines, |_, _| {}, recover));
+            let result = block_on(summarize(
+                &connection,
+                key,
+                &[],
+                lines,
+                |_, _| {},
+                recover,
+                None,
+            ));
             let log = |name| fs::read_to_string(tmp.path().join("logs").join(name));
             Ran {
                 result,
@@ -1891,6 +2075,7 @@ pub(crate) mod tests {
                 &lines(SPEECH),
                 |_, _| {},
                 Some(recover),
+                None,
             ));
             let failure = result.unwrap_err();
             assert_eq!(failure, Failure::Builtin(sidecar::Failure::GlossaryTooLong));
@@ -2244,6 +2429,7 @@ pub(crate) mod tests {
                     &lines,
                     on_step,
                     recover,
+                    None,
                 ));
                 (summary, started.elapsed().as_secs_f64())
             };

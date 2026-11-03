@@ -46,6 +46,7 @@ import {
   listConnections,
   NEWER_VERSION,
   onSlackFinished,
+  pauseMeeting,
   resumeMeeting,
   retrySummary,
   saveSummary,
@@ -137,6 +138,7 @@ export default function Meeting({
   id,
   listed,
   progress,
+  recording = false,
   barSlot,
   onHome,
   onNotice,
@@ -148,6 +150,8 @@ export default function Meeting({
   listed?: MeetingItem;
   /** The meeting's last `meeting://progress`, if it has been in line. */
   progress?: Progress;
+  /** A recording runs: a meeting in line waits for it to end (TRN-09). */
+  recording?: boolean;
   /** App's bottom stack: the send bar goes there, above the dock. */
   barSlot?: HTMLElement | null;
   /** Back to Home: from 홈으로 with its click, after 전송 안 함 or 삭제 without. */
@@ -478,6 +482,11 @@ export default function Meeting({
       },
       (e) => setError(String(e)),
     );
+  // Plan 5.3-11: whatever it did (`already_done` too), the meeting is read again, without a banner.
+  const pause = () => {
+    setError("");
+    pauseMeeting(id).then(read, (e) => setError(String(e)));
+  };
 
   const meta = detail?.meta ?? listed;
   const now = meta ? phase(meta, progress) : null;
@@ -518,12 +527,13 @@ export default function Meeting({
   // Stopped after transcribing, with no place in line: its route does not resolve yet.
   const stopped = meta?.status === "transcribed" && now === null && !newer;
   // Plan 5.4, ENG15: waiting with its transcript for the summary model or for a connection to
-  // replace a deleted one. Not in line, so another connection can be picked.
+  // replace a deleted one. Not in line, so another connection can be picked; nor paused by the
+  // recorder, who resumes it first (plan 5.3).
   const waits =
     !newer &&
     !!meta?.wait &&
     (meta.status === "transcribed" || meta.status === "paused") &&
-    now !== "running" &&
+    now === null &&
     progress?.position == null;
   // Events come before the meeting is read again: a summary's first one can meet a transcribing meta.
   const writing = now === "running" && (progress?.status === "summarizing" || meta?.status === "summarizing");
@@ -699,7 +709,7 @@ export default function Meeting({
                 </Grow>
               ) : (
                 meta.title ||
-                (reviewable || !now ? (
+                (reviewable || !now || now === "held" ? (
                   "제목 없음"
                 ) : (
                   <WaitingTitle
@@ -852,7 +862,14 @@ export default function Meeting({
         {detail && meta && !reviewable && !newer && (now || transcribeFailed || summaryFailed || stopped || waits) && (
           <>
             <div className="space-y-4">
-              <Steps meta={meta} progress={progress} failed={transcribeFailed || summaryFailed} />
+              <Steps
+                meta={meta}
+                progress={progress}
+                failed={transcribeFailed || summaryFailed}
+                recording={recording}
+                onPause={pause}
+                onResume={() => queued(resumeMeeting(id))}
+              />
               {/* Why a waiting meeting waits, the summary model's state with it (DX6). */}
               <RouteNotice
                 id={id}

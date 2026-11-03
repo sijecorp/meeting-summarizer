@@ -143,17 +143,25 @@ const RUNNING: Status[] = ["transcribing", "summarizing"];
 // with a `wait` (plan 5.4): neither is in line.
 const WAITING: Status[] = ["recorded", "paused"];
 
-/** Running, waiting or neither. The dock, Home and the meeting document all ask this, so the dock's
- * "처리 중 N" always matches the rows. */
+/** Running, paused by the recorder (`held`, plan 5.3), waiting or neither. The dock, Home and the
+ * meeting document all ask this, so the dock's "처리 중 N" always matches the rows. A held meeting
+ * whose run still stops is running: "멈추는 중…" comes from the two together, so it survives a
+ * redraw. */
 export function phase(meta: Meta, progress: Progress | undefined) {
   // A meeting from a newer app version is read-only and never runs here (like `busy_ids`).
   if (meta.schema_version > SCHEMA_VERSION) return null;
   // An event saying it runs wins over the list: between transcribing and summarizing the list can
   // read `transcribed`, and the dock must not drop the meeting for that moment.
-  if (RUNNING.includes(meta.status) || (progress && RUNNING.includes(progress.status))) return "running";
+  if (progress && RUNNING.includes(progress.status)) return "running";
+  if (meta.held) return "held";
+  if (RUNNING.includes(meta.status)) return "running";
   if (progress?.position != null || (WAITING.includes(meta.status) && !meta.wait)) return "waiting";
   return null;
 }
+
+/** Plan 5.3: a held meeting whose run has not ended yet. */
+export const stopping = (meta: Meta, progress: Progress | undefined) =>
+  !!meta.held && phase(meta, progress) === "running";
 
 /** A waiting meeting shows its place in line instead of its stored status. */
 export function statusLabel(meta: Meta, progress: Progress | undefined) {

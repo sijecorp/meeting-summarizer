@@ -257,8 +257,8 @@ test("the dock counts the line: meetings being processed and waiting, nothing el
         // Interrupted: offered on Home, not counted as recording or waiting.
         meeting("g", "recording", true),
         // From a newer app version: read-only, never processed here.
-        { ...meeting("h", "transcribing"), schema_version: 2 },
-        { ...meeting("i", "recording"), schema_version: 2 },
+        { ...meeting("h", "transcribing"), schema_version: 3 },
+        { ...meeting("i", "recording"), schema_version: 3 },
       ];
     }
     if (cmd === "queue_state") return [progress("j", { status: "transcribed", position: 1 })];
@@ -885,4 +885,37 @@ test("REC-12: the dock shows the file being imported and how far, then lets go",
 
   await act(async () => finish(meeting("긴 회의", "recorded")));
   await waitFor(() => expect(screen.queryByText("녹음 파일 가져오기")).toBeNull());
+});
+
+// Plan 5.3-14: a meeting whose pause still stops is counted until its run ends; a paused one is
+// not; and when the last one stops, the dock goes without saying it finished.
+test("the dock counts a stopping meeting, never a paused one, and goes quietly", async () => {
+  let list = [{ ...meeting("a", "transcribing"), held: true }, { ...meeting("b", "paused"), held: true }];
+  mock((cmd) => {
+    if (cmd === "list_meetings") return list;
+    if (cmd === "queue_state") return [progress("a")];
+  });
+
+  render(<App />);
+  expect(await screen.findByRole("button", { name: "처리 중 1 · a · 전사 42%" })).toBeTruthy();
+
+  list = [{ ...meeting("a", "paused"), held: true }, list[1]];
+  await act(() => emit("meeting://progress", progress("a", { status: "paused", eta_secs: null })));
+  await waitFor(() => expect(screen.queryByRole("button", { name: /^처리 중/ })).toBeNull());
+  expect(screen.queryByText("처리를 마쳤습니다")).toBeNull();
+});
+
+test("the dock says it finished when no paused meeting is left", async () => {
+  let list = [meeting("a", "transcribing")];
+  mock((cmd) => {
+    if (cmd === "list_meetings") return list;
+    if (cmd === "queue_state") return [progress("a")];
+  });
+
+  render(<App />);
+  expect(await screen.findByRole("button", { name: "처리 중 1 · a · 전사 42%" })).toBeTruthy();
+
+  list = [meeting("a", "review")];
+  await act(() => emit("meeting://progress", progress("a", { status: "review", eta_secs: null })));
+  expect(await screen.findByText("처리를 마쳤습니다")).toBeTruthy();
 });

@@ -418,6 +418,7 @@ pub fn run() {
             commands::get_transcript,
             commands::delete_meeting,
             commands::resume_meeting,
+            commands::pause_meeting,
             commands::start_recording,
             commands::stop_recording,
             commands::recording_state,

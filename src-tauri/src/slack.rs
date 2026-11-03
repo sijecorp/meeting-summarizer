@@ -1075,6 +1075,8 @@ mod tests {
             grounding_replaced: 0,
             grounding_checked: None,
             wait: None,
+            held: false,
+            chunks_total: 0,
         }
     }
 

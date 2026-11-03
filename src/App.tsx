@@ -487,6 +487,7 @@ export default function App() {
                   id={screen.id}
                   listed={meetings?.find((m) => m.id === screen.id)}
                   progress={progress[screen.id]}
+                  recording={recording}
                   barSlot={barSlot}
                   onHome={(e) => leave(screen.id, e)}
                   onNotice={setNotice}
@@ -514,6 +515,7 @@ export default function App() {
             live={live}
             stopping={ending}
             queue={[...running, ...waiting]}
+            held={current.some((m) => phase(m, progress[m.id]) === "held")}
             imported={importing ? imported : null}
             progress={progress}
             hidden={screen.name === "recording"}

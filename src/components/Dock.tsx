@@ -160,6 +160,7 @@ export default function Dock({
   live,
   stopping,
   queue,
+  held = false,
   progress,
   imported,
   hidden,
@@ -173,6 +174,8 @@ export default function Dock({
   stopping: boolean;
   /** Meetings being processed first, then the ones waiting, by place in line. */
   queue: MeetingItem[];
+  /** A meeting paused by the recorder is left (plan 5.3-14): processing then ends without a word. */
+  held?: boolean;
   progress: Record<string, Progress>;
   /** A recording file being imported (REC-12): shown over processing, which it is about to join. */
   imported?: ImportProgress | null;
@@ -188,7 +191,8 @@ export default function Dock({
   const [said, setSaid] = useState("");
   const last = useRef(mode);
   useEffect(() => {
-    if (last.current !== mode) setSaid(announcement(last.current, mode));
+    const quiet = held && last.current === "processing" && mode === "idle";
+    if (last.current !== mode) setSaid(quiet ? "" : announcement(last.current, mode));
     last.current = mode;
   }, [mode]);
 

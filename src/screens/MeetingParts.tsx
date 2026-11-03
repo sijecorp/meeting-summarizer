@@ -11,6 +11,7 @@ import {
   remaining,
   ro,
   statusLabel,
+  stopping as stoppingOf,
   TranscriptList,
   useFollow,
 } from "@/components/common";
@@ -294,12 +295,23 @@ export function DocView({
 }
 
 const STEPS = ["녹음", "전사", "요약", "검토"];
+/** Plan 5.3-15: what the recorder can do about a slow PC itself. */
+const LATER = " · 일시정지하고 나중에 이어서 처리할 수 있습니다";
 /** Plan 5.1-12: why it is slow, and what may help. */
 const SLOW: Record<SlowReason, string> = {
   saver: "에너지 절약 모드라 처리가 느릴 수 있습니다. 전원을 연결하면 빨라질 수 있습니다",
   cpu: "GPU를 쓰지 못해 CPU로 처리하고 있어 느립니다. 그래픽 드라이버를 업데이트하면 나아질 수 있습니다",
-  cpu_nogpu: "이 PC에는 쓸 수 있는 GPU가 없어 CPU로 처리합니다",
-  slow: "이 PC에서는 전사가 회의 길이보다 오래 걸립니다",
+  cpu_nogpu: `이 PC에는 쓸 수 있는 GPU가 없어 CPU로 처리합니다${LATER}`,
+  slow: `이 PC에서는 전사가 회의 길이보다 오래 걸립니다${LATER}`,
+};
+/** Plan 5.3: the processing area's one button, and what it says once it changed. */
+export const PAUSE = {
+  pause: "일시정지",
+  stopping: "멈추는 중…",
+  resume: "이어서 처리",
+  held: "일시정지됨",
+  paused: "일시정지했습니다",
+  resumed: "이어서 처리합니다",
 };
 // Summarizing is next or under way. A `paused` meeting with a connection stopped while summarizing.
 const SUMMARY_STEP: Status[] = ["transcribed", "summarizing", "summarize_failed"];
@@ -311,31 +323,72 @@ function Ticker({ value }: { value: number }) {
 }
 
 /** Where a meeting stands before review: 녹음 ✓ › 전사 42% › 요약 › 검토, then a line of detail.
- * Plain text, never a live region; a screen reader gets the value from a hidden progress bar. */
-export function Steps({ meta, progress: p, failed }: { meta: Meta; progress?: Progress; failed: boolean }) {
+ * Plain text, never a live region; a screen reader gets the value from a hidden progress bar. With
+ * `onPause` the line ends in plan 5.3's button: 일시정지, 멈추는 중… until the run ends, 이어서
+ * 처리. One button whose words change, so the focus stays on it. */
+export function Steps({
+  meta,
+  progress: p,
+  failed,
+  recording = false,
+  onPause,
+  onResume,
+}: {
+  meta: Meta;
+  progress?: Progress;
+  failed: boolean;
+  /** A recording runs: nothing starts until it ends (TRN-09). */
+  recording?: boolean;
+  onPause?: () => void;
+  onResume?: () => void;
+}) {
   const now = phase(meta, p);
+  const held = now === "held";
+  const stopping = stoppingOf(meta, p);
   // An event saying it runs wins over the stored status, as in `phase`: read as `transcribed` while
   // the last event is still transcribing, it is still at 전사.
   const running = p?.status === "transcribing" || p?.status === "summarizing" ? p.status : null;
+  const total = meta.chunks_total ?? 0;
+  // Paused after its last chunk, before its summary started: its transcript is done.
+  const transcribed = total > 0 && meta.chunks_done >= total;
   const summary = running
     ? running === "summarizing"
-    : SUMMARY_STEP.includes(meta.status) || (meta.status === "paused" && !!meta.llm_connection);
+    : SUMMARY_STEP.includes(meta.status) || (meta.status === "paused" && (!!meta.llm_connection || transcribed));
   const at = summary ? 2 : 1;
   const transcribing = now === "running" && at === 1;
   const counted = transcribing && p?.status === "transcribing" && p.chunks > 0;
   const line = now === "running" && p ? progressText(p) : null;
   // Plan 5.1-12: only saver goes on into the summary.
   const slow = now === "running" && p?.slow && (!summary || p.slow === "saver") ? p.slow : null;
-  const note = [
-    now === "waiting" && statusLabel(meta, p),
-    counted && `구간 ${Math.min(p.chunk + 1, p.chunks)}/${p.chunks}`,
-    counted && p.eta_secs != null && remaining(p.eta_secs),
-    transcribing && p?.status === "transcribing" && !counted && "구간 나누는 중",
-    // The reason says the CPU already.
-    slow !== "cpu" && slow !== "cpu_nogpu" && meta.backend && `처리 장치 ${meta.backend.toUpperCase()}`,
-  ]
-    .filter(Boolean)
-    .join(" · ");
+  // Plan 5.3-12: where it stopped, from `meta.json`, so a restart draws it too.
+  const stoppedIn = summary
+    ? "요약 중 멈춤 · 끝난 부분부터 이어서 합니다"
+    : total > 0
+      ? `구간 ${Math.min(meta.chunks_done + 1, total)}/${total}에서 멈춤 · 이어서 처리하면 이 구간부터 다시 합니다`
+      : "구간을 나누기 전에 멈춤 · 이어서 처리하면 처음부터 합니다";
+  const note = held
+    ? stoppedIn
+    : [
+        now === "waiting" && statusLabel(meta, p),
+        now === "waiting" && recording && "녹음이 끝나면 처리합니다",
+        counted && `구간 ${Math.min(p.chunk + 1, p.chunks)}/${p.chunks}`,
+        counted && p.eta_secs != null && remaining(p.eta_secs),
+        transcribing && p?.status === "transcribing" && !counted && "구간 나누는 중",
+        // The reason says the CPU already.
+        slow !== "cpu" && slow !== "cpu_nogpu" && meta.backend && `처리 장치 ${meta.backend.toUpperCase()}`,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+  // The transcription's value where it stopped, for the hidden progress bar.
+  const stoppedAt = held && !summary && total > 0 ? Math.round((meta.chunks_done / total) * 100) : null;
+  const action = held ? PAUSE.resume : stopping ? PAUSE.stopping : now ? PAUSE.pause : null;
+  // Said once when it changes, politely; never on the first render.
+  const [said, setSaid] = useState("");
+  const was = useRef(held);
+  useEffect(() => {
+    if (was.current !== held) setSaid(held ? PAUSE.paused : PAUSE.resumed);
+    was.current = held;
+  }, [held]);
   const mark = failed ? (
     <CircleAlert aria-hidden className="size-3.5 text-danger-line" />
   ) : now === "waiting" ? (
@@ -345,27 +398,45 @@ export function Steps({ meta, progress: p, failed }: { meta: Meta; progress?: Pr
   ) : null;
   return (
     <div className="space-y-1">
-      <ol aria-label="처리 단계" className="flex flex-wrap items-center gap-x-2 gap-y-1 text-label text-ink-2">
-        {STEPS.map((step, i) => (
-          <li
-            key={step}
-            aria-current={i === at ? "step" : undefined}
-            className={`flex items-center gap-1.5 ${i === at ? "text-ink" : ""}`}
+      <div className="flex items-center justify-between gap-3">
+        <ol aria-label="처리 단계" className="flex flex-wrap items-center gap-x-2 gap-y-1 text-label text-ink-2">
+          {STEPS.map((step, i) => (
+            <li
+              key={step}
+              aria-current={i === at ? "step" : undefined}
+              className={`flex items-center gap-1.5 ${i === at ? "text-ink" : ""}`}
+            >
+              {i > 0 && <ChevronRight aria-hidden className="mr-0.5 size-3.5 text-ink-3" />}
+              {i === at && mark}
+              {step}
+              {i < at && (
+                <>
+                  <Check aria-hidden className="size-3.5" />
+                  <span className="sr-only">완료</span>
+                </>
+              )}
+              {i === at && counted && <Ticker value={p.percent} />}
+              {i === at && failed && <span>실패</span>}
+              {i === at && held && <span>{PAUSE.held}</span>}
+            </li>
+          ))}
+        </ol>
+        {onPause && action && (
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-disabled={stopping || undefined}
+            className="-my-1 aria-disabled:opacity-50"
+            onClick={() => {
+              if (stopping) return;
+              if (held) onResume?.();
+              else onPause();
+            }}
           >
-            {i > 0 && <ChevronRight aria-hidden className="mr-0.5 size-3.5 text-ink-3" />}
-            {i === at && mark}
-            {step}
-            {i < at && (
-              <>
-                <Check aria-hidden className="size-3.5" />
-                <span className="sr-only">완료</span>
-              </>
-            )}
-            {i === at && counted && <Ticker value={p.percent} />}
-            {i === at && failed && <span>실패</span>}
-          </li>
-        ))}
-      </ol>
+            {action}
+          </Button>
+        )}
+      </div>
       {note && <p className="text-caption text-ink-2 tabular-nums">{note}</p>}
       <AnimatePresence initial={false} mode="wait">
         {slow && (
@@ -396,6 +467,19 @@ export function Steps({ meta, progress: p, failed }: { meta: Meta; progress?: Pr
           className="sr-only"
         />
       )}
+      {stoppedAt != null && (
+        <span
+          role="progressbar"
+          aria-label="전사 진행률"
+          aria-valuenow={stoppedAt}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          className="sr-only"
+        />
+      )}
+      <span role="status" className="sr-only">
+        {said}
+      </span>
     </div>
   );
 }

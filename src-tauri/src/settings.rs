@@ -1,9 +1,12 @@
-use crate::store::{NEWER_VERSION, SCHEMA_VERSION, write_atomic};
+use crate::store::{NEWER_VERSION, write_atomic};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
+
+/// `settings.json`'s own version, apart from `meta.json`'s (`store::SCHEMA_VERSION`).
+const SCHEMA_VERSION: u32 = 1;
 
 const KEYRING_SERVICE: &str = "com.sije.meeting-summarizer";
 const GLOSSARY_MAX: usize = 100;

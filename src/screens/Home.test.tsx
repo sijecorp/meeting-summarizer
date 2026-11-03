@@ -419,7 +419,7 @@ test("groups meetings into 지금 할 일 and days, each once", () => {
       at("녹음 회의", "recording", 0, 16),
       at("보낸 회의", "sent", 0, 15, { sent: { channel: "#회의록", at: ago(0, 15), edit_count: 0 } }),
       at("전사 회의", "transcribing", 0, 14),
-      at("새 버전 회의", "review", 0, 13, { schema_version: 2 }),
+      at("새 버전 회의", "review", 0, 13, { schema_version: 3 }),
       at("멈춘 회의", "transcribed", 0, 12),
       at("대기 회의", "recorded", 1, 17),
       at("실패 회의", "transcribe_failed", 1, 16, { error: "전사하지 못했습니다" }),
@@ -476,7 +476,7 @@ test("each row offers the one action its state needs", async () => {
         meeting("i", "sent"),
         meeting("j", "archived"),
         meeting("k", "transcribed"),
-        { ...meeting("l", "review"), schema_version: 2 },
+        { ...meeting("l", "review"), schema_version: 3 },
       ]}
       progress={{
         f: progress("f", { chunk: 1, chunks: 3, percent: 42 }),
@@ -565,4 +565,66 @@ test("REC-12: the first screen and Home's head both offer an import, held while 
 
   rerender(<Home {...props} importing meetings={[meeting("a", "sent")]} progress={{}} />);
   expect((screen.getByRole("button", { name: "가져오는 중…" }) as HTMLButtonElement).disabled).toBe(true);
+});
+
+const held = (id: string, status: Status = "paused"): MeetingItem => ({ ...meeting(id, status), held: true });
+
+// Plan 5.3-13: a paused meeting stays in 지금 할 일 with 이어서 처리; one still stopping says so
+// and offers nothing. Home has no pause button.
+test("a paused row offers 이어서 처리; a stopping one says so and offers nothing", async () => {
+  const calls: { cmd: string; args: unknown }[] = [];
+  mock((cmd, args) => {
+    calls.push({ cmd, args });
+    if (cmd === "resume_meeting") return meeting("a", "paused");
+  });
+  home([held("a"), held("b", "transcribing"), meeting("c", "review")], [progress("b", { chunks: 4, percent: 30 })]);
+
+  const now = within(screen.getByRole("region", { name: "지금 할 일" }));
+  const row = (id: string) => now.getByText(id).closest("li")!;
+  expect(within(row("a")).getByText("일시정지됨")).toBeTruthy();
+  expect(row("a").querySelector("svg.lucide-pause")).toBeTruthy();
+  expect(within(row("b")).getByText("멈추는 중…")).toBeTruthy();
+  // Only the row itself, which opens the meeting.
+  expect(within(row("b")).getAllByRole("button")).toHaveLength(1);
+  expect(screen.queryByRole("button", { name: /일시정지$|모두 이어서 처리/ })).toBeNull();
+
+  fireEvent.click(screen.getByRole("button", { name: "이어서 처리 (a)" }));
+  await waitFor(() => expect(calls.find((c) => c.cmd === "resume_meeting")?.args).toEqual({ id: "a" }));
+});
+
+// Plan 5.3-13: with two or more paused, "모두 이어서 처리" by the heading resumes each, oldest first.
+// One that fails keeps its error in its row; once the button goes, the focus goes to the heading.
+test("모두 이어서 처리 resumes every paused meeting and leaves a failure in its row", async () => {
+  const calls: string[] = [];
+  mock((cmd, args) => {
+    if (cmd !== "resume_meeting") return;
+    const { id } = args as { id: string };
+    calls.push(id);
+    if (id === "b") throw "다시 처리할 수 있는 회의가 아닙니다";
+    return meeting(id, "paused");
+  });
+  const all = { name: "모두 이어서 처리" };
+  const { rerender } = home([], []);
+  const draw = (meetings: MeetingItem[], onChanged = () => {}) =>
+    rerender(<Home {...props} meetings={meetings} progress={{}} onChanged={onChanged} />);
+  draw([meeting("x", "review")]);
+  expect(screen.queryByRole("button", all)).toBeNull();
+  draw([held("a"), meeting("x", "review")]);
+  expect(screen.queryByRole("button", all)).toBeNull();
+
+  let changed = 0;
+  draw([held("a"), held("b"), held("c")], () => changed++);
+  const button = screen.getByRole("button", all);
+  button.focus();
+  fireEvent.click(button);
+  await waitFor(() => expect(changed).toBe(1));
+  expect(calls).toEqual(["c", "b", "a"]);
+
+  // The list read again: a and c are back in line, b is still paused.
+  draw([meeting("a", "paused"), held("b"), meeting("c", "paused")]);
+  const row = screen.getByText("b").closest("li")!;
+  expect(within(row).getByText("다시 처리할 수 있는 회의가 아닙니다")).toBeTruthy();
+  expect(row.querySelector("svg.lucide-circle-alert")).toBeTruthy();
+  expect(screen.queryByRole("button", all)).toBeNull();
+  expect(document.activeElement).toBe(screen.getByRole("heading", { name: /^지금 할 일/ }));
 });

@@ -4,7 +4,8 @@ import { listen } from "@tauri-apps/api/event";
 // Mirrors src-tauri/src/store.rs, settings.rs, commands.rs, audio/mod.rs, queue.rs, summarize.rs,
 // slack.rs and transcribe/model.rs.
 
-export const SCHEMA_VERSION = 1;
+/** The newest `meta.json` this app reads and writes: 2 only while a meeting uses a 1.1.0 field. */
+export const SCHEMA_VERSION = 2;
 export const NEWER_VERSION = "새 버전 앱에서 만든 데이터입니다";
 
 export type Status =
@@ -32,7 +33,7 @@ export const STATUS_LABEL: Record<Status, string> = {
   review: "검토 대기",
   sent: "전송 완료",
   archived: "전송 안 함",
-  paused: "일시정지",
+  paused: "일시정지됨",
   transcribe_failed: "전사 실패",
   summarize_failed: "요약 실패",
   deleting: "삭제 중",
@@ -61,6 +62,10 @@ export type Meta = {
   /** Why a meeting with its transcript waits in `transcribed` or `paused` instead of summarizing
    * (plan 5.4). Absent once its summary starts or its connection is changed. */
   wait?: Wait;
+  /** Plan 5.3: the recorder paused it; it waits out of line until "이어서 처리". */
+  held?: boolean;
+  /** Plan 5.3-8: chunks in its plan, 0 before there is one. */
+  chunks_total?: number;
 };
 
 /** `summary_model`: the built-in route needs the summary model (`modelStatus("summary")` tells
@@ -173,6 +178,9 @@ export const getTranscript = (id: string) => invoke<Segment[]>("get_transcript",
 export const deleteMeeting = (id: string) => invoke<void>("delete_meeting", { id });
 /** "처리 계속" for an interrupted recording, or a retry after `transcribe_failed`: queues it. */
 export const resumeMeeting = (id: string) => invoke<Meta>("resume_meeting", { id });
+/** Plan 5.3-4: `pausing` while its run stops; `already_done` when it finished first. */
+export type PauseResult = "paused" | "pausing" | "already_done";
+export const pauseMeeting = (id: string) => invoke<PauseResult>("pause_meeting", { id });
 
 // Summaries and review (architecture 6, 10.2).
 

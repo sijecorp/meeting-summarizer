@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// The newest `schema_version` this app reads and writes. A meeting is written as 2 only while it
+/// uses a field an older app would drop (`Meta::schema`); newer ones stay read-only (8.2).
+pub const SCHEMA_VERSION: u32 = 2;
 pub const NEWER_VERSION: &str = "새 버전 앱에서 만든 데이터입니다";
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +86,13 @@ pub struct Meta {
     /// (plan 5.4). Written by the queue, gone once its summary starts or its connection is changed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<Wait>,
+    /// Plan 5.3: the recorder paused it. The queue never lines it up by itself, not even at the
+    /// next start, until "이어서 처리" clears it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
+    /// Plan 5.3-8: chunks in its plan, so a paused meeting still draws "구간 3/7" after a restart.
+    #[serde(default)]
+    pub chunks_total: u32,
 }
 
 /// Plan 5.4, ENG15: the meeting's route does not resolve yet.
@@ -97,6 +106,12 @@ pub enum Wait {
 }
 
 impl Meta {
+    /// Plan 5.7-9: 2 only while it uses a 1.1.0 field, so an older app keeps every other meeting
+    /// as before and leaves this one read-only instead of dropping the field.
+    fn schema(&self) -> u32 {
+        if self.held { 2 } else { 1 }
+    }
+
     /// Summarizing has started, so where it goes is settled (SUM-08): a connection was chosen, or
     /// the meeting is past the stages before summarizing.
     pub fn summary_started(&self) -> bool {
@@ -125,6 +140,8 @@ pub fn can_transition(from: Status, to: Status) -> bool {
             | (Summarizing, Review | Paused | SummarizeFailed)
             | (SummarizeFailed, Summarizing)
             | (Paused, Transcribing | Summarizing)
+            // Plan 5.3-3: "일시정지" of a meeting in line, a retried failure too.
+            | (Recorded | Transcribed | TranscribeFailed | SummarizeFailed, Paused)
             | (Review, Sent | Archived)
     )
 }
@@ -246,7 +263,7 @@ fn new_meta(
     summarize_local: bool,
 ) -> Meta {
     Meta {
-        schema_version: SCHEMA_VERSION,
+        schema_version: 1,
         id: format!(
             "{:04}-{:02}-{:02}T{:02}{:02}-{:04x}",
             now.year(),
@@ -271,6 +288,8 @@ fn new_meta(
         grounding_replaced: 0,
         grounding_checked: None,
         wait: None,
+        held: false,
+        chunks_total: 0,
     }
 }
 
@@ -463,12 +482,21 @@ impl Store {
         }
         let from = meta.status;
         f(&mut meta)?;
+        meta.schema_version = meta.schema();
         self.write(&meta)?;
         // Plan 5.1-13: app.log's timestamps then tell how long each step took.
         if meta.status != from {
             log::info!("상태 ({id}): {from:?} -> {:?}", meta.status);
         }
         Ok(meta)
+    }
+
+    /// Plan 5.7-2: a check under the meeting's lock that writes nothing (`update` always writes,
+    /// and refuses `deleting`).
+    pub fn with_lock<T>(&self, id: &str, f: impl FnOnce(&Meta) -> T) -> Result<T, String> {
+        let lock = self.lock_for(id)?;
+        let _guard = lock.lock().unwrap();
+        Ok(f(&self.read(id)?))
     }
 
     pub fn set_status(&self, id: &str, to: Status) -> Result<Meta, String> {
@@ -770,6 +798,10 @@ mod tests {
             (Summarizing, SummarizeFailed),
             (SummarizeFailed, Summarizing),
             (Paused, Summarizing),
+            (Recorded, Paused),
+            (Transcribed, Paused),
+            (TranscribeFailed, Paused),
+            (SummarizeFailed, Paused),
             (Review, Sent),
             (Review, Archived),
         ];
@@ -927,7 +959,7 @@ mod tests {
         let changed_shape = put(&store, Review).id;
         let future = |id: &str, extra: &str| {
             format!(
-                r#"{{"schema_version": 2, "id": "{id}", "title": "미래 회의", "created_at": "2026-10-13T05:00:03Z", {extra}}}"#
+                r#"{{"schema_version": 3, "id": "{id}", "title": "미래 회의", "created_at": "2026-10-13T05:00:03Z", {extra}}}"#
             )
         };
         fs::write(
@@ -944,13 +976,79 @@ mod tests {
         let listed = store.list();
         assert_eq!(listed.len(), 2);
         for meta in listed {
-            assert_eq!((meta.schema_version, meta.title.as_str()), (2, "미래 회의"));
+            assert_eq!((meta.schema_version, meta.title.as_str()), (3, "미래 회의"));
             assert_eq!(meta.status, Unknown);
             assert_eq!(
                 store.set_status(&meta.id, Deleting).unwrap_err(),
                 NEWER_VERSION
             );
         }
+    }
+
+    /// Plan 5.7-9: only a meeting using a 1.1.0 field is written as 2, and back to 1 once it no
+    /// longer does; both read and write here.
+    #[test]
+    fn only_a_held_meeting_is_written_as_schema_2_and_back_to_1() {
+        let (_tmp, store) = store();
+        let id = store.create("", false).unwrap().id;
+        let on_disk = || {
+            let bytes = fs::read(meta_path(&store, &id)).unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        };
+        assert_eq!(on_disk()["schema_version"], 1);
+        assert!(on_disk().get("held").is_none());
+
+        let held = store
+            .update(&id, |m| {
+                m.held = true;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            (held.schema_version, on_disk()["held"].as_bool()),
+            (2, Some(true))
+        );
+        assert_eq!(on_disk()["schema_version"], 2);
+        // Still this app's own: read and written as before.
+        assert_eq!(store.set_status(&id, Recorded).unwrap().schema_version, 2);
+
+        let cleared = store
+            .update(&id, |m| {
+                m.held = false;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(cleared.schema_version, 1);
+        assert_eq!(on_disk()["schema_version"], 1);
+        assert!(on_disk().get("held").is_none());
+    }
+
+    /// Plan 5.7-2: a read under the meeting's lock leaves `meta.json` as it was, and waits for a
+    /// write in flight.
+    #[test]
+    fn with_lock_reads_without_writing_and_waits_for_an_update() {
+        let (_tmp, store) = store();
+        let id = put(&store, Recorded).id;
+        let before = fs::read(meta_path(&store, &id)).unwrap();
+        assert_eq!(store.with_lock(&id, |m| m.status).unwrap(), Recorded);
+        assert_eq!(fs::read(meta_path(&store, &id)).unwrap(), before);
+        assert!(store.with_lock("../x", |_| ()).is_err());
+
+        let entered = std::sync::Barrier::new(2);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                store
+                    .update(&id, |m| {
+                        entered.wait();
+                        std::thread::sleep(Duration::from_millis(100));
+                        m.held = true;
+                        Ok(())
+                    })
+                    .unwrap()
+            });
+            entered.wait();
+            assert!(store.with_lock(&id, |m| m.held).unwrap());
+        });
     }
 
     #[test]

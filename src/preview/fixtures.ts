@@ -38,6 +38,10 @@ export const SCENARIOS = {
   summaryReady: "이 PC 요약",
   // Plan 5.1-12: a meeting for each slow reason (Home's row names only saver).
   slow: "느린 처리",
+  // Plan 5.3, 5.7-15: paused meetings in each step, one still stopping, and "모두 이어서 처리".
+  pause: "일시정지",
+  // Plan 5.3-12: resumed while recording, it waits for the recording to end.
+  pauseRecording: "녹음 중 이어서 처리",
 } as const;
 export type Scenario = keyof typeof SCENARIOS;
 
@@ -490,6 +494,47 @@ export function reset(scenario: Scenario) {
     );
   }
 
+  if (scenario === "pause") {
+    // Its run still stops: 멈추는 중… on Home, in the dock and in its document.
+    const winding = stored("transcribing", at(0, 15, 0), {
+      duration_ms: 38 * 60_000,
+      backend: "gpu",
+      chunks_done: 1,
+      chunks_total: 4,
+      held: true,
+    });
+    const inChunk = stored("paused", at(0, 14, 0), {
+      duration_ms: 70 * 60_000,
+      backend: "gpu",
+      chunks_done: 2,
+      chunks_total: 7,
+      held: true,
+    });
+    const inSummary = stored(
+      "paused",
+      at(0, 11, 0),
+      { duration_ms: 52 * 60_000, backend: "gpu", chunks_done: 5, chunks_total: 5, llm_connection: CLOUD.name, held: true },
+      { transcript: TRANSCRIPT },
+    );
+    const unplanned = stored("paused", at(0, 10, 0), { duration_ms: 20 * 60_000, held: true });
+    meetings = [winding, inChunk, inSummary, unplanned, summarized("주간 제품 회의", "review", at(1, 10, 0))];
+    line = [progressOf(winding.meta.id, { status: "transcribing", chunk: 1, chunks: 4, percent: 30, eta_secs: 900 })];
+  }
+
+  if (scenario === "pauseRecording") {
+    const started = Date.now() - 5 * 60_000;
+    const live = stored("recording", new Date(started), { duration_ms: 0 });
+    recording = { id: live.meta.id, startedAt: started };
+    const resumed = stored("paused", at(0, 11, 0), {
+      duration_ms: 40 * 60_000,
+      backend: "gpu",
+      chunks_done: 3,
+      chunks_total: 6,
+    });
+    meetings = [live, resumed];
+    line = [progressOf(resumed.meta.id, { status: "paused", position: 1 })];
+  }
+
   timers.push(setInterval(tick, 700), setInterval(levels, 40));
 }
 
@@ -509,6 +554,8 @@ function tick() {
 
 function advance(p: Progress) {
   const m = find(p.id);
+  // Paused: its run stops when `pause_meeting` says, and never in the scenario.
+  if (m.meta.held) return;
   if (p.status === "transcribing" && p.chunks === 0) {
     // Chunk planning (`--plan-chunks`): its own percent, then the plan.
     p.percent = Math.min(100, p.percent + 4);
@@ -562,6 +609,15 @@ function advance(p: Progress) {
 function finish(p: Progress) {
   line = line.filter((x) => x !== p);
   send("meeting://progress", { ...p, position: null });
+}
+
+/** A paused run's end (queue.rs `end`): `paused`, back in line last if it was resumed meanwhile. */
+function stopRun(m: Stored, p: Progress) {
+  m.meta.status = "paused";
+  line = line.filter((x) => x !== p);
+  send("meeting://progress", { ...p, status: "paused", position: null });
+  if (!m.meta.held) enqueue(m);
+  renumber();
 }
 
 function start(p: Progress) {
@@ -755,6 +811,7 @@ type Commands = {
   get_transcript: typeof ipc.getTranscript;
   delete_meeting: typeof ipc.deleteMeeting;
   resume_meeting: typeof ipc.resumeMeeting;
+  pause_meeting: typeof ipc.pauseMeeting;
   summary_route: typeof ipc.summaryRoute;
   set_summarize_local: typeof ipc.setSummarizeLocal;
   save_summary: typeof ipc.saveSummary;
@@ -861,8 +918,23 @@ const handlers: Handlers = {
     const m = find(a.id);
     if (m.meta.interrupted)
       Object.assign(m.meta, { status: "recorded", interrupted: false, duration_ms: 31 * 60_000 });
-    enqueue(m);
+    m.meta.held = false;
+    // Still stopping: its end puts it back in line.
+    if (!line.some((p) => p.id === m.meta.id)) enqueue(m);
     return clone(m.meta);
+  },
+  // Plan 5.3-4: one in line is paused at once; a running one stops a moment later.
+  pause_meeting: (a) => {
+    const m = find(a.id);
+    const p = line.find((x) => x.id === m.meta.id);
+    if (!p) return "already_done";
+    m.meta.held = true;
+    if (!isRunning(p)) {
+      stopRun(m, p);
+      return "paused";
+    }
+    timers.push(setTimeout(() => stopRun(m, p), 1500));
+    return "pausing";
   },
 
   summary_route: (a) => summaryRoute(find(a.id).meta),

@@ -1,12 +1,12 @@
 // `async` keeps file and keychain I/O off the main (UI) thread.
 use crate::QUIT_CONFIRMED;
 use crate::audio::{self, AudioDevices, Recorder, RecordingState};
-use crate::queue::{Progress, Queue};
+use crate::queue::{Pause, Progress, Queue};
 use crate::settings::{self, LoadedSettings, SecretKind, Settings, SettingsStore};
 use crate::slack::{self, Channel, Slack};
 use crate::store::{Meta, Status, Store, one_line};
 use crate::summarize::{self, SummaryRoute};
-use crate::transcribe::engine::Segment;
+use crate::transcribe::engine::{Segment, diag_line};
 use crate::transcribe::model::{self, Cancelled, ModelFile, ModelState, Models};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -125,27 +125,39 @@ pub fn delete_meeting(
     deleted
 }
 
-/// "처리 계속" for an interrupted recording, or another try after `transcribe_failed`. Either
-/// way the meeting joins the processing queue (TRN-01).
+/// "처리 계속" for an interrupted recording, another try after `transcribe_failed`, and "이어서
+/// 처리" of a paused meeting (plan 5.3-7). Either way the meeting joins the processing queue
+/// (TRN-01).
 #[tauri::command(async)]
 pub fn resume_meeting(
     store: State<'_, Store>,
     queue: State<'_, Queue>,
     id: String,
 ) -> Result<Meta, String> {
-    let meta = if store.is_interrupted(&id) {
-        store.continue_interrupted(&id)?
-    } else {
-        store.get(&id)?
-    };
-    if !matches!(
-        meta.status,
-        Status::Recorded | Status::Paused | Status::TranscribeFailed
-    ) {
-        return Err("다시 처리할 수 있는 회의가 아닙니다".into());
+    if store.is_interrupted(&id) {
+        store.continue_interrupted(&id)?;
     }
-    queue.enqueue(&id, meta.status);
-    Ok(meta)
+    queue.resume(&store, &id)
+}
+
+/// Plan 5.3-4: "일시정지". `AlreadyDone` when it finished first; the screen then only redraws.
+#[tauri::command(async)]
+pub fn pause_meeting(
+    store: State<'_, Store>,
+    queue: State<'_, Queue>,
+    id: String,
+) -> Result<Pause, String> {
+    log::info!("{}", diag_line("pause_meeting", &[("id", id.clone())]));
+    let paused = queue.pause(&store, &id);
+    let result = match &paused {
+        Ok(p) => format!("{p:?}"),
+        Err(e) => format!("err:{e}"),
+    };
+    log::info!(
+        "{}",
+        diag_line("pause_meeting", &[("id", id), ("result", result)])
+    );
+    paused
 }
 
 /// Pinned devices come from settings; unreadable settings must not block a recording.

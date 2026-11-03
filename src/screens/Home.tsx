@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
-import { Check, ChevronRight, CircleAlert, FileAudio, TriangleAlert } from "lucide-react";
+import { Check, ChevronRight, CircleAlert, FileAudio, Pause, TriangleAlert } from "lucide-react";
 import { motion } from "motion/react";
 import {
   Banner,
@@ -18,6 +18,7 @@ import {
   SHIMMER,
   SHORTCUT,
   statusLabel,
+  stopping,
 } from "@/components/common";
 import { Button } from "@/components/ui/button";
 import { Progress as ProgressBar } from "@/components/ui/progress";
@@ -100,7 +101,8 @@ type State = {
   note?: string;
   bar?: ReactNode;
 };
-function stateOf(m: MeetingItem, p: Progress | undefined, name: string): State {
+/** `failure`: why "모두 이어서 처리" could not resume this one (plan 5.3-13). */
+function stateOf(m: MeetingItem, p: Progress | undefined, name: string, failure?: string): State {
   if (m.interrupted) {
     return {
       mark: <TriangleAlert aria-hidden className="size-4 text-warn-line" />,
@@ -116,6 +118,13 @@ function stateOf(m: MeetingItem, p: Progress | undefined, name: string): State {
       mark: <span aria-hidden className="size-2 rounded-full bg-rec motion-safe:animate-breathe" />,
       text: STATUS_LABEL.recording,
     };
+  }
+  // Plan 5.3-13: paused by the recorder, its run maybe still stopping.
+  if (stopping(m, p)) return { text: "멈추는 중…" };
+  if (now === "held") {
+    return failure
+      ? { mark: <CircleAlert aria-hidden className="size-4 text-danger-line" />, text: "일시정지됨", note: failure }
+      : { mark: <Pause aria-hidden className="size-4 text-ink-2" />, text: "일시정지됨" };
   }
   if (now === "running") {
     const line = p && progressText(p);
@@ -175,6 +184,7 @@ function Row({
   progress: p,
   day,
   action,
+  failure,
   morph,
   onPress,
   onOpen,
@@ -182,6 +192,7 @@ function Row({
 }: {
   meeting: MeetingItem;
   progress?: Progress;
+  failure?: string;
   /** Set in "지금 할 일" for a meeting from another day. */
   day: string | null;
   /** `opens`: it opens the meeting, so pressing it may start the title's glide. */
@@ -196,7 +207,7 @@ function Row({
   children?: ReactNode;
 }) {
   const name = nameOf(m);
-  const state = stateOf(m, p, name);
+  const state = stateOf(m, p, name, failure);
   const body = (
     <>
       <span className="w-16 shrink-0 leading-tight">
@@ -371,7 +382,37 @@ export default function Home({
     };
   }, []);
 
-  const resume = (id: string) => resumeMeeting(id).then(onChanged, (e) => setError(String(e)));
+  // Plan 5.3-13: why "모두 이어서 처리" left a meeting paused, by meeting.
+  const [failures, setFailures] = useState<Record<string, string>>({});
+  const resume = (id: string) =>
+    resumeMeeting(id).then(
+      () => {
+        setFailures((f) => Object.fromEntries(Object.entries(f).filter(([failed]) => failed !== id)));
+        onChanged();
+      },
+      (e) => setError(String(e)),
+    );
+  // Oldest first, as the line takes them. One that fails keeps its error in its row; the rest go on.
+  const paused = (meetings ?? []).filter((m) => phase(m, progress[m.id]) === "held").reverse();
+  const resumeAll = async () => {
+    const failed: Record<string, string> = {};
+    for (const m of paused) {
+      await resumeMeeting(m.id).catch((e) => {
+        failed[m.id] = String(e);
+      });
+    }
+    setFailures(failed);
+    onChanged();
+  };
+  // The button goes once fewer than two are paused. If the focus went with it, it goes to the
+  // heading instead of the page.
+  const many = paused.length > 1;
+  const nowHeading = useRef<HTMLHeadingElement>(null);
+  const offered = useRef(many);
+  useEffect(() => {
+    if (offered.current && !many && document.activeElement === document.body) nowHeading.current?.focus();
+    offered.current = many;
+  }, [many]);
 
   // REC-12, on both the first screen and Home's head.
   const importButton = (className: string) => (
@@ -501,6 +542,7 @@ export default function Home({
     if (m.schema_version > SCHEMA_VERSION) return null;
     if (m.interrupted) return { label: "처리 계속", run: () => resume(m.id) };
     if (m.status === "recording") return { label: "녹음 화면으로", run: onRecord };
+    if (phase(m, p) === "held") return { label: "이어서 처리", run: () => resume(m.id) };
     // In line or running: it needs nothing from the recorder. A retried failure waits too.
     if (phase(m, p)) return null;
     if (m.status === "review") {
@@ -523,6 +565,7 @@ export default function Home({
       progress={progress[m.id]}
       day={now ? shortDay(new Date(m.created_at), today) : null}
       action={actionOf(m, progress[m.id])}
+      failure={failures[m.id]}
       morph={morph === m.id}
       onPress={() => !m.interrupted && !window.scrollY && setMorph(m.id)}
       onOpen={m.interrupted ? undefined : (e) => onOpen(m, e.detail === 0)}
@@ -591,15 +634,27 @@ export default function Home({
         >
           {groups.map((g) => (
             <section key={g.name} aria-label={g.name}>
-              <motion.h2 variants={rowVariants} className="flex items-baseline gap-2 text-title">
-                {g.name}
-                {g.now && (
-                  <>
-                    {" "}
-                    <span className="font-normal text-ink-2 tabular-nums">{g.rows.length}</span>
-                  </>
+              <div className="flex items-center justify-between gap-3">
+                <motion.h2
+                  ref={g.now ? nowHeading : undefined}
+                  tabIndex={g.now ? -1 : undefined}
+                  variants={rowVariants}
+                  className="flex items-baseline gap-2 text-title outline-hidden"
+                >
+                  {g.name}
+                  {g.now && (
+                    <>
+                      {" "}
+                      <span className="font-normal text-ink-2 tabular-nums">{g.rows.length}</span>
+                    </>
+                  )}
+                </motion.h2>
+                {g.now && many && (
+                  <Button variant="ghost" size="sm" onClick={() => void resumeAll()}>
+                    모두 이어서 처리
+                  </Button>
                 )}
-              </motion.h2>
+              </div>
               <ul className="-mx-3 mt-2 divide-y divide-line">{g.rows.map((m) => row(m, g.now))}</ul>
             </section>
           ))}
