@@ -86,29 +86,51 @@ Windows에서 전사가 매우 오래 걸린다는 보고가 있다. 특히 배�
 
 ## 5. 설계
 
-### 5.1 Windows 전사 속도
+### 5.1 Windows 전사 속도 (1.0.3 최종 명세)
 
-0단계에서 잴 도구(1~3)를 먼저 넣고, 싸고 근거가 분명한 개선(4~8)을 넣은 뒤, 실측으로 beam과 스레드 기본값을 정한다(9).
+이 절과 5.2절은 8·9절의 1.0.3 항목을 한 벌로 모은 것이다(ER4, 2026-11-03). 1.0.3 구현은 이 두 절만 따르고, 8절의 같은 주제 항목은 기록으로만 읽는다. 5.3~5.6절은 3단계 전에 같은 방식으로 다시 쓴다.
 
-1. **진단 줄**: 워커가 구간마다 stderr(`worker.log`)에 한 줄을 남긴다. 예: `chunk device=gpu gpu="Intel(R) Iris(R) Xe Graphics" threads=6 beam=5 fa=1 lang=ko audio_s=600 speech_s=412 load_s=2.1 run_s=380 rtf=0.63 power=battery saver=1`. 전원은 Windows `GetSystemPowerStatus`(`ACLineStatus`, `SystemStatusFlag`의 에너지 절약 비트), macOS는 `power=?`(windows-sys에 `Win32_System_Power` 기능을 더한다). 대기열은 회의 전사가 끝나면 `app.log`에 회의 하나당 한 줄(오디오 길이, 걸린 시간, 장치)을 쓴다. 설정의 "로그 폴더 열기"가 이미 있어 동료에게 받기 쉽다.
-2. **워커 인자 확장**: `--transcribe-worker`의 위치 인자 6개 뒤에 `--lang <code> --beam <n> --threads <n> --fa <0|1>`을 받는다. 대기열은 제품 값을 넘기고, 측정 도구는 다른 값을 넘긴다. 환경 변수로 하지 않는다(릴리스 빌드에서 재야 하는데 `cfg!(debug_assertions)`로 막을 수 없다).
-3. **측정 도구**: `summary_eval`과 같은 무시된 테스트 `transcribe_eval`. `TRANSCRIBE_EVAL_MEETING`(회의 폴더)과 선택으로 `TRANSCRIBE_EVAL_REFERENCE`(사람이 고친 전사본)를 받아, 릴리스 빌드(`cargo test --release`)의 워커를 조합(beam 5/1 × fa 0/1 × 스레드 절반/물리 코어)으로 돌리고 조합마다 걸린 시간, 실시간 배수, 기준 대비 글자 오류율(기준이 없으면 beam 5 결과 대비 차이율)을 찍는다. whisper.cpp는 디버그 빌드에서 CMake도 Debug라서 디버그로 잰 속도는 쓸모가 없다.
-4. **flash attention 켜기**: `WhisperContextParameters::flash_attn(true)`. whisper.cpp와 `whisper-cli`의 기본값으로 돌아가는 것이다. 측정에서 Vulkan 내장 GPU가 느려지거나 오류가 나면 그 경우만 끈다.
-5. **처리 중 절전 방지**: 대기열이 회의를 하나라도 처리하는 동안(전사·요약) 시스템 유휴 잠자기를 막는다. 화면은 꺼져도 된다. 녹음에서 이미 쓰는 `keepawake`(`idle(true)`, 화면 꺼짐 허용)를 쓴다. Windows의 `SetThreadExecutionState`가 스레드 단위라서 전용 스레드가 쥐고, 처리 중인 회의가 0이 되면 놓는다. 덮개를 닫아 재우는 것은 막지 않는다(OS 정책).
-6. **EcoQoS 끄기 (Windows)**: 워커는 시작하자마자 자기 프로세스에 `SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, {Version=1, ControlMask=EXECUTION_SPEED, StateMask=0})`를 건다. 요약 엔진은 감독 프로세스(같은 실행 파일)가 자기에게 걸고, 띄운 `llama-server`의 핸들에도 건다. 우선순위는 NORMAL을 그대로 둔다(낮추지 않는다). 실패하면 `worker.log`·`app.log`에 경고만 남기고 계속한다.
-7. **GPU 고르기**: 워커가 ggml 장치를 whisper.cpp와 같은 방식으로 센다(GPU·내장 GPU를 등록 순서대로). 외장 GPU(`GGML_BACKEND_DEVICE_TYPE_GPU`)가 있으면 그 번호를, 없으면 첫 내장 GPU를 `gpu_device`로 넘기고, 고른 장치와 전체 목록을 진단 줄에 남긴다.
-8. **느림 이유 안내**: 8절의 E2(`Progress.slow`)로 한다. 에너지 절약 안내는 그중 `saver`다.
-9. **beam·스레드 기본값 (실측 뒤)**: Mac(Metal) 한 대와 Windows 노트북 한 대 이상(내장 GPU, CPU만)에서 `transcribe_eval`을 돌린다. 이 결정에는 사람이 고친 한국어 기준 전사본(`TRANSCRIBE_EVAL_REFERENCE`)이 꼭 있어야 한다. greedy가 그 기준 글자 오류율을 0.5%p 이하로만 나쁘게 하면서 1.3배 이상 빠르면 greedy로 바꾼다. 스레드는 동시 처리 1개일 때 물리 코어 수가 절반보다 빠르면 그렇게 한다(동시 처리 2개면 지금처럼 절반).
+**A. 워커 인자와 출력** (`transcribe/engine.rs`)
 
-### 5.2 모델 다운로드
+1. `--transcribe-worker <회의 폴더> <시작 ms> <끝 ms> <gpu|cpu> <모델> <VAD 모델>` 뒤에 선택 플래그를 받는다: `--lang <code>`(기본 `ko`, whisper 언어 코드), `--beam <1..8>`(기본 5, 1은 greedy), `--threads <n>`(기본 지금 규칙), `--fa <0|1>`(기본 1), `--gpu-device <n>`(기본 자동 고르기). 모르는 플래그, 중복, 범위 밖 값, 값 없는 플래그는 `Fail::Input`(종료 코드 2)과 새 인자까지 담은 사용법 문구로 끝난다. 큐 테스트의 가짜 워커 셸이 새 인자에서 깨지지 않게 한다.
+2. stdin 감시(앱이 죽으면 워커도 끝남)는 `--plan-chunks`·`--transcribe-worker`에만 둔다.
+3. 모델을 불러온 직후 `{"type":"device","device":"gpu|cpu","name":"..."}` 한 줄을 낸다(GPU를 하나도 못 찾았으면 `name`은 빈 값).
+4. 구간이 끝나면 결과 줄 앞에 진단 줄 `{"type":"diag","line":"chunk ..."}`을 낸다. 값은 `key=value`이고, 공백·따옴표가 있으면 큰따옴표로 감싸며 안의 `"`·`\`는 백슬래시로 막는다. 키: `device`, `gpu`(이름), `gpus`(찾은 장치 수), `gpu_device`, `threads`, `beam`, `fa`, `lang`, `audio_s`, `speech_s`, `load_s`, `run_s`, `rtf`, `power`(`ac|battery|?`), `saver`(`1|0|?`), `ecoqos`(`ok|err:N|-`). 단위는 키 이름(`_s`)에 둔다. macOS는 `power=? saver=? ecoqos=-`.
+5. Windows `exit_now`는 stdout을 flush한 뒤 `TerminateProcess(GetCurrentProcess(), code)`로 끝낸다(`std::process::exit`의 정적 소멸자가 Vulkan 정리 중 죽어 `Exit::Crash`로 세지는 것을 막는다. macOS `_exit`와 같은 이유).
 
-1. **측정 줄**: 파일마다 받은 바이트, 걸린 시간, 평균 속도, 연결 수를 `app.log`에 쓴다.
-2. **큰 파일은 범위 4개를 동시에**: 64MB 이상인 파일은 크기를 4등분해 범위마다 연결 하나로 받는다. 범위 i는 `{file}.part{i}`에 차례로 덧붙이므로 그 파일 크기가 곧 이어받을 위치다. 범위 요청마다 `resolve/` 주소로 보내 리디렉트를 새로 받는다. 모든 범위가 차면 `.part0`을 읽어 sha256에 넣고, `.part1`~`.part3`을 순서대로 `.part0`에 덧붙이면서 sha256에 넣는다(덧붙인 조각은 바로 지운다). 덧붙이기가 파일의 약 75%를 다시 쓰므로 디스크 일은 지금보다 줄지 않는다. 디스크 확인은 "남은 크기 + 가장 큰 조각 + 1GB"로 바꾼다.
-   - 서버가 범위를 무시하거나(200) `Content-Range`가 맞지 않으면 그 파일은 지금의 연결 하나 방식으로 받는다. 사내 미러도 같다.
-   - 이전 버전이 남긴 `.part`(연결 하나)가 있으면 그 파일은 연결 하나 방식으로 마저 받는다.
-   - 진행률(파일 합계, 줄지 않음), 취소, 3번 재시도, 해시 실패, 디스크 확인 계약은 그대로다.
-3. **순서**: 지금처럼 전사 모델 먼저(전사를 먼저 시작할 수 있게). 파일끼리 동시에 받지는 않는다(범위 병렬이 이미 회선을 채운다).
-4. 이 회선에서는 약 +20%다. 녹음자에게 "다운로드가 빨라졌다"고 약속하지 않고, 측정 줄로 해외 회선 효과를 본다.
+**B. 속도**
+
+6. **flash attention**: `WhisperContextParameters::flash_attn(fa)`. UI 없는 설정 키 `transcribe_flash_attn`(기본 true)을 대기열이 `--fa`로 넘긴다. 이 키는 `save_settings`와 TS `Settings` 타입을 거쳐도 지워지지 않는다.
+7. **EcoQoS 끄기 (Windows)**: 워커는 시작하자마자 자기 프로세스에 `SetProcessInformation(ProcessPowerThrottling, {Version=1, ControlMask=EXECUTION_SPEED, StateMask=0})`를 걸고 결과를 진단 `ecoqos`에 남긴다. 앱 프로세스는 자기에게, 그리고 띄운 `llama-server` 핸들에 같은 설정을 건다. 우선순위는 바꾸지 않는다. 실패는 로그만 남기고 계속한다. `cfg(windows)` 테스트가 상태를 걸고 `GetProcessInformation`으로 다시 읽는다.
+8. **GPU 고르기**: 워커가 ggml 장치를 whisper.cpp와 같은 방식으로 센다(GPU·내장 GPU를 등록 순서대로, `whisper-rs-sys`를 직접 의존으로 더해 `ggml_backend_dev_*`를 부른다). 외장 GPU가 있으면 그 번호, 없으면 첫 내장 GPU, `--gpu-device`가 있으면 그 값을 `gpu_device`로 쓴다. 기본(0)이 아닌 장치로 모델 불러오기가 실패하면 워커 안에서 다른 GPU로 한 번 더 불러 본 뒤 CPU로 간다(지금의 GPU→CPU 대신 보기와 같은 모양). 실행 중 충돌은 지금 경로 그대로다.
+9. **처리 중 잠자기 방지**: 대기열이 회의를 하나라도 처리하는 동안(전사·요약) 전용 스레드가 `keepawake`를 `idle(true)`로 쥐고(화면은 꺼져도 됨), 처리 중인 회의가 0이 되면 놓는다. 모델을 받는 동안에도 같은 방식으로 쥔다. 2단계에 배터리·화면 꺼짐 1시간 실측과 `powercfg /requests`로 확인하고, 모자라면 `PowerCreateRequest`+`PowerSetRequest(SystemRequired)`로 바꾼다.
+10. **`gpu_failed` 한 번 풀기**: 1.0.3 첫 실행에 한 번(설정에 처리한 버전을 남겨) `gpu_failed`를 지운다. 1.0.x에서 GPU 충돌로 CPU에 묶인 PC가 이번 개선을 받게 한다.
+
+**C. 느림 이유 (E2)**
+
+11. `meeting://progress`의 `Progress`에 `slow`를 싣는다: 없음, `saver`, `cpu`(GPU 있음), `cpu_nogpu`, `slow`. 대기열당 ticker 스레드 하나가 30초마다(그리고 진행 줄마다) 처리 중 회의를 다시 판단해 바뀌면 보낸다(`inner`를 쥔 채 OS를 부르지 않고, 앱이 끝날 때 멈춘다).
+    - `saver`: Windows에서 배터리이고 effective power mode가 BatterySaver나 BetterBattery일 때(전사·요약 모두). 앱 프로세스가 `PowerRegisterForEffectivePowerModeNotifications`로 모드를 받는다. 지원 최소 버전은 Windows 10 1809다.
+    - 전사 중 실시간 배수 = 이번 실행에서 걸린 시간 ÷ 이번 실행에서 처리한 오디오 길이(ms를 한 곳에서 초로 바꾼다). GPU에서 CPU로 바뀌면 그때부터 다시 잰다. 실행 시작(또는 다시 잰 때)부터 60초 동안은 새로 판단하지 않고 마지막 값을 둔다.
+    - 배수가 1보다 크고 백엔드가 자동·GPU인데 실제 장치가 CPU면 `cpu`(GPU를 하나도 못 찾았으면 `cpu_nogpu`), 그 밖에 1보다 크면 `slow`.
+12. 화면(이유 하나와 행동 하나까지):
+    - 회의 문서 처리 영역: 단계 줄, 메모 줄, 그 아래 느림 이유 줄(caption, ink-2, lucide `BatteryLow`나 `Cpu`, 경고색 아님, live region 아님, `dur.small` 페이드). `cpu`·`cpu_nogpu`면 메모 줄의 "처리 장치 CPU"를 뺀다. 단계가 요약으로 바뀌면 `cpu`·`slow` 줄은 사라진다.
+    - 문구: `saver` "에너지 절약 모드라 처리가 느릴 수 있습니다. 전원을 연결하면 빨라질 수 있습니다", `cpu` "GPU를 쓰지 못해 CPU로 처리하고 있어 느립니다. 그래픽 드라이버를 업데이트하면 나아질 수 있습니다", `cpu_nogpu` "이 PC에는 쓸 수 있는 GPU가 없어 CPU로 처리합니다", `slow` "이 PC에서는 전사가 회의 길이보다 오래 걸립니다".
+    - 홈의 처리 중 행 메모는 `saver`만: "에너지 절약 모드 · 전원을 연결하면 빨라질 수 있습니다". 독은 그대로.
+
+**D. 측정**
+
+13. 대기열은 워커의 `diag` 줄을 회의 id와 앱 버전을 붙여 `app.log`에 옮기고, 회의 전사가 끝나면 회의 한 줄(`meeting id=… audio_s run_s rtf device`)을 쓴다. 상태 전이가 시각과 함께 `app.log`에 남는지 확인하고, 없으면 한 줄을 더한다.
+14. **실측 도구** `--transcribe-bench <회의 폴더> [--reference <txt>] [--range <시작ms>-<끝ms>] [--only <조합,...>] [--smoke] [--model <파일>] [--vad <파일>] [--lang <code>]`: 설치된 앱 실행 파일로 돈다. `mic.wav`·`system.wav`를 임시 폴더로 복사해 거기서 돌고(앱의 회의 폴더에는 `bench.tsv`만 쓴다), 자기 자신을 `--transcribe-worker`로 조합마다 띄우되 자식 stdin은 pipe로 쥔다. 모델은 인자가 없으면 설치 앱의 모델 폴더(macOS `~/Library/Application Support/com.sije.meeting-summarizer/models`, Windows `%LOCALAPPDATA%\com.sije.meeting-summarizer\models`)에서 찾는다. `chunks.json`이 없으면 `--plan-chunks`를 먼저 돌린다. 범위가 없으면 첫 10분, `--smoke`는 제품 기본 조합 하나. 조합 축: beam(5, 1), fa(1, 0), threads(절반, 물리 코어), 모델(`large-v3-turbo-q8_0`, `medium-q5_0`. medium은 디코더가 24층이라 CPU beam 5에서 더 느릴 수 있다), 장치(gpu, cpu). 시작 전에 예상 시간을 `bench.tsv` 머리와 stderr에 쓰고, 행마다 바로 쓴다. 기준 전사본(UTF-8 평문, 같은 범위)이 있으면 CER(NFC 정규화 뒤 공백·문장부호를 뺀 글자)을 적는다. `transcribe_eval`은 같은 함수를 부르는 얇은 무시된 테스트로 남기고 디버그 빌드를 거부한다. 물리 코어 수는 Windows `GetLogicalProcessorInformationEx`(`Win32_System_SystemInformation`), macOS `sysctl hw.physicalcpu`.
+15. **beam·스레드 기본값**은 2단계 실측 뒤에 정한다(사람이 고친 한국어 기준 전사본이 있어야 한다. greedy가 CER을 0.5%p 이하로만 나쁘게 하면서 1.3배 이상 빠르면 greedy, 동시 처리 1개일 때 물리 코어가 절반보다 빠르면 물리 코어). 2단계 표에는 같은 인자로 upstream 1.8.3 `whisper-cli.exe` 한 줄을 더한다.
+16. **문서와 CI**: README에 "전사 실측" 절(설치 앱으로 도는 sh·PowerShell `Start-Process -Wait` 명령, "앱을 끄고", 회의 폴더 위치, 기준 전사본 만드는 법, `bench.tsv` 읽는 법)과 "느릴 때 보낼 것"(로그 폴더 열기 → `app.log`, `settings.json`)을 더한다. `docs/install.md`에 지원 최소 Windows 10 1809. 기존 Windows CI 작업에 Windows 대상 clippy를 더한다. 1.0.3 릴리스 노트에 동료용 3단계(설치, 배터리로 1시간 회의 처리, 로그 보내기).
+
+### 5.2 모델 다운로드 (1.0.3 최종 명세)
+
+1. **측정 줄**: 파일마다 받은 바이트, 걸린 시간, 평균 속도, 연결 수(1)를 `app.log`에 `download file=… bytes=… secs=… bps=… connections=1` 한 줄로 쓴다.
+2. **속도와 남은 시간(E4)**: 받기 코드가 공유 바이트 카운터를 두고, 받는 동안 1초 타이머로 `model://download`를 보낸다(바이트가 오지 않아도 보낸다. 지금의 1%마다 이벤트는 그대로). 이벤트에 최근 10초 평균 속도(bytes/s)를 더하고, 이 창은 받을 파일 전체에 걸쳐 이어진다(파일이 바뀌어도 비우지 않는다).
+3. 화면: 설정의 파일 행만 속도를 보인다 "받는 중 42% (370/874MB) · 12.4MB/s · 이 파일 약 3분 남음". 홈 설정 줄과 요약 모델 안내(RouteNotice)는 기존 `remaining()` 형식의 남은 시간만(받을 파일 전체 기준). 받기 시작 10초 전이나 속도가 0이면 남은 시간을 숨기고, 10초 넘게 바이트가 없으면 "연결 기다리는 중". 다 받은 뒤 해시 확인 동안은 "확인 중…"이 앞선다. 단계가 바뀔 때만 role=status로 알리고 속도는 알리지 않는다.
+4. **받기 중 잠자기 방지**: 5.1-9와 같다.
+5. 범위 병렬 받기는 하지 않는다(UC1, `docs/TODOS.md`). 파일 순서(전사 모델 먼저)와 진행률·취소·3번 재시도·해시·디스크 확인 계약은 그대로다.
 
 ### 5.3 일시정지와 다시 시작
 
