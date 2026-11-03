@@ -284,6 +284,42 @@ test("the setup line's 모델 받기 downloads with progress and checks the file
   await waitFor(() => expect(screen.queryByText(/모델 받/)).toBeNull());
 });
 
+// Plan 5.2-3 (E4): the time until every file is in, never the speed.
+test("the setup line shows the time left for every file, or why not", async () => {
+  mock((cmd) => {
+    if (cmd === "model_status") return models(false);
+    if (cmd === "download_models") return new Promise<void>((resolve) => (release = resolve));
+  });
+  render(<Home {...props} meetings={[]} progress={{}} />);
+  fireEvent.click(await screen.findByRole("button", { name: "모델 받기" }));
+  const at = (received: number, bps: number | null) =>
+    act(() =>
+      emit("model://download", {
+        file: WHISPER,
+        received,
+        total: 874_188_075,
+        all_received: received,
+        all_total: 874_188_075 + 885_098 + 2_497_281_120,
+        bps,
+      }),
+    );
+
+  // The download's first 10 s: no time yet.
+  await at(524_512_845, null);
+  expect(await screen.findByText("모델 받는 중 15%")).toBeTruthy();
+  // 2.85 GB left of all three files at 10 MB/s.
+  await at(524_512_845, 10_000_000);
+  expect(await screen.findByText("모델 받는 중 15% · 약 5분 남음")).toBeTruthy();
+  expect(screen.getByRole("status").textContent).toBe("모델 받는 중");
+  await at(524_512_845, 0);
+  expect(await screen.findByText("모델 받는 중 15% · 연결 기다리는 중")).toBeTruthy();
+  expect(screen.getByRole("status").textContent).toBe("연결 기다리는 중");
+  // The transcription model all in, its hash checked.
+  await at(874_188_075, 0);
+  expect(await screen.findByText("모델 받는 중 25% · 확인 중…")).toBeTruthy();
+  expect(screen.getByRole("status").textContent).toBe("확인 중…");
+});
+
 test("a failed download says so and 다시 받기 tries again; each link opens its tab", async () => {
   let downloads = 0;
   mock((cmd) => {

@@ -3,14 +3,19 @@
 //! verification, or imported from a file the recorder picked. Files land in
 //! `{local app data}/models/`; a download grows as `{file}.part` until its hash checks out.
 
+use super::engine::diag_line;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::any::Any;
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub struct ModelFile {
@@ -92,6 +97,10 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTEMPTS: u32 = 3;
 /// Plan 5.2: free space a download leaves beyond its file.
 const DISK_MARGIN: u64 = 1_000_000_000;
+/// Plan 5.2-2 (E4): progress goes out this often while a download runs, bytes or not, with the
+/// average speed over the last `SPAN`.
+const TICK: Duration = Duration::from_secs(1);
+const SPAN: Duration = Duration::from_secs(10);
 
 impl ModelFile {
     /// What a mirror serves under its base URL (`docs/install.md`).
@@ -109,8 +118,10 @@ pub fn needed(model: &str) -> Result<[&'static ModelFile; 2], String> {
     Ok([whisper, &VAD])
 }
 
-/// `model://download`, about once per percent of the file being fetched. `all_*` add up every file
-/// of the download (E3, DX12), the ones already in place counted whole.
+/// `model://download`, about once per percent of the file being fetched and every `TICK` while
+/// the download runs. `all_*` add up every file of the download (E3, DX12), the ones already in
+/// place counted whole. `bps`: bytes per second over the download's last `SPAN`, `None` for its
+/// first `SPAN` (plan 5.2-2).
 #[derive(Serialize, Clone, Debug)]
 pub struct DownloadProgress {
     pub file: &'static str,
@@ -118,6 +129,7 @@ pub struct DownloadProgress {
     pub total: u64,
     pub all_received: u64,
     pub all_total: u64,
+    pub bps: Option<u64>,
 }
 
 #[derive(Serialize, Debug)]
@@ -138,12 +150,17 @@ pub struct ModelState {
     pub downloading: bool,
 }
 
+/// Plan 5.1-9: holds the system awake until dropped, `None` when it could not.
+type Awake = Arc<dyn Fn() -> Option<Box<dyn Any>> + Send + Sync>;
+
 /// One download or import at a time.
 pub struct Models {
     pub dir: PathBuf,
     busy: Arc<AtomicBool>,
     /// The download in flight, for `cancel`.
     current: Mutex<Option<Current>>,
+    /// Taken by each download's thread (`tick`); tests put a stand-in here.
+    awake: Awake,
 }
 
 /// One download's cancel mark. Aborting its task stops the network side at once, but a blocking
@@ -309,29 +326,106 @@ fn room(f: &ModelFile, part: u64, free: u64) -> Result<(), String> {
     ))
 }
 
+/// Plan 5.2-2 (E4): a download's speed over its last `SPAN`, from all the bytes it has received
+/// sampled every `TICK`. One for the whole download: the next file does not empty it.
+#[derive(Default)]
+struct Speed(VecDeque<(Duration, u64)>);
+
+impl Speed {
+    /// `at`: since the download began. `bytes`: all it had received by then.
+    fn push(&mut self, at: Duration, bytes: u64) {
+        self.0.push_back((at, bytes));
+        // The oldest sample kept is the newest one at least `SPAN` back.
+        while self
+            .0
+            .get(1)
+            .is_some_and(|&(t, _)| at.saturating_sub(t) >= SPAN)
+        {
+            self.0.pop_front();
+        }
+    }
+
+    /// Bytes per second, `None` until the samples span `SPAN`.
+    fn bps(&self) -> Option<u64> {
+        let (&(t0, b0), &(t1, b1)) = (self.0.front()?, self.0.back()?);
+        let span = t1.saturating_sub(t0);
+        (span >= SPAN).then(|| (b1.saturating_sub(b0) as f64 / span.as_secs_f64()) as u64)
+    }
+}
+
+/// Plan 5.1-9, 5.2-2: a download's own thread, until its sender drops. It keeps the system awake
+/// (Windows ties that to the thread that asked) and every `TICK` sends the progress last stored,
+/// with the speed of the last `SPAN`, whether bytes came or not.
+fn tick<F: Fn(DownloadProgress) + Send + Sync + 'static>(
+    awake: Awake,
+    arrived: Arc<AtomicU64>,
+    last: Arc<Mutex<Option<DownloadProgress>>>,
+    on_progress: Arc<F>,
+) -> Option<(mpsc::Sender<()>, JoinHandle<()>)> {
+    let (stop, stopped) = mpsc::channel::<()>();
+    let spawned = thread::Builder::new()
+        .name("download".into())
+        .spawn(move || {
+            let _held = awake();
+            let began = Instant::now();
+            let mut speed = Speed::default();
+            speed.push(Duration::ZERO, arrived.load(Ordering::SeqCst));
+            // Nothing is ever sent: only the sender dropping ends a wait early.
+            while stopped.recv_timeout(TICK) == Err(RecvTimeoutError::Timeout) {
+                speed.push(began.elapsed(), arrived.load(Ordering::SeqCst));
+                let mut last = lock(&last);
+                if let Some(p) = last.as_mut() {
+                    p.bps = speed.bps();
+                    on_progress(p.clone());
+                }
+            }
+        });
+    spawned
+        .inspect_err(|e| log::error!("모델 다운로드 스레드를 시작할 수 없습니다: {e}"))
+        .ok()
+        .map(|thread| (stop, thread))
+}
+
 /// One file into `dest`: attempts that resume each other, then the hash check. `on_progress` gets
-/// the bytes in the `.part`.
+/// the bytes in the `.part`; `arrived` counts each one that comes.
 async fn fetch(
     client: &reqwest::Client,
     base_url: &str,
     dest: &Path,
     f: &'static ModelFile,
     mark: &CancelMark,
+    arrived: &AtomicU64,
     on_progress: &impl Fn(u64),
 ) -> Result<(), String> {
     let url = format!("{base_url}/{}", f.url_path());
     let part = part_of(dest);
+    let (began, before) = (Instant::now(), arrived.load(Ordering::SeqCst));
     let mut attempt = 1;
-    loop {
-        match fetch_once(client, &url, &part, f, on_progress).await {
-            Ok(()) => break,
+    let fetched = loop {
+        match fetch_once(client, &url, &part, f, arrived, on_progress).await {
+            Ok(()) => break Ok(()),
             Err(Fetch::Retry(e)) if attempt < ATTEMPTS => {
                 log::warn!("모델 다운로드 재시도 {attempt} ({}): {e}", f.file);
                 attempt += 1;
             }
-            Err(Fetch::Retry(e) | Fetch::Stop(e)) => return Err(e),
+            Err(Fetch::Retry(e) | Fetch::Stop(e)) => break Err(e),
         }
-    }
+    };
+    // Plan 5.2-1: the network's part, failed or not; the hash check is not in it.
+    let bytes = arrived.load(Ordering::SeqCst) - before;
+    let secs = began.elapsed().as_secs_f64();
+    let line = diag_line(
+        "download",
+        &[
+            ("file", f.file.into()),
+            ("bytes", bytes.to_string()),
+            ("secs", format!("{secs:.1}")),
+            ("bps", format!("{:.0}", bytes as f64 / secs.max(0.001))),
+            ("connections", "1".into()),
+        ],
+    );
+    log::info!("{line}");
+    fetched?;
     let (dest, mark) = (dest.to_path_buf(), mark.clone());
     blocking(move || install(&part, &dest, f, &mark)).await?
 }
@@ -342,6 +436,7 @@ async fn fetch_once(
     url: &str,
     part: &Path,
     f: &'static ModelFile,
+    arrived: &AtomicU64,
     on_progress: &impl Fn(u64),
 ) -> Result<(), Fetch> {
     let retry = |e: reqwest::Error| Fetch::Retry(format!("모델을 받지 못했습니다: {e}"));
@@ -410,6 +505,7 @@ async fn fetch_once(
     while let Some(bytes) = response.chunk().await.map_err(retry)? {
         file.write_all(&bytes).map_err(io)?;
         received += bytes.len() as u64;
+        arrived.fetch_add(bytes.len() as u64, Ordering::SeqCst);
         if received * 100 / f.size != shown {
             shown = received * 100 / f.size;
             on_progress(received);
@@ -436,6 +532,17 @@ impl Models {
             dir,
             busy: Arc::new(AtomicBool::new(false)),
             current: Mutex::new(None),
+            awake: Arc::new(|| {
+                keepawake::Builder::default()
+                    .idle(true)
+                    .reason("모델 받는 중")
+                    .app_name("회의 요약")
+                    .app_reverse_domain("com.sije.meeting-summarizer")
+                    .create()
+                    .inspect_err(|e| log::warn!("절전 방지 실패: {e}"))
+                    .ok()
+                    .map(|held| Box::new(held) as Box<dyn Any>)
+            }),
         }
     }
 
@@ -540,24 +647,45 @@ impl Models {
         let task_left = left.clone();
         let mark = CancelMark::default();
         let task_mark = mark.clone();
+        // Plan 5.2-2: every byte the download receives, and its last progress, for the ticks.
+        let arrived = Arc::new(AtomicU64::new(0));
+        let last = Arc::new(Mutex::new(None::<DownloadProgress>));
+        let on_progress = Arc::new(on_progress);
+        let (stop, ticker) = tick(
+            self.awake.clone(),
+            arrived.clone(),
+            last.clone(),
+            on_progress.clone(),
+        )
+        .unzip();
         let task = {
             // Spawned and stored under one lock: a `cancel` lands before both (and is not for
             // this download) or after both (and reaches it).
             let mut current = lock(&self.current);
             let task = tauri::async_runtime::spawn(async move {
+                // Dropped with the task however it ends, which ends the ticks.
+                let _stop = stop;
                 let _busy = busy;
                 fs::create_dir_all(&dir).map_err(|e| format!("모델 폴더 생성 실패: {e}"))?;
                 let client = client()?;
                 // `done`: the bytes of the files behind. `all_total` is those plus the files left.
-                let report = |f: &'static ModelFile, received, done, now| {
+                // Stored for the ticks, and sent unless only stored. Sent under the lock, so a tick
+                // never sends an older one after it.
+                let report = |f: &'static ModelFile, received, done, now, send: bool| {
                     let left: u64 = lock(&task_left).iter().map(|f| f.size).sum();
-                    on_progress(DownloadProgress {
+                    let mut last = lock(&last);
+                    let progress = DownloadProgress {
                         file: f.file,
                         received,
                         total: f.size,
                         all_received: done + now,
                         all_total: done + left,
-                    })
+                        bps: last.as_ref().and_then(|p| p.bps),
+                    };
+                    if send {
+                        on_progress(progress.clone());
+                    }
+                    *last = Some(progress);
                 };
                 let mut done = 0;
                 let mut failed = Vec::new();
@@ -571,8 +699,10 @@ impl Models {
                     };
                     let dest = dir.join(f.file);
                     // The right size can still be the wrong bytes: the hash decides (deleted if
-                    // not).
+                    // not). Meanwhile the ticks show the file whole, counting it only once it
+                    // passes.
                     let intact = fs::metadata(&dest).is_ok_and(|m| m.len() == f.size) && {
+                        report(f, f.size, done, 0, false);
                         let (path, mark) = (dest.clone(), task_mark.clone());
                         blocking(move || check(&path, f, &mark)).await? == Check::Intact
                     };
@@ -586,15 +716,23 @@ impl Models {
                             .map_or(Ok(()), |free| room(f, part, free))
                         {
                             Ok(()) => {
+                                // Until bytes come, the ticks show the file where it resumes (an
+                                // oversized `.part` starts over).
+                                let from = if part <= f.size { part } else { 0 };
+                                shown.store(from, Ordering::SeqCst);
+                                report(f, from, done, from, false);
                                 // The high-water mark: a restart from 0 (a whole file answered
                                 // to a `Range`) shows no step back.
                                 let progress = |received: u64| {
                                     let received = received.min(f.size);
                                     let high = shown.fetch_max(received, Ordering::SeqCst);
                                     let high = high.max(received);
-                                    report(f, high, done, high);
+                                    report(f, high, done, high, true);
                                 };
-                                fetch(&client, &base_url, &dest, f, &task_mark, &progress).await
+                                fetch(
+                                    &client, &base_url, &dest, f, &task_mark, &arrived, &progress,
+                                )
+                                .await
                             }
                             refused => refused,
                         }
@@ -603,7 +741,7 @@ impl Models {
                     match fetched {
                         Ok(()) if intact => {
                             done += f.size;
-                            report(f, f.size, done, 0);
+                            report(f, f.size, done, 0, true);
                         }
                         Ok(()) => {
                             done += f.size;
@@ -613,7 +751,7 @@ impl Models {
                             failed.push(e);
                             let came = shown.load(Ordering::SeqCst);
                             done += came;
-                            report(f, came, done, 0);
+                            report(f, came, done, 0, true);
                         }
                     }
                 }
@@ -632,6 +770,10 @@ impl Models {
             task
         };
         let result = task.await;
+        // The task's end dropped `stop`: no tick comes after this returns, and the system may sleep.
+        if let Some(ticker) = ticker {
+            let _ = blocking(move || ticker.join()).await;
+        }
         {
             // Only ours: a download started after a cancel may have stored its own by now.
             let mut current = lock(&self.current);
@@ -700,6 +842,40 @@ mod tests {
         sha256: "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7",
     };
 
+    /// Never the OS's sleep settings.
+    fn models_in(dir: PathBuf) -> Models {
+        Models {
+            awake: Arc::new(|| None),
+            ..Models::new(dir)
+        }
+    }
+
+    /// Plan 5.2-2: the speed of the last 10 s, from samples of the download's byte count.
+    #[test]
+    fn speed_is_the_last_ten_seconds_of_the_whole_download() {
+        let speed = |samples: &[(u64, u64)]| {
+            let mut speed = Speed::default();
+            for &(at, bytes) in samples {
+                speed.push(Duration::from_secs(at), bytes);
+            }
+            speed.bps()
+        };
+        // Empty, then the download's first 10 s: no speed yet.
+        assert_eq!(speed(&[]), None);
+        assert_eq!(speed(&[(0, 0)]), None);
+        assert_eq!(speed(&[(0, 0), (9, 900)]), None);
+        assert_eq!(speed(&[(0, 0), (10, 1_000)]), Some(100));
+        // Fast, then nothing for 10 s: zero, the earlier bytes out of the window.
+        let stalled: Vec<_> = (0..=20).map(|t| (t, t.min(10) * 1_000)).collect();
+        assert_eq!(speed(&stalled), Some(0));
+        // A file ends at 6 s and the next begins: the count is the download's, so the window
+        // spans both. 100 B/s, then 300 B/s: from 200 bytes at 2 s to 2,400 at 12 s.
+        let two: Vec<_> = (0..=12u64)
+            .map(|t| (t, t.min(6) * 100 + t.saturating_sub(6) * 300))
+            .collect();
+        assert_eq!(speed(&two), Some((2_400 - 200) / 10));
+    }
+
     #[test]
     fn hash_mismatch_deletes_the_part_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -741,7 +917,7 @@ mod tests {
     #[test]
     fn cancel_while_hashing_installs_nothing_afterwards() {
         let tmp = tempfile::tempdir().unwrap();
-        let models = Models::new(tmp.path().to_path_buf());
+        let models = models_in(tmp.path().to_path_buf());
         // A finished `.part` big enough that hashing it takes a while (sparse: no disk used).
         let size = 1 << 28;
         let part = part_of(&tmp.path().join("big.bin"));
@@ -781,7 +957,7 @@ mod tests {
     #[test]
     fn check_tells_intact_damaged_and_missing_apart() {
         let tmp = tempfile::tempdir().unwrap();
-        let models = Models::new(tmp.path().to_path_buf());
+        let models = models_in(tmp.path().to_path_buf());
         let path = models.path(&HELLO);
         assert_eq!(models.check(&[&HELLO]), Check::Missing);
         fs::write(&path, b"hello").unwrap();
@@ -801,7 +977,7 @@ mod tests {
     #[test]
     fn import_installs_only_a_matching_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let models = Models::new(tmp.path().join("models"));
+        let models = models_in(tmp.path().join("models"));
         let src = tmp.path().join("picked.bin");
 
         fs::write(&src, b"hello, world").unwrap();
@@ -833,7 +1009,7 @@ mod tests {
         }
         assert!(needed("large-v3").is_err());
         let tmp = tempfile::tempdir().unwrap();
-        let models = Models::new(tmp.path().to_path_buf());
+        let models = models_in(tmp.path().to_path_buf());
         assert!(models.ready("large-v3-turbo-q8_0").is_none());
         let state = models.state(&needed("large-v3-turbo-q8_0").unwrap());
         assert_eq!(state.files.len(), 2);
@@ -892,8 +1068,14 @@ mod tests {
         }
         let (url, server) = serve(vec![response], Duration::ZERO);
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let result =
-            tauri::async_runtime::block_on(fetch_once(&client, &url, &path, &HELLO, &|_| {}));
+        let result = tauri::async_runtime::block_on(fetch_once(
+            &client,
+            &url,
+            &path,
+            &HELLO,
+            &AtomicU64::new(0),
+            &|_| {},
+        ));
         (
             result,
             fs::read(&path).ok(),
@@ -950,7 +1132,7 @@ mod tests {
     #[test]
     fn download_replaces_an_installed_file_whose_hash_is_wrong() {
         let tmp = tempfile::tempdir().unwrap();
-        let models = Models::new(tmp.path().to_path_buf());
+        let models = models_in(tmp.path().to_path_buf());
         // The right size, the wrong bytes: size alone would call it installed.
         fs::write(models.path(&HELLO), b"hellp").unwrap();
         let (url, server) = serve(vec![reply("200 OK", "", b"hello")], Duration::ZERO);
@@ -964,7 +1146,7 @@ mod tests {
     #[test]
     fn cancel_stops_a_stalled_download_and_its_chain_at_once_and_frees_import() {
         let tmp = tempfile::tempdir().unwrap();
-        let models = Models::new(tmp.path().to_path_buf());
+        let models = models_in(tmp.path().to_path_buf());
         // Two of five bytes, then nothing for 5 s (the stall timeout is 30 s).
         let mut stalled = reply("200 OK", "", b"hello");
         stalled.truncate(stalled.len() - 3);
@@ -1007,12 +1189,79 @@ mod tests {
         assert_eq!(models.cancel(None), None);
     }
 
+    /// Plan 5.1-9, 5.2-2: one hold on the system for the whole download, files and all, let go
+    /// by the time it returns, a cancel too. While no bytes come, progress still comes every
+    /// second.
+    #[test]
+    fn a_download_holds_the_system_awake_and_ticks_while_it_stalls() {
+        use std::sync::atomic::AtomicUsize;
+        struct Hold(Arc<(AtomicUsize, AtomicUsize)>);
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.1.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let holds = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let taking = holds.clone();
+        let models = Models {
+            awake: Arc::new(move || {
+                taking.0.fetch_add(1, Ordering::SeqCst);
+                Some(Box::new(Hold(taking.clone())) as Box<dyn Any>)
+            }),
+            ..Models::new(tmp.path().to_path_buf())
+        };
+        let held = || {
+            (
+                holds.0.load(Ordering::SeqCst),
+                holds.1.load(Ordering::SeqCst),
+            )
+        };
+
+        let (url, server) = serve(
+            vec![reply("200 OK", "", b"hello"), reply("200 OK", "", b"world")],
+            Duration::ZERO,
+        );
+        tauri::async_runtime::block_on(models.download(&url, &[&HELLO, &WORLD], |_| {}, |_| {}))
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(held(), (1, 1));
+
+        // Two of five bytes, then nothing for 5 s.
+        fs::remove_file(models.path(&HELLO)).unwrap();
+        let mut stalled = reply("200 OK", "", b"hello");
+        stalled.truncate(stalled.len() - 3);
+        let (url, _server) = serve(vec![stalled], Duration::from_secs(5));
+        let (progress, arrived) = mpsc::channel();
+        let result = thread::scope(|s| {
+            s.spawn(|| {
+                let mut arrived = arrived.into_iter();
+                assert!(arrived.any(|p: DownloadProgress| p.received == 2));
+                // A tick: nothing new, and no speed in the download's first 10 s.
+                let tick = arrived.next().unwrap();
+                assert_eq!((tick.received, tick.bps), (2, None));
+                assert_eq!(held(), (2, 1));
+                models.cancel(None);
+            });
+            tauri::async_runtime::block_on(models.download(
+                &url,
+                &[&HELLO],
+                move |p| {
+                    let _ = progress.send(p);
+                },
+                |_| {},
+            ))
+        });
+        assert_eq!(result.unwrap_err(), CANCELLED);
+        assert_eq!(held(), (2, 2));
+    }
+
     /// DX12: a scoped cancel of a file still ahead takes it out of the chain and lets the file in
     /// flight finish.
     #[test]
     fn a_cancel_of_a_file_ahead_drops_it_and_the_download_goes_on() {
         let tmp = tempfile::tempdir().unwrap();
-        let models = Models::new(tmp.path().to_path_buf());
+        let models = models_in(tmp.path().to_path_buf());
         // Two of five bytes, the rest once the cancel is in.
         let (go, wait) = std::sync::mpsc::channel::<()>();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1055,7 +1304,7 @@ mod tests {
     #[test]
     fn a_failed_file_does_not_stop_the_chain() {
         let tmp = tempfile::tempdir().unwrap();
-        let models = Models::new(tmp.path().to_path_buf());
+        let models = models_in(tmp.path().to_path_buf());
         let (url, server) = serve(
             vec![
                 reply("404 Not Found", "", b""),
@@ -1149,7 +1398,7 @@ mod tests {
     #[test]
     fn a_resume_without_a_size_starts_over() {
         let tmp = tempfile::tempdir().unwrap();
-        let models = Models::new(tmp.path().to_path_buf());
+        let models = models_in(tmp.path().to_path_buf());
         fs::write(part_of(&models.path(&HELLO)), b"he").unwrap();
         let untold = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello".to_vec();
         let (url, server) = serve(vec![untold], Duration::ZERO);
@@ -1165,7 +1414,7 @@ mod tests {
     #[test]
     fn a_restart_from_zero_shows_no_step_back() {
         let tmp = tempfile::tempdir().unwrap();
-        let models = Models::new(tmp.path().to_path_buf());
+        let models = models_in(tmp.path().to_path_buf());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
@@ -1232,7 +1481,7 @@ mod tests {
             ..WORLD
         };
         let tmp = tempfile::tempdir().unwrap();
-        let models = Models::new(tmp.path().to_path_buf());
+        let models = models_in(tmp.path().to_path_buf());
         // Port 9 refuses: a request would end in a network error, not this one.
         let e = tauri::async_runtime::block_on(models.download(
             "http://127.0.0.1:9",
@@ -1251,7 +1500,7 @@ mod tests {
     #[test]
     fn a_reinstall_reuses_a_model_in_place() {
         let tmp = tempfile::tempdir().unwrap();
-        let models = Models::new(tmp.path().to_path_buf());
+        let models = models_in(tmp.path().to_path_buf());
         fs::write(models.path(&HELLO), b"hello").unwrap();
         let state = models.state(&[&HELLO]);
         assert!(state.files[0].installed && !state.files[0].downloading);
@@ -1297,7 +1546,7 @@ mod tests {
     #[ignore]
     fn downloads_and_resumes_the_vad_model() {
         let tmp = tempfile::tempdir().unwrap();
-        let models = Models::new(tmp.path().to_path_buf());
+        let models = models_in(tmp.path().to_path_buf());
         let get = |models: &Models| {
             let seen = Arc::new(Mutex::new(Vec::new()));
             let into = seen.clone();

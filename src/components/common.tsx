@@ -28,6 +28,7 @@ import {
   STATUS_LABEL,
   summaryRoute,
   type Meta,
+  type ModelDownload,
   type Progress,
   type Segment,
   type Status,
@@ -261,6 +262,15 @@ export function remaining(secs: number) {
   return `약 ${parts.filter(Boolean).join(" ")} 남음`;
 }
 
+/** Plan 5.2-3 (E4): what follows a download's percent. `stage`: "확인 중…" while a file whose bytes
+ * are all in has its hash checked, "연결 기다리는 중" after 10 s without a byte; the only part a
+ * `role="status"` says. Otherwise `time`, for the `left` bytes at the last 10 s' speed, none in the
+ * download's first 10 s. */
+export function downloadNote(d: ModelDownload, left: number) {
+  const stage = d.received >= d.total ? "확인 중…" : d.bps === 0 ? "연결 기다리는 중" : "";
+  return { stage, time: !stage && d.bps ? remaining(left / d.bps) : "" };
+}
+
 /** A running meeting's words and bar (TRN-01, APP-07), or null when its last event (its final
  * status, with the last step's counts) came before the meeting was read again: nothing runs then.
  * A summary of more than one LLM request shows "요청 2/5". `bar` is false when there is no value
@@ -321,11 +331,17 @@ export function EngineStarting({ since }: { since: number }) {
 
 /** The summary model as the route notices tell it (plan 5.2, DX6), or null until read. Read when
  * `on`, then followed through `model://download` and the app's one download (ipc.ts). A read that
- * fails reads as not downloaded: the 요약(LLM) tab says why. */
+ * fails reads as not downloaded: the 요약(LLM) tab says why. `stage` and `time` (`downloadNote`) are
+ * the whole download's, every file left. */
 export function useSummaryModel(on: boolean) {
-  const [model, setModel] = useState<{ file: string; installed: boolean; downloading: boolean; percent: number } | null>(
-    null,
-  );
+  const [model, setModel] = useState<{
+    file: string;
+    installed: boolean;
+    downloading: boolean;
+    percent: number;
+    stage?: string;
+    time?: string;
+  } | null>(null);
   useEffect(() => {
     if (!on) return;
     let live = true;
@@ -352,8 +368,13 @@ export function useSummaryModel(on: boolean) {
     follow(false);
     const unlisten = onModelDownload((d) => {
       follow(true);
-      setModel((m) =>
-        m?.file === d.file ? { ...m, downloading: true, percent: Math.floor((d.received / d.total) * 100) } : m,
+      setModel(
+        (m) =>
+          m && {
+            ...m,
+            ...(m.file === d.file ? { downloading: true, percent: Math.floor((d.received / d.total) * 100) } : {}),
+            ...downloadNote(d, d.all_total - d.all_received),
+          },
       );
     });
     return () => {
@@ -431,7 +452,9 @@ export function RouteNotice({
           : model.installed
             ? "이 PC에서 요약합니다. 전사본은 밖으로 나가지 않습니다"
             : model.downloading
-              ? `요약 모델 받는 중 ${model.percent}% · 다 받으면 자동으로 요약합니다`
+              ? [`요약 모델 받는 중 ${model.percent}%`, model.stage || model.time, "다 받으면 자동으로 요약합니다"]
+                  .filter(Boolean)
+                  .join(" · ")
               : "설정 → 요약(LLM)에서 요약 모델을 받아 주세요"
         : route.locked
           ? status === "summarizing" && c
@@ -451,6 +474,12 @@ export function RouteNotice({
         <Info aria-hidden className="mt-0.5 size-4 shrink-0" />
         {text}
       </p>
+      {/* Plan 5.2-3: only when the download's stage changes, never its time. */}
+      {waitsForModel && model?.downloading && !model.installed && (
+        <span role="status" className="sr-only">
+          {model.stage || "요약 모델 받는 중"}
+        </span>
+      )}
       {missing && onSetup && (
         <Button variant="outline" size="sm" onClick={onSetup}>
           요약(LLM) 설정

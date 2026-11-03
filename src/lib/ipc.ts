@@ -349,14 +349,16 @@ export type ModelFileState = {
 };
 /** `downloading`: some download or import runs. */
 export type ModelState = { files: ModelFileState[]; downloading: boolean };
-/** `model://download`, about once per percent of `file`. `all_*`: every file of the download
- * together, the ones already in place counted whole. */
+/** `model://download`, about once per percent of `file` and every second while the download runs.
+ * `all_*`: every file of the download together, the ones already in place counted whole. `bps`:
+ * bytes per second over the download's last 10 s, null for its first 10 s (plan 5.2, E4). */
 export type ModelDownload = {
   file: string;
   received: number;
   total: number;
   all_received: number;
   all_total: number;
+  bps: number | null;
 };
 export const modelStatus = (scope?: ModelScope) => invoke<ModelState>("model_status", { scope });
 

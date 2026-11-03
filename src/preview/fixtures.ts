@@ -984,6 +984,7 @@ const handlers: Handlers = {
   download_models: (args) =>
     new Promise<void>((resolve, reject) => {
       const chain = scoped(args.scope);
+      const started = Date.now();
       const timer = setInterval(() => {
         const file = chain.find((f) => !f.installed);
         if (downloading?.cancelled || !file) {
@@ -1002,6 +1003,8 @@ const handlers: Handlers = {
           total: file.size,
           all_received: done,
           all_total: all,
+          // Like the app: no speed for the download's first 10 s (plan 5.2-3).
+          bps: Date.now() - started < 10_000 ? null : 32_000_000,
         });
         if (file.received === file.size) {
           Object.assign(file, { installed: true, received: 0 });

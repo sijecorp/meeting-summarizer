@@ -6,6 +6,7 @@ import {
   Bars,
   DeleteButton,
   Dots,
+  downloadNote,
   EngineStarting,
   engineStarting,
   hhmm,
@@ -384,6 +385,8 @@ export default function Home({
   // still need, each item its own way there. The model downloads in place; its tab (cancel, import,
   // the mirror) shows up as a quieter link while that matters.
   const download = () => follow(startModelDownload());
+  // Plan 5.2-3: the time for every file left, not the speed.
+  const note = received && downloadNote(received, received.all_total - received.all_received);
   const setupLine = (align: string) =>
     (noModel || downloading || setup.length > 0) && (
       <div className={`flex flex-wrap items-center gap-x-2 gap-y-1 text-label ${align}`}>
@@ -392,9 +395,20 @@ export default function Home({
           {(noModel || downloading) && (
             <li className={ITEM}>
               {downloading ? (
-                <span className="tabular-nums">
-                  {`모델 받는 중 ${received?.all_total ? Math.floor((received.all_received / received.all_total) * 100) : 0}%`}
-                </span>
+                <>
+                  <span className="tabular-nums">
+                    {[
+                      `모델 받는 중 ${received?.all_total ? Math.floor((received.all_received / received.all_total) * 100) : 0}%`,
+                      note && (note.stage || note.time),
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </span>
+                  {/* Only when the stage changes: never the time. */}
+                  <span role="status" className="sr-only">
+                    {note?.stage || "모델 받는 중"}
+                  </span>
+                </>
               ) : downloadFailed ? (
                 <>
                   <span>모델을 받지 못했습니다</span>

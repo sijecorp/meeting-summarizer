@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, expect, test, vi } from "vitest";
 import type { LlmConnection, Meta, Progress, SummaryRoute } from "../lib/ipc";
@@ -80,6 +81,30 @@ test("says why a pinned meeting waits: its connection deleted, or the summary mo
   render(<RouteNotice id="a" wait="summary_model" />);
   expect(await screen.findByText("요약 모델 받는 중 20% · 다 받으면 자동으로 요약합니다")).toBeTruthy();
   expect(screen.queryByRole("switch")).toBeNull();
+});
+
+// Plan 5.2-3 (E4): the time until every file is in, the one ahead of the summary model too, never
+// the speed; 확인 중 while a hash is checked.
+test("a summary model downloading shows the time left for every file", async () => {
+  mockIPC(
+    (cmd) => {
+      if (cmd === "summary_route") return route({ connection: null, locked: true });
+      if (cmd === "model_status") {
+        const file = { file: "m.gguf", size: 100, installed: false, received: 20, downloading: true };
+        return { files: [file], downloading: true };
+      }
+    },
+    { shouldMockEvents: true },
+  );
+  render(<RouteNotice id="a" wait="summary_model" />);
+  expect(await screen.findByText("요약 모델 받는 중 20% · 다 받으면 자동으로 요약합니다")).toBeTruthy();
+  const progress = { all_total: 600_000_100, all_received: 0, bps: 2_000_000 };
+  await act(() => emit("model://download", { ...progress, file: "w.bin", received: 0, total: 600_000_000 }));
+  expect(await screen.findByText("요약 모델 받는 중 20% · 약 5분 남음 · 다 받으면 자동으로 요약합니다")).toBeTruthy();
+  expect(screen.getByRole("status").textContent).toBe("요약 모델 받는 중");
+  await act(() => emit("model://download", { ...progress, file: "m.gguf", received: 100, total: 100, bps: 0 }));
+  expect(await screen.findByText("요약 모델 받는 중 100% · 확인 중… · 다 받으면 자동으로 요약합니다")).toBeTruthy();
+  expect(screen.getByRole("status").textContent).toBe("확인 중…");
 });
 
 // Plan 5.3: counted on screen between events, from when the engine began starting.

@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { open } from "@tauri-apps/plugin-dialog";
 import { AnimatePresence, motion, useIsPresent, type Transition } from "motion/react";
 import { Check, ChevronDown, CircleAlert, Download, FolderOpen, Plus, RotateCcw, Trash2, TriangleAlert } from "lucide-react";
-import { Banner, Field, host, Page, Present } from "@/components/common";
+import { Banner, downloadNote, Field, host, Page, Present } from "@/components/common";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -214,6 +214,8 @@ export default function Settings({
   const [summary, setSummary] = useState<ModelState | null>(null);
   const summaryRead = useRef(false);
   const [received, setReceived] = useState<Record<string, ModelDownload>>({});
+  // The file of the last `model://download`: the one in flight.
+  const [latest, setLatest] = useState("");
   const [modelBusy, setModelBusy] = useState<"download" | "import" | null>(null);
   // Both shown in the 전사 tab, not the shared banner. A status read that works clears its own
   // error but never a download's or import's, which lasts until the next try.
@@ -299,6 +301,7 @@ export default function Settings({
         : state;
     const unlisten = onModelDownload((d) => {
       setReceived((all) => ({ ...all, [d.file]: d }));
+      setLatest(d.file);
       setModels(fetching(d));
       setSummary(fetching(d));
     });
@@ -847,6 +850,7 @@ export default function Settings({
                 labels={MODEL_FILES}
                 models={models}
                 received={received}
+                latest={latest}
                 busy={modelBusy}
                 blocked={unsaved}
                 unreadable={!!statusError}
@@ -913,6 +917,7 @@ export default function Settings({
                   labels={SUMMARY_FILES}
                   models={summary}
                   received={received}
+                  latest={latest}
                   busy={modelBusy}
                   blocked={addressUnsaved}
                   unreadable={!!summaryStatusError}
@@ -1176,6 +1181,7 @@ function ModelFiles({
   labels,
   models,
   received,
+  latest,
   busy,
   blocked,
   unreadable,
@@ -1189,6 +1195,8 @@ function ModelFiles({
   models: ModelState | null;
   /** The last `model://download` of each file. */
   received: Record<string, ModelDownload>;
+  /** The file in flight: the only row with a speed and a time (plan 5.2-3). */
+  latest: string;
   /** This screen's download or import: the download itself is the app's one (ipc.ts). */
   busy: "download" | "import" | null;
   /** An unsaved change it depends on: download and import wait for 저장. */
@@ -1212,10 +1220,22 @@ function ModelFiles({
     const d = received[f.file];
     if (f.installed) return "설치됨";
     if (busy === "download" && d) {
-      return `받는 중 ${Math.floor((d.received / d.total) * 100)}% (${mb(d.received)}/${mb(d.total)}MB)`;
+      const got = `받는 중 ${Math.floor((d.received / d.total) * 100)}% (${mb(d.received)}/${mb(d.total)}MB)`;
+      // A file behind keeps its last event as it was.
+      if (f.file !== latest) return got;
+      const { stage, time } = downloadNote(d, d.total - d.received);
+      // All in: only the hash check is left.
+      if (d.received >= d.total) return stage;
+      return [got, d.bps && `${(d.bps / 1e6).toFixed(1)}MB/s`, stage || (time && `이 파일 ${time}`)]
+        .filter(Boolean)
+        .join(" · ");
     }
     return f.received ? `없음 · ${mb(f.received)}/${mb(f.size)}MB 받아 둠` : "없음";
   };
+  // The stage of this tab's file in flight, never its speed or time.
+  const flying = models?.files.findIndex((f) => f.file === latest && !f.installed) ?? -1;
+  const stage =
+    flying >= 0 && received[latest] ? downloadNote(received[latest], 0).stage || `${labels[flying]} 받는 중` : "";
   return (
     <div className="space-y-4 px-5 py-4">
       {models && (
@@ -1240,6 +1260,11 @@ function ModelFiles({
             );
           })}
         </ul>
+      )}
+      {busy === "download" && (
+        <p role="status" className="sr-only">
+          {stage}
+        </p>
       )}
       {(missing || downloading || busy || unreadable) && (
         <div className="flex flex-wrap gap-2">

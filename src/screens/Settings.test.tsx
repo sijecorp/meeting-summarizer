@@ -568,6 +568,56 @@ test("전사 tab: file states, download progress from events, and a quiet cancel
   expect(screen.queryByRole("alert")).toBeNull();
 });
 
+// Plan 5.2-3 (E4): only the file row shows the speed, with that file's own time left.
+test("전사 tab: the file in flight shows its speed and time left, or why not", async () => {
+  let running = false;
+  mockIPC(
+    (cmd) => {
+      if (cmd === "get_settings") return loaded;
+      if (cmd === "has_secret") return true;
+      if (cmd === "model_status") return { ...models({ downloading: running }), downloading: running };
+      if (cmd === "download_models") {
+        running = true;
+        return new Promise<void>((resolve) => (release = () => ((running = false), resolve())));
+      }
+    },
+    { shouldMockEvents: true },
+  );
+  render(<Settings tab="transcription" onHome={() => {}} />);
+  fireEvent.click(await screen.findByRole("button", { name: "다운로드" }));
+  const at = (received: number, bps: number | null) =>
+    act(() =>
+      emit("model://download", {
+        file: WHISPER,
+        received,
+        total: 874_188_075,
+        all_received: received,
+        all_total: 874_188_075,
+        bps,
+      }),
+    );
+  const said = () => screen.getAllByRole("status").map((s) => s.textContent);
+
+  // The download's first 10 s: no speed yet, so no time.
+  await at(370_000_000, null);
+  expect(await screen.findByText("받는 중 42% (370/874MB)")).toBeTruthy();
+  // 504 MB left at 2.8 MB/s.
+  await at(370_000_000, 2_800_000);
+  expect(await screen.findByText("받는 중 42% (370/874MB) · 2.8MB/s · 이 파일 약 3분 남음")).toBeTruthy();
+  expect(said()).toContain("전사 모델 받는 중");
+  // 10 s without a byte.
+  await at(370_000_000, 0);
+  expect(await screen.findByText("받는 중 42% (370/874MB) · 연결 기다리는 중")).toBeTruthy();
+  expect(said()).toContain("연결 기다리는 중");
+  // All in, its hash checked: no bytes for 10 s either, and 확인 중 comes first.
+  await at(874_188_075, 0);
+  const row = screen.getByText(WHISPER).closest("li") as HTMLElement;
+  expect(await within(row).findByText("확인 중…")).toBeTruthy();
+  expect(said()).toContain("확인 중…");
+  // Never the speed or the time.
+  expect(said().join()).not.toMatch(/MB\/s|남음/);
+});
+
 test("직접 가져오기 hands the picked file to import_model", async () => {
   const calls: Call[] = [];
   const path = "/Users/me/Downloads/ggml-large-v3-turbo-q8_0.bin";
