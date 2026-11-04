@@ -60,7 +60,7 @@ jobs:
           post() {
             curl -fsS --max-time 30 -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
               -H 'Content-Type: application/json; charset=utf-8' --data @- https://slack.com/api/chat.postMessage > res.json
-            jq -e .ok res.json > /dev/null || { echo "::error::Slack chat.postMessage: $(jq -r .error res.json)"; exit 1; }
+            jq -e .ok res.json > /dev/null || { echo "::error::Slack chat.postMessage: $(jq -r '[.error, .needed, .provided] | map(select(.)) | join(" ")' res.json)"; exit 1; }
           }
           notes=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq '.body | gsub("\r"; "")')
           jq -n --arg channel "$SLACK_CHANNEL_ID" --arg tag "$TAG" --arg notes "$notes" --arg dmg "$DMG" --arg exe "$EXE" '
