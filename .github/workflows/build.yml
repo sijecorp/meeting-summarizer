@@ -1,6 +1,6 @@
 # Installers for internal distribution (docs/install.md): macOS Apple Silicon .dmg and Windows x64
 # NSIS setup.exe, uploaded as workflow artifacts. A v* tag also gets a GitHub Release with both, once
-# both builds and their checks pass (the release job), and a Slack message with its link.
+# both builds and their checks pass (the release job), and both installers in a Slack channel.
 name: build
 
 on:
@@ -314,18 +314,37 @@ jobs:
           if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
           gh release create "$GITHUB_REF_NAME" installers/* --verify-tag --title "$GITHUB_REF_NAME" "$@"
 
-      # The release's link to Slack, through an Incoming Webhook (the webhook fixes the channel) in the
-      # SLACK_WEBHOOK_URL repository secret. Without it, or when Slack fails, this only warns: the release
-      # is already out, and a re-run would upload every installer again.
-      - name: Notify Slack
+      # Both installers into a Slack channel, since colleagues without access to this private repository
+      # cannot download from the release. Repository secrets: SLACK_BOT_TOKEN, a Slack app's bot token
+      # with files:write whose bot is in the channel, and SLACK_CHANNEL_ID. Without them, or when Slack
+      # fails, this only warns: the release is already out, and a re-run would upload every installer
+      # again.
+      - name: Find the installers for Slack
+        id: slack
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
         run: |
-          if [ -z "$SLACK_WEBHOOK_URL" ]; then
-            echo "::warning::SLACK_WEBHOOK_URL is not set, so Slack was not notified"
+          if [ -z "$SLACK_BOT_TOKEN" ] || [ -z "$SLACK_CHANNEL_ID" ]; then
+            echo "::warning::SLACK_BOT_TOKEN or SLACK_CHANNEL_ID is not set, so Slack was not notified"
             exit 0
           fi
-          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME"
-          jq -n --arg text "meeting-summarizer $GITHUB_REF_NAME 릴리스: <$url|설치 파일 받기>" '{text: $text}' |
-            curl -fsS --max-time 20 --retry 2 -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL" ||
-            echo "::warning::Slack notification failed"
+          echo "dmg=$(basename installers/*.dmg)" >> "$GITHUB_OUTPUT"
+          echo "exe=$(basename installers/*-setup.exe)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the installers to Slack
+        if: steps.slack.outputs.dmg
+        continue-on-error: true
+        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
+        with:
+          method: files.uploadV2
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          errors: true
+          payload: |
+            channel_id: ${{ secrets.SLACK_CHANNEL_ID }}
+            initial_comment: "meeting-summarizer ${{ github.ref_name }} 릴리스입니다. Mac은 dmg, Windows는 setup.exe를 받아 설치해 주세요.\n릴리스 노트: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
+            file_uploads:
+              - file: installers/${{ steps.slack.outputs.dmg }}
+                filename: ${{ steps.slack.outputs.dmg }}
+              - file: installers/${{ steps.slack.outputs.exe }}
+                filename: ${{ steps.slack.outputs.exe }}

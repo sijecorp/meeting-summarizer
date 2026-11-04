@@ -944,10 +944,10 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 
 ### 11.3 배포 빌드
 
-- **워크플로** (`.github/workflows/build.yml`): 수동 실행(workflow_dispatch)이나 `v*` 태그 push에서 macOS Apple Silicon(`aarch64-apple-darwin`, `.dmg`)과 Windows x64(NSIS `-setup.exe`)를 만든다. 둘 다 workflow artifact로 올리며, artifact는 30일 뒤 지워진다. 태그 실행은 두 빌드와 검사가 모두 통과하면 GitHub Release도 만들고, 저장소 Secret `SLACK_WEBHOOK_URL`(Incoming Webhook)이 있으면 그 링크를 Slack에 올린다. 액션은 모두 커밋 SHA로 고정했다. 태그 실행이면 태그(`v` 제외)가 `tauri.conf.json`의 `version`과 같은지 먼저 확인한다.
+- **워크플로** (`.github/workflows/build.yml`): 수동 실행(workflow_dispatch)이나 `v*` 태그 push에서 macOS Apple Silicon(`aarch64-apple-darwin`, `.dmg`)과 Windows x64(NSIS `-setup.exe`)를 만든다. 둘 다 workflow artifact로 올리며, artifact는 30일 뒤 지워진다. 태그 실행은 두 빌드와 검사가 모두 통과하면 GitHub Release도 만들고, 저장소 Secret `SLACK_BOT_TOKEN`(`files:write` 봇 토큰)과 `SLACK_CHANNEL_ID`가 있으면 두 설치 파일을 그 Slack 채널에 올린다(`slackapi/slack-github-action`의 `files.uploadV2`). 저장소가 비공개라 Release는 권한 있는 사람만 받기 때문이다. 액션은 모두 커밋 SHA로 고정했다. 태그 실행이면 태그(`v` 제외)가 `tauri.conf.json`의 `version`과 같은지 먼저 확인한다.
 - **캐시 데우기** (2026-10-29): 태그 실행은 그 태그와 master의 캐시만 읽고, 7일 동안 안 쓴 캐시는 지워진다. 그래서 새 태그마다 Windows가 사이드카·`cargo test`·release 빌드를 처음부터 해 약 50분 걸렸다(v1.0.1, v1.0.2). 매주 월요일 03:30(KST) master에서 같은 워크플로를 돌려 master 캐시를 살려 둔다. macOS는 캐시 없이도 약 8분이라(v1.0.2 7분 35초) 덕을 거의 보지 않지만 같은 matrix라 함께 돈다.
 - **번들 대상**: macOS `app`·`dmg`(`tauri.conf.json`), Windows `nsis`(`tauri.windows.conf.json`, Tauri가 Windows에서 병합한다).
-- **배포**: 관리자가 artifact를 OneDrive에 올리고 동료에게 링크를 보낸다. 설치·업데이트·삭제 안내는 `docs/install.md`다. 자동 업데이트는 없다(eng review D2).
+- **배포**: 태그 릴리스는 워크플로가 두 설치 파일을 Slack 채널에 올린다. 그 채널 밖의 동료에게는 관리자가 OneDrive에 올려 링크를 보낸다. 설치·업데이트·삭제 안내는 `docs/install.md`다. 자동 업데이트는 없다(eng review D2).
 - **CPU 기준** (M6.5 계획의 H4): ggml(전사)은 빌드 기계가 아니라 x86-64 AVX2·FMA·F16C·BMI2(NFR-02), arm64 Apple M1 기준으로 빌드한다(`GGML_NATIVE=OFF`, 저장소 루트 `.cargo/config.toml`의 `[env]`). 워크플로가 CMake 기록과 Windows 실행 파일의 zmm 명령으로 확인한다.
 - **요약 엔진 사이드카** (M6.5 계획 5.1): llama.cpp의 `llama-server`를 정적 링크로 빌드해 `bundle.externalBin`(`binaries/llama-server`)으로 넣는다.
   - 커밋은 `scripts/llama.cpp.rev` 한 곳에 고정한다(지금 v0.7.0, 620d222). 새 모델이 필요하거나 보안 수정이 있을 때만 올린다. 올릴 때는 `THIRD_PARTY_NOTICES.md`의 커밋과 포함 코드 목록을 고치고, 1단계 확인(두 OS 빌드, CPU 기준, Metal·Vulkan 실행, q8_0 KV 캐시와 flash attention이 Metal·Vulkan·CPU에서 도는지, 회사 PC)을 다시 한다. Windows 내장 GPU에서는 1단계와 7단계에 `llama-server.log`의 "enabling flash_attn since it is required for quantized V cache"와 `graph splits`를 본다(2쯤이 정상이고 72쯤이면 flash attention이 CPU에서 돈 것이다). 나뉘면 Windows에서만 `-ctv q8_0`을 빼고 `-ctk q8_0`은 둔다.
