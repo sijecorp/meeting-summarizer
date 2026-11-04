@@ -720,17 +720,19 @@ export function SendBar({
   const noOther = !!sent && !!channels && !channels.some((c) => !isSentTo(sent, c));
   // A sent meeting's bar holds only what it can do now: sign in, read the list again, or nothing.
   const blocked = again && !sentTo && (!signedIn || !!listFailed || noOther);
-  const label = sentTo
-    ? `${sentTo}${ro(sentTo)} 보냄`
+  // A long channel name gives way in a narrow bar (…); what the button does always shows.
+  const [named, does] = sentTo
+    ? [sentTo, `${ro(sentTo)} 보냄`]
     : inFlight
-      ? "보내는 중…"
+      ? ["", "보내는 중…"]
       : failed
-        ? "다시 보내기"
+        ? ["", "다시 보내기"]
         : again
-          ? "보내기"
+          ? ["", "보내기"]
           : channel
-            ? `#${channel.name}${ro(channel.name)} 보내기`
-            : "Slack으로 보내기";
+            ? [`#${channel.name}`, `${ro(channel.name)} 보내기`]
+            : ["", "Slack으로 보내기"];
+  const label = named + does;
   // Sent from the keyboard: `disabled` dropped the focus meanwhile, so it comes back when the send
   // ends, sent or failed.
   const button = useRef<HTMLButtonElement>(null);
@@ -794,7 +796,7 @@ export function SendBar({
                   ref={picker}
                   aria-label="보낼 채널"
                   title={channel ? `#${channel.name}` : undefined}
-                  className="h-10 max-w-56 rounded-full border-transparent bg-transparent pl-4 hover:bg-sunken"
+                  className="h-10 max-w-56 min-w-0 rounded-full border-transparent bg-transparent pl-4 hover:bg-sunken"
                 >
                   <SelectValue
                     placeholder={
@@ -847,17 +849,20 @@ export function SendBar({
             {!sentTo && !again && length != null && <Gauge length={length} />}
             {/* The warning in words too, from 90%, not only the ring's color (NFR-09). */}
             {!sentTo && !again && length != null && length / SLACK_MAX >= 0.9 && over === 0 && (
-              <span className="text-label text-ink-2 tabular-nums">{`${(SLACK_MAX - length).toLocaleString("ko-KR")}자 남음`}</span>
+              <span className="shrink-0 text-label text-ink-2 tabular-nums">{`${(SLACK_MAX - length).toLocaleString("ko-KR")}자 남음`}</span>
             )}
             {!sentTo && !again && over > 0 && (
-              <span className="text-label">{`${over.toLocaleString("ko-KR")}자를 줄여 주세요`}</span>
+              <span className="shrink-0 text-label">{`${over.toLocaleString("ko-KR")}자를 줄여 주세요`}</span>
             )}
             {/* Named by `aria-label`: while the label swaps, both labels are in the button. */}
             <Button
               ref={button}
               hidden={blocked}
               aria-label={label}
-              className={cn("relative h-10 rounded-full px-4", sentTo && "bg-transparent text-ink hover:bg-transparent")}
+              className={cn(
+                "relative h-10 min-w-0 shrink rounded-full px-4",
+                sentTo && "bg-transparent text-ink hover:bg-transparent",
+              )}
               disabled={!sentTo && !canSend}
               aria-disabled={sentTo ? true : undefined}
               onClick={
@@ -870,7 +875,7 @@ export function SendBar({
               }
             >
               {/* On success the plane flies off up and right (300ms), then the check comes in. */}
-              <span className="relative size-4">
+              <span className="relative size-4 shrink-0">
                 <motion.span
                   className="absolute inset-0"
                   initial={false}
@@ -891,12 +896,14 @@ export function SendBar({
               <AnimatePresence mode="popLayout" initial={false}>
                 <motion.span
                   key={sentTo ? "sent" : "send"}
+                  className="flex min-w-0"
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
                   exit={{ opacity: 0 }}
                   transition={{ duration: dur.micro }}
                 >
-                  {label}
+                  <span className="truncate">{named}</span>
+                  {does}
                 </motion.span>
               </AnimatePresence>
             </Button>
