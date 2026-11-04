@@ -394,14 +394,15 @@ export default function App() {
   const move: ScreenMove = { dir: screen.name === "home" ? -1 : 1, instant };
 
   return (
-    <div className="min-h-screen">
+    // `pt-12`: the room the fixed header takes at the top.
+    <div className="min-h-screen pt-12">
       {/* The window's title bar too (design-system 6.1): it drags the window where nothing else is
           under the pointer. macOS draws its traffic lights over the left end; Windows has no frame,
-          so the right end holds the window controls. */}
+          so the right end holds the window controls. Fixed, so it never moves with the page. */}
       <header
         data-tauri-drag-region
         className={cn(
-          "sticky top-0 z-10 flex h-12 items-center justify-between gap-4 border-b border-line bg-paper/92 px-6 backdrop-blur-md",
+          "fixed inset-x-0 top-0 z-10 flex h-12 items-center justify-between gap-4 border-b border-line bg-paper/92 px-6 backdrop-blur-md",
           MAC && "pl-24",
           WINDOWS && "pr-0",
         )}

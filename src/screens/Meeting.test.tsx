@@ -280,8 +280,8 @@ test("a click on a line opens the editor there, and Esc goes back to the documen
   expect(textbox("요약").selectionStart).toBe(summary.indexOf("## 액션 아이템"));
 });
 
-// Moving up, a browser brings the caret only to the window's top edge: under App's sticky header.
-test("the caret moving up is kept clear of the sticky header", async () => {
+// Moving up, a browser brings the caret only to the window's top edge: under App's fixed header.
+test("the caret moving up is kept clear of the fixed header", async () => {
   mock({ meta: meta(), summary: "요약" });
   render(<Meeting id={id} {...props} />);
   const field = await openEditor();

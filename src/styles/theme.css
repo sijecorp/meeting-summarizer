@@ -196,10 +196,13 @@
     font-synthesis: none;
     word-break: keep-all;
     overflow-wrap: break-word;
-    /* A focused element scrolls clear of the sticky header (48px) and the fixed bottom stack (a bar
+    /* A focused element scrolls clear of the fixed header (48px) and the fixed bottom stack (a bar
        over the dock: 148px at most), so neither covers it (WCAG 2.4.11). */
     scroll-padding-top: 4rem;
     scroll-padding-bottom: 10rem;
+    /* A desktop app's page does not rubber-band past its ends (trackpads on macOS and Windows),
+       which dragged the page and its header down with it. */
+    overscroll-behavior: none;
   }
   /* An extra where WebKit supports it. */
   h1,

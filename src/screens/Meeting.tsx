@@ -113,7 +113,7 @@ const REVIEWABLE: Status[] = ["review", "sent", "archived"];
 const TRANSCRIBED: Status[] = ["transcribed", "summarizing", "summarize_failed", ...REVIEWABLE];
 /** Room kept between the caret and the send bar over the page's bottom, or App's header over its top. */
 const CARET_ROOM = 16;
-/** App's sticky header (h-12). */
+/** App's fixed header (h-12). */
 const HEADER = 48;
 
 /** The local UTC offset at the meeting's start, in minutes, for the Slack header's time. */
