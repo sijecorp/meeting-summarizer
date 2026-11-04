@@ -149,6 +149,10 @@ export function LanguageChecks({
         })}
       </div>
       {value.length > 1 && <p className="text-caption text-ink-2">여러 언어를 고르면 전사가 더 걸립니다</p>}
+      {/* UC2 (2026-11-04): the built-in summary model often got these meetings' numbers and names wrong. */}
+      {value.some((c) => c === "vi" || c === "id") && (
+        <p className="text-caption text-ink-2">베트남어·인도네시아어 회의는 이 PC 요약이 자주 틀립니다. LLM 연결로도 요약해 보세요</p>
+      )}
     </fieldset>
   );
 }

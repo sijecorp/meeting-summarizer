@@ -230,6 +230,21 @@ test("one language is always left: its check is off, and why; two or more say it
   expect(popover.queryByText("여러 언어를 고르면 전사가 더 걸립니다")).toBeNull();
 });
 
+test("Vietnamese or Indonesian, alone or mixed, points the summary to an LLM connection", async () => {
+  mockLanguages();
+  renderPicker(["ko"]);
+  const popover = await openPicker("전사 언어: 한국어");
+  const box = (name: string) => popover.getByRole("checkbox", { name: new RegExp(`^${name}`) }) as HTMLInputElement;
+  const hint = "베트남어·인도네시아어 회의는 이 PC 요약이 자주 틀립니다. LLM 연결로도 요약해 보세요";
+  fireEvent.click(box("영어"));
+  expect(popover.queryByText(hint)).toBeNull();
+  fireEvent.click(box("인도네시아어"));
+  expect(popover.getByText(hint)).toBeTruthy();
+  fireEvent.click(box("인도네시아어"));
+  fireEvent.click(box("베트남어"));
+  expect(popover.getByText(hint)).toBeTruthy();
+});
+
 test("the trigger waits for the table, shows one, two or the first and a count, and is named by all", async () => {
   let table: (langs: Lang[]) => void = () => {};
   mockLanguages((cmd) => (cmd === "transcribe_languages" ? new Promise((resolve) => (table = resolve)) : undefined));
