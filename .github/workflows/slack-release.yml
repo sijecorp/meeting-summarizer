@@ -1,9 +1,8 @@
-# A release in a Slack channel, since colleagues without access to this private repository cannot
-# download from the release: a card in the app's accent color, the two installers right below it, and
-# the release notes in the card's thread. The build workflow calls this once a tag's release is out.
-# To send a release again: Actions > slack-release > Run workflow, with its tag.
-# Repository secrets: SLACK_BOT_TOKEN, a Slack app's bot token with chat:write and files:write whose
-# bot is in the channel, and SLACK_CHANNEL_ID. Without them this only warns.
+# A release's two installers into a Slack channel, since colleagues without access to this private
+# repository cannot download from the release. The build workflow calls this once a tag's release is
+# out. To send a release again: Actions > slack-release > Run workflow, with its tag.
+# Repository secrets: SLACK_BOT_TOKEN, a Slack app's bot token with files:write whose bot is in the
+# channel, and SLACK_CHANNEL_ID. Without them this only warns.
 name: slack-release
 
 on:
@@ -38,50 +37,12 @@ jobs:
             echo "::warning::SLACK_BOT_TOKEN or SLACK_CHANNEL_ID is not set, so Slack was not notified"
             exit 0
           fi
+          # The tag goes into the YAML payload below.
+          if ! [[ "$TAG" =~ ^v[0-9A-Za-z.+-]+$ ]]; then echo "::error::Not a release tag: $TAG"; exit 1; fi
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir installers --pattern '*.dmg' --pattern '*-setup.exe'
           ls -l installers
           echo "dmg=$(basename installers/*.dmg)" >> "$GITHUB_OUTPUT"
           echo "exe=$(basename installers/*-setup.exe)" >> "$GITHUB_OUTPUT"
-
-      # The card's lead is the notes' first paragraph (docs/releases/<tag>.md opens with one), left out
-      # when it is a heading, as in GitHub's generated notes. The thread reply is cut at 11,500
-      # characters: Slack rejects markdown blocks over 12,000, and the installers would not follow.
-      - name: Post the card and the release notes
-        if: steps.slack.outputs.dmg
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
-          DMG: ${{ steps.slack.outputs.dmg }}
-          EXE: ${{ steps.slack.outputs.exe }}
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
-        run: |
-          # Slack answers most errors with HTTP 200 and "ok": false.
-          post() {
-            curl -fsS --max-time 30 -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
-              -H 'Content-Type: application/json; charset=utf-8' --data @- https://slack.com/api/chat.postMessage > res.json
-            jq -e .ok res.json > /dev/null || { echo "::error::Slack chat.postMessage: $(jq -r '[.error, .needed, .provided] | map(select(.)) | join(" ")' res.json)"; exit 1; }
-          }
-          notes=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq '.body | gsub("\r"; "")')
-          jq -n --arg channel "$SLACK_CHANNEL_ID" --arg tag "$TAG" --arg notes "$notes" --arg dmg "$DMG" --arg exe "$EXE" '
-            ($notes | sub("^\\s+"; "") | split("\n\n")[0] | if test("^\\s*[#|]") then "" else gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;") end) as $lead
-            | {channel: $channel, unfurl_links: false, attachments: [{
-                color: "#4950B0",
-                fallback: "meeting-summarizer \($tag) 릴리스",
-                blocks: (
-                  [{type: "header", text: {type: "plain_text", text: "meeting-summarizer \($tag)"}}]
-                  + (if $lead == "" then [] else [{type: "section", text: {type: "mrkdwn", text: $lead}}] end)
-                  + [{type: "divider"},
-                     {type: "section", fields: [
-                       {type: "mrkdwn", text: "*Mac*  Apple 실리콘\n`\($dmg)`"},
-                       {type: "mrkdwn", text: "*Windows*  10·11 64비트\n`\($exe)`"}]},
-                     {type: "context", elements: [{type: "mrkdwn", text: "설치 파일은 바로 아래에, 바뀐 내용은 이 메시지의 스레드에 있습니다."}]}])
-              }]}' | post
-          ts=$(jq -r .ts res.json)
-          if [ -z "$notes" ]; then echo "::warning::$TAG has no release notes"; exit 0; fi
-          jq -n --arg channel "$SLACK_CHANNEL_ID" --arg ts "$ts" --arg tag "$TAG" --arg notes "$notes" '
-            {channel: $channel, thread_ts: $ts, unfurl_links: false, unfurl_media: false,
-             text: "meeting-summarizer \($tag) 릴리스 노트", blocks: [{type: "markdown", text: $notes[0:11500]}]}' | post
 
       - name: Upload the installers to Slack
         if: steps.slack.outputs.dmg
@@ -92,6 +53,7 @@ jobs:
           errors: true
           payload: |
             channel_id: ${{ secrets.SLACK_CHANNEL_ID }}
+            initial_comment: "meeting-summarizer ${{ inputs.tag }} 릴리스입니다. Mac은 dmg, Windows는 setup.exe를 받아 설치해 주세요.\n릴리스 노트: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ inputs.tag }}"
             file_uploads:
               - file: installers/${{ steps.slack.outputs.dmg }}
                 filename: ${{ steps.slack.outputs.dmg }}
