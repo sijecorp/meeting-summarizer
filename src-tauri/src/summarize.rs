@@ -311,27 +311,41 @@ fn system(glossary: &[String], languages: &[String]) -> String {
     let mut system = SYSTEM.to_string();
     if !lang::korean_only(languages) {
         let names = lang::names(languages);
-        let (what, rule) = if languages.len() > 1 {
+        let mut rules = Vec::new();
+        let what = if languages.len() > 1 {
             let tags: Vec<String> = languages
                 .iter()
                 .filter_map(|c| lang::get(c))
                 .map(|l| format!("[{}] {}", l.code, l.name))
                 .collect();
-            (
-                format!("{names}가 섞인 회의 전사본"),
-                format!(
-                    "전사본 줄 앞의 표시는 그 줄의 언어다({}). 모든 언어의 발언을 빠짐없이 반영해 한국어로만 쓰고, 사람 이름·제품명은 전사본 표기 그대로 쓴다.",
-                    tags.join(", ")
-                ),
-            )
+            rules.push(format!(
+                "전사본 줄 앞의 표시는 그 줄의 언어다({}). 모든 언어의 발언을 빠짐없이 반영해 한국어로만 쓴다. 통역으로 같은 내용이 두 언어로 나오면 한 번만 쓰고, 한 언어로만 나온 내용도 빠뜨리지 않는다.",
+                tags.join(", ")
+            ));
+            format!("{names}가 섞인 회의 전사본")
         } else {
-            (
-                format!("{names} 회의 전사본"),
-                "사람 이름·제품명은 전사본 표기 그대로 쓴다.".to_string(),
-            )
+            format!("{names} 회의 전사본")
         };
+        // UC2 (2026-11-04): Qwen3-4B wrote "anh Hùng" as "안형", which the grounding check then
+        // could not find, turned dong and rupiah into won, and read thứ Bảy as Sunday.
+        rules.push("사람 이름·회사명·제품명은 호칭까지 전사본 글자 그대로 쓰고 한글로 소리 나는 대로 옮기지 않는다(용어집에 있으면 용어집 표기). 액션 아이템의 [담당자]도 같다.".into());
+        rules.push("금액은 말한 통화(동, 루피아, 달러 등) 그대로 쓰고 원으로 바꾸지 않는다. 숫자·날짜·요일은 말한 값 그대로 쓰고 계산하거나 바꾸지 않는다.".into());
+        if languages.iter().any(|l| l == "vi" || l == "id") {
+            rules.push(
+                "베트남어·인도네시아어 숫자의 점(.)은 천 단위 구분이고 쉼표(,)는 소수점이다."
+                    .into(),
+            );
+        }
+        if languages.iter().any(|l| l == "vi") {
+            rules.push(
+                "베트남어 요일: thứ Hai(thứ 2) 월요일, thứ Ba(thứ 3) 화요일, thứ Tư(thứ 4) 수요일, thứ Năm(thứ 5) 목요일, thứ Sáu(thứ 6) 금요일, thứ Bảy(thứ 7) 토요일, Chủ nhật 일요일."
+                    .into(),
+            );
+        }
         system = system.replacen("한국어 회의 전사본", &what, 1);
-        system += &format!("\n- {rule}");
+        for rule in rules {
+            system += &format!("\n- {rule}");
+        }
     }
     if !glossary.is_empty() {
         system += &format!("\n- 용어집의 표기를 따른다: {}", glossary.join(", "));
@@ -1382,12 +1396,17 @@ pub(crate) mod tests {
         assert_eq!(system(&[], &codes(&["ko"])), SYSTEM);
         let english = system(&[], &codes(&["en"]));
         assert!(english.contains("너는 회의록 작성자다. 영어 회의 전사본을 읽고"));
-        assert!(english.ends_with("사람 이름·제품명은 전사본 표기 그대로 쓴다."));
+        assert!(english.contains("호칭까지 전사본 글자 그대로 쓰고 한글로 소리 나는 대로"));
+        assert!(english.ends_with("말한 값 그대로 쓰고 계산하거나 바꾸지 않는다."));
         assert!(!english.contains("한국어 회의 전사본") && !english.contains("[en]"));
+        assert!(!english.contains("천 단위") && !english.contains("thứ Bảy"));
+        let indonesian = system(&[], &codes(&["id"]));
+        assert!(indonesian.contains("천 단위") && !indonesian.contains("thứ Bảy"));
         let mixed = system(&["누리패스".into()], &codes(&["ko", "vi"]));
         assert!(mixed.contains("한국어·베트남어가 섞인 회의 전사본을 읽고"));
         assert!(mixed.contains("([ko] 한국어, [vi] 베트남어)"));
-        assert!(mixed.contains("모든 언어의 발언을 빠짐없이 반영해 한국어로만 쓰고"));
+        assert!(mixed.contains("모든 언어의 발언을 빠짐없이 반영해 한국어로만 쓴다."));
+        assert!(mixed.contains("천 단위") && mixed.contains("thứ Bảy(thứ 7) 토요일"));
         assert!(mixed.ends_with("용어집의 표기를 따른다: 누리패스"));
 
         assert_eq!(
