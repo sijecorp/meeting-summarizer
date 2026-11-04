@@ -944,7 +944,7 @@ default-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost; im
 
 ### 11.3 배포 빌드
 
-- **워크플로** (`.github/workflows/build.yml`): 수동 실행(workflow_dispatch)이나 `v*` 태그 push에서 macOS Apple Silicon(`aarch64-apple-darwin`, `.dmg`)과 Windows x64(NSIS `-setup.exe`)를 만든다. 둘 다 workflow artifact로 올리며, artifact는 30일 뒤 지워진다. 태그 실행은 두 빌드와 검사가 모두 통과하면 GitHub Release도 만든다. 액션은 모두 커밋 SHA로 고정했다. 태그 실행이면 태그(`v` 제외)가 `tauri.conf.json`의 `version`과 같은지 먼저 확인한다.
+- **워크플로** (`.github/workflows/build.yml`): 수동 실행(workflow_dispatch)이나 `v*` 태그 push에서 macOS Apple Silicon(`aarch64-apple-darwin`, `.dmg`)과 Windows x64(NSIS `-setup.exe`)를 만든다. 둘 다 workflow artifact로 올리며, artifact는 30일 뒤 지워진다. 태그 실행은 두 빌드와 검사가 모두 통과하면 GitHub Release도 만들고, 저장소 Secret `SLACK_WEBHOOK_URL`(Incoming Webhook)이 있으면 그 링크를 Slack에 올린다. 액션은 모두 커밋 SHA로 고정했다. 태그 실행이면 태그(`v` 제외)가 `tauri.conf.json`의 `version`과 같은지 먼저 확인한다.
 - **캐시 데우기** (2026-10-29): 태그 실행은 그 태그와 master의 캐시만 읽고, 7일 동안 안 쓴 캐시는 지워진다. 그래서 새 태그마다 Windows가 사이드카·`cargo test`·release 빌드를 처음부터 해 약 50분 걸렸다(v1.0.1, v1.0.2). 매주 월요일 03:30(KST) master에서 같은 워크플로를 돌려 master 캐시를 살려 둔다. macOS는 캐시 없이도 약 8분이라(v1.0.2 7분 35초) 덕을 거의 보지 않지만 같은 matrix라 함께 돈다.
 - **번들 대상**: macOS `app`·`dmg`(`tauri.conf.json`), Windows `nsis`(`tauri.windows.conf.json`, Tauri가 Windows에서 병합한다).
 - **배포**: 관리자가 artifact를 OneDrive에 올리고 동료에게 링크를 보낸다. 설치·업데이트·삭제 안내는 `docs/install.md`다. 자동 업데이트는 없다(eng review D2).

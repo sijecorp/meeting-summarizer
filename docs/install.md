@@ -120,6 +120,7 @@ IT 담당자용:
 3. 태그로 실행했으면 두 OS의 빌드와 검사가 모두 통과한 뒤 그 태그의 GitHub Release가 만들어지고 `.dmg`와 `-setup.exe`가 붙습니다(저장소 첫 화면 오른쪽 "Releases"). Release 설명은 `docs/releases/<태그>.md`이고, 없으면 GitHub가 커밋으로 만듭니다. 그래서 태그를 push하기 전에 그 파일을 써 둡니다. 수동 실행은 Release를 만들지 않으니, 그 실행 페이지 아래쪽 "Artifacts"에서 `meeting-summarizer-macos-arm64`와 `meeting-summarizer-windows-x64`를 받습니다(zip이니 풀어서 꺼냅니다).
 4. 두 파일을 OneDrive 공유 폴더에도 올리고 동료들에게 링크와 이 문서를 알립니다. 비공개 저장소의 Release는 저장소 접근 권한이 있는 사람만 받을 수 있습니다.
 
+- Release가 만들어지거나 파일이 바뀌면 Slack 채널에 링크가 올라갑니다. Slack에서 그 채널의 Incoming Webhook을 만들고, 주소를 저장소 Settings > Secrets and variables > Actions의 `SLACK_WEBHOOK_URL`에 넣습니다. 주소가 없거나 Slack 전송이 실패해도 워크플로는 경고만 남기고 Release는 그대로 둡니다.
 - Artifacts는 30일 뒤 지워집니다. Release에 붙은 파일은 남습니다.
 - 비공개 저장소에서는 macOS 실행 시간이 10배로 계산됩니다. 배포할 때만 실행합니다.
 - 실제 서명과 공증을 하려면 Apple Developer 계정을 만든 뒤 워크플로의 주석 처리된 `APPLE_*` 항목을 저장소 Secrets로 채우고 주석을 풉니다. 그러면 "그래도 열기" 단계와 업데이트 뒤 권한 문제가 없어집니다.

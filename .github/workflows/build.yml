@@ -1,6 +1,6 @@
 # Installers for internal distribution (docs/install.md): macOS Apple Silicon .dmg and Windows x64
 # NSIS setup.exe, uploaded as workflow artifacts. A v* tag also gets a GitHub Release with both, once
-# both builds and their checks pass (the release job).
+# both builds and their checks pass (the release job), and a Slack message with its link.
 name: build
 
 on:
@@ -313,3 +313,19 @@ jobs:
           notes="docs/releases/$GITHUB_REF_NAME.md"
           if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
           gh release create "$GITHUB_REF_NAME" installers/* --verify-tag --title "$GITHUB_REF_NAME" "$@"
+
+      # The release's link to Slack, through an Incoming Webhook (the webhook fixes the channel) in the
+      # SLACK_WEBHOOK_URL repository secret. Without it, or when Slack fails, this only warns: the release
+      # is already out, and a re-run would upload every installer again.
+      - name: Notify Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "::warning::SLACK_WEBHOOK_URL is not set, so Slack was not notified"
+            exit 0
+          fi
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$GITHUB_REF_NAME"
+          jq -n --arg text "meeting-summarizer $GITHUB_REF_NAME 릴리스: <$url|설치 파일 받기>" '{text: $text}' |
+            curl -fsS --max-time 20 --retry 2 -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL" ||
+            echo "::warning::Slack notification failed"
