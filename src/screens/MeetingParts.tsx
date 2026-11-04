@@ -10,6 +10,7 @@ import {
   progressText,
   remaining,
   ro,
+  SelectField,
   statusLabel,
   stopping as stoppingOf,
   TranscriptList,
@@ -29,10 +30,12 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   retranscribe,
+  retrySummary,
   sentTo as isSentTo,
   setMeetingLanguage,
   SLACK_MAX,
   type Channel,
+  type ConnectionItem,
   type Lang,
   type Meta,
   type Progress,
@@ -1001,6 +1004,80 @@ export function LanguageDialog({
               {redo ? "지우고 다시 전사" : "바꾸기"}
             </Button>
           )}
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+/** UC2 (2026-11-04): a summary this PC made, summarized again with a saved connection. Its summary
+ * and review edits are deleted first (`retry_summary`), as the description says. */
+export function ResummarizeDialog({
+  meta,
+  connections,
+  open,
+  onOpenChange,
+  onCloseAutoFocus,
+  onChanged,
+}: {
+  meta: Meta;
+  /** The saved connections, this PC left out. */
+  connections: ConnectionItem[];
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  /** It has no trigger to give the focus back to. */
+  onCloseAutoFocus: (event: Event) => void;
+  onChanged: (meta: Meta) => void;
+}) {
+  const [chosen, setChosen] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    if (!open) return;
+    setChosen(connections[0]?.name ?? "");
+    setError("");
+  }, [open]);
+  const confirm = () => {
+    setBusy(true);
+    setError("");
+    retrySummary(meta.id, chosen)
+      .then(
+        (next) => {
+          onOpenChange(false);
+          onChanged(next);
+        },
+        (e) => setError(String(e)),
+      )
+      .finally(() => setBusy(false));
+  };
+  return (
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
+      <AlertDialogContent onCloseAutoFocus={onCloseAutoFocus}>
+        <AlertDialogHeader>
+          <AlertDialogTitle>LLM 연결로 다시 요약</AlertDialogTitle>
+          <AlertDialogDescription>지금 요약과 검토에서 고친 내용이 지워집니다</AlertDialogDescription>
+        </AlertDialogHeader>
+        {/* SUM-07: where each one would send the transcript. */}
+        <SelectField
+          label="요약할 LLM 연결"
+          value={chosen}
+          options={connections.map((c) => ({
+            value: c.name,
+            label: `${c.label} (${c.is_local ? "이 PC" : `${c.host}로 전송`})`,
+          }))}
+          onChange={setChosen}
+        />
+        {error && <p className="text-caption text-danger-line">{error}</p>}
+        <AlertDialogFooter>
+          <AlertDialogCancel>취소</AlertDialogCancel>
+          <Button
+            variant="destructive"
+            aria-disabled={busy || !chosen || undefined}
+            className="aria-disabled:opacity-50"
+            onClick={() => !busy && chosen && confirm()}
+          >
+            지우고 다시 요약
+          </Button>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>

@@ -91,6 +91,7 @@ import {
   DocView,
   Grow,
   LanguageDialog,
+  ResummarizeDialog,
   SendBar,
   Skeleton,
   Steps,
@@ -245,7 +246,7 @@ export default function Meeting({
   const [listTry, setListTry] = useState(0);
   // SUM-06: the connection picked for 요약 다시 실행, until then the default.
   const [chosen, setChosen] = useState("");
-  const [asking, setAsking] = useState<"archive" | "delete" | "language" | null>(null);
+  const [asking, setAsking] = useState<"archive" | "delete" | "language" | "resummarize" | null>(null);
   // The summary arrived while open: it comes in once, read-only, before it can be edited.
   const [reveal, setReveal] = useState(false);
   // REV-01: the summary reads as a document; a click on a line or 고치기 swaps the editor in
@@ -559,7 +560,8 @@ export default function Meeting({
       (e) => setError(String(e)),
     );
   // Plan 5.6-24: in other languages. Transcribed again (E3), its summary, review edits and
-  // transcript are gone: nothing of them stays on screen or waits to be saved.
+  // transcript are gone: nothing of them stays on screen or waits to be saved. Summarized again
+  // (UC2), the summary and edits are gone the same way, and the transcript is read again.
   const relanguaged = (next: Meta) => {
     s.pending = null;
     s.latest++;
@@ -658,6 +660,14 @@ export default function Meeting({
   // Plan 5.6: its languages, named once the table is read.
   const named = languageNames(langs, meta?.languages ?? []);
   const korean = meta?.languages.join() === "ko";
+  // UC2 (2026-11-04): this PC's summary often got Vietnamese and Indonesian meetings' numbers and
+  // names wrong, so one it made offers the saved connections. Sent ones stay as every channel got them.
+  const others = connections?.filter((c) => !c.builtin) ?? [];
+  const resummarize =
+    editable &&
+    !!connections &&
+    meta.llm_connection === BUILTIN &&
+    meta.languages.some((c) => c === "vi" || c === "id");
   // Plan 5.6-24: not once sent, nor while recording (the recording screen changes it then).
   const relanguage =
     !!meta && !newer && !(["sent", "recording", "deleting", "unknown"] as Status[]).includes(meta.status);
@@ -698,6 +708,12 @@ export default function Meeting({
   const focusMore = (e: Event) => {
     e.preventDefault();
     more.current?.focus();
+  };
+  // Back to 다시 요약, or to ⋯ once a summary started again took the link away.
+  const resummarizeLink = useRef<HTMLButtonElement>(null);
+  const focusLink = (e: Event) => {
+    e.preventDefault();
+    (resummarizeLink.current ?? more.current)?.focus();
   };
 
   return (
@@ -960,7 +976,26 @@ export default function Meeting({
             </div>
             {/* Plan 5.6-18: dates are read in Korean only, so another language leaves them unchecked,
                 with "미정" lines or without. */}
-            {!korean && <p className="text-label text-ink-2">이 회의의 날짜는 확인하지 않았습니다</p>}
+            {(!korean || resummarize) && (
+              <div className="space-y-1">
+                {!korean && <p className="text-label text-ink-2">이 회의의 날짜는 확인하지 않았습니다</p>}
+                {resummarize && (
+                  <p className="text-label text-ink-2">
+                    요약이 실제 회의와 다른가요? LLM 연결로 다시 요약해 볼 수 있습니다{" "}
+                    <Button
+                      ref={resummarizeLink}
+                      variant="link"
+                      size="xs"
+                      className="h-auto px-0 text-ink-2 underline"
+                      disabled={inFlight}
+                      onClick={() => (others.length ? setAsking("resummarize") : onSetup("llm"))}
+                    >
+                      {others.length ? "다시 요약" : "LLM 연결 만들기"}
+                    </Button>
+                  </p>
+                )}
+              </div>
+            )}
             {/* For screen readers above all: the marks are only drawn. Typed into, so not live. */}
             {undecided.length > 0 && (
               <details className="text-label">
@@ -1143,6 +1178,16 @@ export default function Meeting({
           onOpenChange={(open) => !open && setAsking(null)}
           onCloseAutoFocus={focusMore}
           onPause={pause}
+          onChanged={relanguaged}
+        />
+      )}
+      {meta && others.length > 0 && (
+        <ResummarizeDialog
+          meta={meta}
+          connections={others}
+          open={asking === "resummarize"}
+          onOpenChange={(open) => !open && setAsking(null)}
+          onCloseAutoFocus={focusLink}
           onChanged={relanguaged}
         />
       )}

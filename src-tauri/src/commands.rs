@@ -722,20 +722,21 @@ pub async fn slack_channels(
     slack.channels(&settings).await
 }
 
-/// SUM-06 "요약 다시 실행" after `summarize_failed`, and ENG15's change of connection for a meeting
-/// waiting with its transcript, with the connection the recorder picked (`list_connections`'s
-/// name, the built-in route's too).
+/// SUM-06 "요약 다시 실행" after `summarize_failed`, ENG15's change of connection for a meeting
+/// waiting with its transcript, and a reviewed summary made again (UC2), with the connection the
+/// recorder picked (`list_connections`'s name, the built-in route's too).
 #[tauri::command(async)]
 pub fn retry_summary(
     store: State<'_, Store>,
     settings: State<'_, SettingsStore>,
     queue: State<'_, Queue>,
+    slack: State<'_, Slack>,
     id: String,
     connection: String,
 ) -> Result<Meta, String> {
     let settings = settings.load()?.settings;
     let chosen = retry_connection(&settings, &connection, queue.builtin_ready())?;
-    let meta = store.retry_summary(&id, &chosen)?;
+    let meta = store.retry_summary(&id, &chosen, || slack.is_sending(&id))?;
     queue.enqueue(&id, meta.status);
     Ok(meta)
 }

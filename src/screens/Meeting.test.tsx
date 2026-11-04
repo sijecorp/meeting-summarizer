@@ -1925,6 +1925,60 @@ test("a meeting in another language says its dates were not checked, with no 미
   expect(screen.queryByText("이 회의의 날짜는 확인하지 않았습니다")).toBeNull();
 });
 
+// UC2 (2026-11-04): this PC's summary of a Vietnamese or Indonesian meeting offers a saved
+// connection, its summary and edits deleted first; with none saved, the way to make one.
+test("this PC's summary of a Vietnamese or Indonesian meeting offers another connection", async () => {
+  const hint = /^요약이 실제 회의와 다른가요\? LLM 연결로 다시 요약해 볼 수 있습니다/;
+  const review = meta({ languages: ["ko", "id"], llm_connection: "builtin" });
+  const calls = mock({ meta: review, summary: "## 결정사항\n- 출시한다" }, (cmd) => {
+    if (cmd === "list_connections") return [item("회사 클라우드"), THIS_PC];
+    if (cmd === "retry_summary") return { ...review, status: "transcribed", llm_connection: "회사 클라우드" };
+  });
+  render(<Meeting id={id} {...props} />);
+  expect(await screen.findByText(hint)).toBeTruthy();
+  // Cancelled, the focus is back on the link it came from.
+  fireEvent.click(screen.getByRole("button", { name: "다시 요약" }));
+  fireEvent.click(within(await screen.findByRole("alertdialog")).getByRole("button", { name: "취소" }));
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "다시 요약" })));
+  fireEvent.click(screen.getByRole("button", { name: "다시 요약" }));
+  const dialog = within(await screen.findByRole("alertdialog"));
+  expect(dialog.getByText("지금 요약과 검토에서 고친 내용이 지워집니다")).toBeTruthy();
+  const select = dialog.getByRole("combobox", { name: "요약할 LLM 연결" });
+  await waitFor(() => expect(select.textContent).toBe("회사 클라우드 (api.example.com로 전송)"));
+  fireEvent.click(dialog.getByRole("button", { name: "지우고 다시 요약" }));
+  await waitFor(() =>
+    expect(calls.find((c) => c.cmd === "retry_summary")?.args).toEqual({ id, connection: "회사 클라우드" }),
+  );
+  await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  expect(screen.queryByText(hint)).toBeNull();
+  // The link went with the summary: the focus goes to ⋯.
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "더보기" })));
+  cleanup();
+
+  const onSetup = vi.fn();
+  mock({ meta: review, summary: "요약" }, (cmd) => (cmd === "list_connections" ? [THIS_PC] : undefined));
+  render(<Meeting id={id} {...props} onSetup={onSetup} />);
+  fireEvent.click(await screen.findByRole("button", { name: "LLM 연결 만들기" }));
+  expect(onSetup).toHaveBeenCalledWith("llm");
+  cleanup();
+
+  // Korean or English, or a summary a connection made: nothing to offer.
+  for (const other of [
+    meta({ llm_connection: "builtin" }),
+    meta({ languages: ["en"], llm_connection: "builtin" }),
+    meta({ languages: ["vi"] }),
+  ]) {
+    const seen = mock({ meta: other, summary: "요약" }, (cmd) =>
+      cmd === "list_connections" ? [item("회사 클라우드"), THIS_PC] : undefined,
+    );
+    render(<Meeting id={id} {...props} />);
+    await waitFor(() => expect(seen.map((c) => c.cmd)).toContain("list_connections"));
+    await act(async () => {});
+    expect(screen.queryByText(hint)).toBeNull();
+    cleanup();
+  }
+});
+
 // Plan 5.6-28 (d11a): a mixed transcript names its language on the first line and wherever it
 // changes; every line carries `lang` for screen readers.
 test("a mixed transcript names the language where it changes; a single one names none", async () => {

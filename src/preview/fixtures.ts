@@ -42,7 +42,8 @@ export const SCENARIOS = {
   pause: "일시정지",
   // Plan 5.3-12: resumed while recording, it waits for the recording to end.
   pauseRecording: "녹음 중 이어서 처리",
-  // Plan 5.7-15 언어: every picker, the dialog's three modes, a mixed transcript, the date notice.
+  // Plan 5.7-15 언어: every picker, the dialog's three modes, a mixed transcript, the date notice,
+  // and this PC's summary offering another connection (UC2).
   languages: "전사 언어",
   // The recording screen's trigger in two languages, its first apply failing.
   languagesRecording: "녹음 중 전사 언어",
@@ -631,7 +632,12 @@ export function reset(scenario: Scenario) {
       detecting,
       english,
       waiting,
-      mixedSummarized("호치민 공장 주간 회의", "review", at(0, 10, 0), { duration_ms: 46 * 60_000 }),
+      // Summarized on this PC: it offers another connection (UC2).
+      mixedSummarized("호치민 공장 주간 회의", "review", at(0, 10, 0), {
+        duration_ms: 46 * 60_000,
+        llm_connection: BUILTIN,
+        summarize_local: true,
+      }),
       mixedSummarized("호치민 공장 주간 회의", "sent", at(7, 10, 0), {
         duration_ms: 51 * 60_000,
         sent: { channel: "#베트남법인", at: at(7, 11, 5).toISOString(), edit_count: 2 },
@@ -1201,7 +1207,12 @@ const handlers: Handlers = {
     if (connection.name === BUILTIN && !builtinReady())
       throw "이 PC 요약 모델이 아직 없습니다. 설정 → 요약(LLM)에서 요약 모델을 먼저 받아 주세요";
     const waits = m.meta.status === "transcribed" || (m.meta.status === "paused" && !!m.transcript);
-    if (m.meta.status !== "summarize_failed" && !waits) throw "요약을 기다리거나 요약에 실패한 회의가 아닙니다";
+    // UC2: a reviewed summary made again, its summary and edits gone first.
+    if (m.meta.status === "review") {
+      if (m.sending) throw "보내는 중입니다";
+      Object.assign(m, { summary: "", generated: "" });
+      m.meta.status = "transcribed";
+    } else if (m.meta.status !== "summarize_failed" && !waits) throw "요약을 기다리거나 요약에 실패한 회의가 아닙니다";
     Object.assign(m.meta, { llm_connection: connection.name, summarize_local: connection.is_local });
     delete m.meta.wait;
     enqueue(m);

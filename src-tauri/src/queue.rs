@@ -1072,7 +1072,8 @@ impl<R: Runtime> Queue<R> {
     }
 
     /// `resume_meeting`: a continued interrupted recording, or a `transcribe_failed` retry.
-    /// `retry_summary`: a `summarize_failed` one, or a waiting one given another connection.
+    /// `retry_summary`: a `summarize_failed` one, a waiting one given another connection, or a
+    /// reviewed one summarized again.
     pub fn enqueue(&self, id: &str, status: Status) {
         self.add(id, status);
         self.pump();
@@ -1706,7 +1707,9 @@ impl<R: Runtime> Queue<R> {
 
         let segments = done.iter().flat_map(|r| &r.segments).collect();
         let finished = store.update(id, |m| {
-            if !can_transition(m.status, Status::Transcribed) {
+            // Only from `transcribing`: `review` may go to `transcribed` too, but only to be
+            // summarized again (`Store::retry_summary`).
+            if m.status != Status::Transcribing {
                 return Err(format!("전사를 마칠 수 없는 상태입니다: {:?}", m.status));
             }
             let bytes =
@@ -3821,7 +3824,7 @@ mod tests {
             let last = f.events.lock().unwrap().last().cloned().unwrap();
             assert_eq!(last["status"], "summarize_failed");
 
-            let meta = f.store().retry_summary(&id, &chosen).unwrap();
+            let meta = f.store().retry_summary(&id, &chosen, || false).unwrap();
             f.queue().enqueue(&id, meta.status);
             f.wait("review", || f.status(&id) == Status::Review);
             let meta = f.store().get(&id).unwrap();
@@ -4183,7 +4186,7 @@ mod tests {
             assert_eq!(stub.connections.load(Ordering::SeqCst), 0);
 
             for id in [&orphan, &modelless] {
-                let meta = f.store().retry_summary(id, &cloud).unwrap();
+                let meta = f.store().retry_summary(id, &cloud, || false).unwrap();
                 f.queue().enqueue(id, meta.status);
             }
             f.wait("both summarized", || {

@@ -167,6 +167,8 @@ pub fn can_transition(from: Status, to: Status) -> bool {
             // Plan 5.3-3: "일시정지" of a meeting in line, a retried failure too.
             | (Recorded | Transcribed | TranscribeFailed | SummarizeFailed, Paused)
             | (Review, Sent | Archived)
+            // UC2 (2026-11-04): a summary made again with another connection.
+            | (Review, Transcribed)
             // Plan 5.6-6 (E3): transcribed again in another language.
             | (
                 Transcribed | Review | SummarizeFailed | Archived | TranscribeFailed | Paused,
@@ -613,15 +615,41 @@ impl Store {
         })
     }
 
-    /// SUM-06 "요약 다시 실행" with the connection the recorder picked, and ENG15's change of
-    /// connection for a meeting waiting with its transcript (`transcribed`, or `paused` after it).
-    /// The caller queues it.
-    pub fn retry_summary(&self, id: &str, connection: &LlmConnection) -> Result<Meta, String> {
-        let transcript = self.dir_for(id)?.join("transcript.json");
+    /// SUM-06 "요약 다시 실행" with the connection the recorder picked, ENG15's change of
+    /// connection for a meeting waiting with its transcript (`transcribed`, or `paused` after it),
+    /// and a `review` summary made again (UC2, 2026-11-04): its summary files and the recorder's
+    /// edits go first, then it waits as `transcribed`. Refused while `sending`. The caller queues it.
+    pub fn retry_summary(
+        &self,
+        id: &str,
+        connection: &LlmConnection,
+        sending: impl FnOnce() -> bool,
+    ) -> Result<Meta, String> {
+        let dir = self.dir_for(id)?;
         self.update(id, |meta| {
             let waiting = match meta.status {
                 Status::SummarizeFailed | Status::Transcribed => true,
-                Status::Paused => transcript.exists(),
+                Status::Paused => dir.join("transcript.json").exists(),
+                Status::Review => {
+                    if sending() {
+                        return Err("보내는 중입니다".into());
+                    }
+                    // Every one before the status: an old `summary.md` would show over the new one.
+                    // A crash before `meta.json` is written leaves `review` with no summary, still
+                    // offering 다시 요약 (it is still this PC's).
+                    for name in RESULTS.iter().filter(|n| n.starts_with("summary.")) {
+                        match fs::remove_file(dir.join(name)) {
+                            Err(e) if e.kind() != ErrorKind::NotFound => {
+                                return Err(format!("{name}을(를) 지우지 못했습니다: {e}"));
+                            }
+                            _ => {}
+                        }
+                    }
+                    transition(meta, Status::Transcribed)?;
+                    (meta.grounding_replaced, meta.grounding_checked) = (0, None);
+                    (meta.error, meta.no_speech) = (None, false);
+                    true
+                }
                 _ => false,
             };
             if !waiting {
@@ -898,6 +926,8 @@ mod tests {
             (SummarizeFailed, Paused),
             (Review, Sent),
             (Review, Archived),
+            // UC2: summarized again with another connection.
+            (Review, Transcribed),
             // Plan 5.6-6 (E3).
             (Transcribed, Recorded),
             (Review, Recorded),
@@ -1356,13 +1386,11 @@ mod tests {
             timeout_secs: 900,
         };
         let failed = put(&store, SummarizeFailed).id;
-        let meta = store.retry_summary(&failed, &local).unwrap();
+        let meta = store.retry_summary(&failed, &local, || false).unwrap();
         assert_eq!(
             (meta.llm_connection.as_deref(), meta.summarize_local),
             (Some("내 Ollama"), true)
         );
-        let review = put(&store, Review).id;
-        assert!(store.retry_summary(&review, &local).is_err());
 
         // ENG15: a meeting waiting with its transcript takes another connection, and the reason
         // it waited goes.
@@ -1372,18 +1400,78 @@ mod tests {
             ..put(&store, Transcribed)
         };
         store.write(&waiting).unwrap();
-        let meta = store.retry_summary(&waiting.id, &local).unwrap();
+        let meta = store.retry_summary(&waiting.id, &local, || false).unwrap();
         assert_eq!(
             (meta.llm_connection.as_deref(), meta.wait),
             (Some("내 Ollama"), None)
         );
         // `paused` only once it has a transcript: before that it still needs transcribing.
         let paused = put(&store, Paused).id;
-        assert!(store.retry_summary(&paused, &local).is_err());
+        assert!(store.retry_summary(&paused, &local, || false).is_err());
         fs::write(store.dir.join(&paused).join("transcript.json"), "{}").unwrap();
-        assert!(store.retry_summary(&paused, &local).is_ok());
+        assert!(store.retry_summary(&paused, &local, || false).is_ok());
         let recorded = put(&store, Recorded).id;
-        assert!(store.retry_summary(&recorded, &local).is_err());
+        assert!(store.retry_summary(&recorded, &local, || false).is_err());
+    }
+
+    #[test]
+    fn a_reviewed_summary_is_made_again_without_its_files_and_edits() {
+        let (_tmp, store) = store();
+        let cloud = LlmConnection {
+            name: "회사 GPT".into(),
+            base_url: "https://llm.example.com/v1".into(),
+            model: "m".into(),
+            context_tokens: 128_000,
+            is_local: false,
+            timeout_secs: 300,
+        };
+        let review = Meta {
+            llm_connection: Some(crate::settings::BUILTIN.into()),
+            summarize_local: true,
+            grounding_replaced: 3,
+            grounding_checked: Some(true),
+            ..put(&store, Review)
+        };
+        store.write(&review).unwrap();
+        let dir = store.dir.join(&review.id);
+        for name in RESULTS {
+            fs::write(dir.join(name), "옛것").unwrap();
+        }
+        // Not while its summary is being sent: nothing changes.
+        assert_eq!(
+            store
+                .retry_summary(&review.id, &cloud, || true)
+                .unwrap_err(),
+            "보내는 중입니다"
+        );
+        assert!(dir.join("summary.md").exists());
+
+        let meta = store.retry_summary(&review.id, &cloud, || false).unwrap();
+        assert_eq!(
+            (
+                meta.status,
+                meta.llm_connection.as_deref(),
+                meta.summarize_local
+            ),
+            (Transcribed, Some("회사 GPT"), false)
+        );
+        assert_eq!((meta.grounding_replaced, meta.grounding_checked), (0, None));
+        let left: Vec<&str> = RESULTS
+            .into_iter()
+            .filter(|n| dir.join(n).exists())
+            .collect();
+        assert_eq!(left, ["transcript.partial.jsonl", "transcript.json"]);
+        assert_eq!(store.summary(&review.id).unwrap(), "");
+
+        // A summary.md that will not go keeps it in review, the edit still there to read.
+        let again = put(&store, Review).id;
+        fs::create_dir(store.dir.join(&again).join("summary.md")).unwrap();
+        let error = store.retry_summary(&again, &cloud, || false).unwrap_err();
+        assert!(error.starts_with("summary.md"), "{error}");
+        assert_eq!(store.get(&again).unwrap().status, Review);
+        // A sent one is never summarized again: every channel got the same text.
+        let sent = put(&store, Sent).id;
+        assert!(store.retry_summary(&sent, &cloud, || false).is_err());
     }
 
     #[test]
