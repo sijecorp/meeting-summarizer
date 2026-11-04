@@ -393,6 +393,13 @@ const SPEECH_GAP: usize = 1_600;
 /// shorter than 1.5 s is too short to judge: it takes its neighbour's language.
 const LID_WINDOW: usize = 30 * 16_000;
 const LID_MIN: usize = 24_000;
+/// Whisper's segment times run up to about a second off in the joined speech, and at a piece's
+/// edge a second there can be many seconds of the recording. An edge piece a segment covers by
+/// less than this (`Speech::place`) is where Whisper's time ran over, not where it was said:
+/// replayed on the raw times of the two UC2 mixed meetings, the lines placed 3 s+ early went from
+/// 36 and 44 to 6 and 4, and those placed 3 s+ late from 49 and 66 to 55 and 70 (a long
+/// utterance's later sentences count as late there).
+const EDGE: usize = 16_000;
 
 /// TRN-04's VAD step, done here. whisper.cpp cuts the audio down to speech only inside
 /// `whisper_full`; whisper-rs 0.16's `WhisperState::full` calls `whisper_full_with_state`, which
@@ -449,6 +456,54 @@ impl Speech {
             Some(&(_, next, _)) if is_start => next,
             _ => start + len,
         }
+    }
+
+    /// A segment, `start..end` in `samples`, back in the chunk. Across two or more pieces, a first
+    /// piece it covers only the tail of and a last piece it covers only the head of are left out,
+    /// each when covered by less than `EDGE` and less than half: Whisper often starts a segment
+    /// where the one before it ended, the end of a piece said seconds earlier (in a mixed meeting,
+    /// before the other language's lines). A short piece it covers whole, a "네" before a pause,
+    /// stays.
+    fn place(&self, start: usize, end: usize) -> (usize, usize) {
+        let covered: Vec<(usize, usize)> = (self.pieces.iter().enumerate())
+            .map(|(i, &(joined, _, len))| {
+                (i, end.min(joined + len).saturating_sub(start.max(joined)))
+            })
+            .filter(|&(_, n)| n > 0)
+            .collect();
+        let (Some(&(mut first, first_n)), Some(&(mut last, last_n))) =
+            (covered.first(), covered.last())
+        else {
+            // Wholly in a gap or past the end.
+            let start = self.to_chunk(start, true);
+            return (start, self.to_chunk(end, false).max(start));
+        };
+        if covered.len() > 1 {
+            let (joined, _, len) = self.pieces[first];
+            let tail = first_n < EDGE && start > joined + len / 2;
+            let (joined, _, len) = self.pieces[last];
+            let head = last_n < EDGE && end < joined + len / 2;
+            match (tail, head) {
+                // Two pieces, barely each: the one it covers more.
+                (true, true) if covered.len() == 2 => match first_n < last_n {
+                    true => first = last,
+                    false => last = first,
+                },
+                _ => {
+                    if tail {
+                        first = covered[1].0;
+                    }
+                    if head {
+                        last = covered[covered.len() - 2].0;
+                    }
+                }
+            }
+        }
+        let (joined, at, _) = self.pieces[first];
+        let from = at + start.saturating_sub(joined);
+        let (joined, at, len) = self.pieces[last];
+        let to = at + end.saturating_sub(joined).min(len);
+        (from, to.max(from))
     }
 }
 
@@ -565,15 +620,11 @@ fn transcribe_runs(
         for (start, end, text) in full(code, speech, before)? {
             // Centiseconds into the speech-only audio, back to recording time. Whisper may run a
             // little past the audio.
-            let at = |cs: i64, is_start: bool| {
-                let sample = speech.to_chunk(cs_to_samples(cs as f32), is_start) as u64;
-                (start_ms + sample / SAMPLES_PER_MS).min(end_ms)
-            };
-            let start = at(start, true);
+            let (from, to) = speech.place(cs_to_samples(start as f32), cs_to_samples(end as f32));
+            let ms = |sample: usize| (start_ms + sample as u64 / SAMPLES_PER_MS).min(end_ms);
             segments.push(Segment {
-                start_ms: start,
-                // A segment wholly inside a gap would map its start forward and its end back.
-                end_ms: at(end, false).max(start),
+                start_ms: ms(from),
+                end_ms: ms(to),
                 text: text.trim().to_string(),
                 lang: (languages.len() > 1).then(|| code.clone()),
             });
@@ -1119,6 +1170,56 @@ mod tests {
         let none = Speech::new(&audio, &[]);
         assert!(none.samples.is_empty());
         assert_eq!(none.to_chunk(5, true), 0);
+    }
+
+    #[test]
+    fn a_segment_barely_in_a_piece_is_placed_in_the_piece_it_was_said_in() {
+        let audio = vec![0.5; 40 * S];
+        // Speech at 0..5 s and 20..25 s: joined, the second starts 5.2 s in.
+        let speech = Speech::new(&audio, &[(0, 5 * S), (20 * S, 25 * S)]);
+        let second = speech.pieces[1].0;
+        assert_eq!(second, 5 * S + 2 * SPEECH_GAP);
+        // Starts 0.1 s before the first piece ends and runs 3 s into the second: said at 20 s,
+        // not at 5 s.
+        assert_eq!(
+            speech.place(second - 2 * SPEECH_GAP - S / 10, second + 3 * S),
+            (20 * S, 23 * S)
+        );
+        // Ends 0.5 s into the second piece: it ends with the first.
+        assert_eq!(speech.place(S, second + S / 2), (S, 5 * S + SPEECH_OVERLAP));
+        // Covers 2 s of each: the whole of it is kept.
+        assert_eq!(speech.place(3 * S, second + 2 * S), (3 * S, 22 * S));
+        // One piece, however little of it: as it is.
+        assert_eq!(speech.place(S, S + S / 10), (S, S + S / 10));
+        // In the gap, and past the end: as `to_chunk` puts them.
+        assert_eq!(
+            speech.place(second - S / 20, second - S / 40),
+            (20 * S, 20 * S)
+        );
+        assert_eq!(
+            speech.place(second + 6 * S, second + 7 * S),
+            (25 * S, 25 * S)
+        );
+
+        // A 0.5 s "네" covered whole, then 3 s of the next piece: it starts with the "네".
+        let short = Speech::new(&audio, &[(0, S / 2), (3 * S, 8 * S)]);
+        assert_eq!(short.place(0, short.pieces[1].0 + 3 * S), (0, 6 * S));
+        // Three short pieces: only the first, covered at its tail, is left out, and the last,
+        // covered past its middle, stays.
+        let shorts = Speech::new(
+            &audio,
+            &[(0, S / 2), (2 * S, 5 * S / 2), (4 * S, 9 * S / 2)],
+        );
+        let (third, len) = (shorts.pieces[2].0, shorts.pieces[2].2);
+        assert_eq!(shorts.place(S / 2, third + len), (2 * S, 9 * S / 2));
+        // Two pieces, the tail of one and the head of the other: the one it covers more.
+        let two = Speech::new(&audio, &[(0, 2 * S), (10 * S, 12 * S)]);
+        let (end, next) = (two.pieces[0].2, two.pieces[1].0);
+        assert_eq!(
+            two.place(end - 3_600, next + 6_000),
+            (10 * S, 10 * S + 6_000)
+        );
+        assert_eq!(two.place(end - 6_000, next + 3_600), (end - 6_000, end));
     }
 
     fn os(args: &[&str]) -> Vec<OsString> {
