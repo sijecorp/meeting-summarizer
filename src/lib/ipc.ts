@@ -333,6 +333,10 @@ export const confirmQuit = () => invoke<void>("confirm_quit");
 export const requestQuit = () => invoke<void>("request_quit");
 /** Opens the folder of `app.log` in the file manager. Rust picks the path. */
 export const openLogDir = () => invoke<void>("open_log_dir");
+/** The window stands tall or lies wide (shape.rs); `animate`: it glides there. Never rejects for a
+ * window that will not move: Rust logs that. */
+export const setWindowShape = (tall: boolean, animate: boolean) =>
+  invoke<void>("set_window_shape", { tall, animate });
 /** Quit was requested while work is running; the UI must ask before `confirmQuit`. */
 export const onQuitRequested = (handler: () => void) =>
   listen("app://quit-requested", handler);

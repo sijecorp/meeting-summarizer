@@ -124,8 +124,10 @@ export default function Recording({
   }, [startedAt]);
 
   return (
-    // Centered in the window under the header, clear of the dock's room (App.tsx `pb-24`).
-    <main className="mx-auto box-content flex min-h-[calc(100dvh-9rem)] max-w-home flex-col px-8 py-6">
+    // Centered in the window under the header and exactly as tall as the room there, so the tall
+    // window (shape.rs) shows it all without scrolling. The dock hides on this screen, so its room
+    // (App.tsx `pb-24`) is given back (`-mb-24`); the header (3rem) and `py-6` (3rem) are the rest.
+    <main className="mx-auto -mb-24 box-content flex min-h-[calc(100dvh-6rem)] max-w-home flex-col px-8 py-6">
       <div className="flex items-center gap-3">
         <Button variant="ghost" size="sm" className="-ml-3 text-ink-2 hover:text-ink" onClick={onHome}>
           <ArrowLeft aria-hidden />홈

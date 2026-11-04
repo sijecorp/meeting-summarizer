@@ -15,7 +15,7 @@
         "title": "회의 요약",
         "width": 1040,
         "height": 720,
-        "minWidth": 720,
+        "minWidth": 520,
         "minHeight": 600,
         "center": true,
         "preventOverflow": true,

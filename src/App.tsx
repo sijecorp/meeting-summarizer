@@ -3,7 +3,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Copy, FileAudio, Minus, Settings as SettingsIcon, Square, X } from "lucide-react";
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { Banner, MAC, phase, Present, SijeLogo, WIDTH, WINDOWS, withModifier } from "@/components/common";
 import Dock from "@/components/Dock";
 import { ImportLanguages } from "@/components/Languages";
@@ -38,6 +38,7 @@ import {
   RECORDING_FILES,
   requestQuit,
   SCHEMA_VERSION,
+  setWindowShape,
   startRecording,
   stopRecording,
   type ImportProgress,
@@ -385,6 +386,14 @@ export default function App() {
     const box = screenBox.current;
     (box?.querySelector<HTMLElement>("h1") ?? box)?.focus({ preventScroll: true });
   }, [key]);
+  // The window stands tall beside a video call while recording and for a meeting's document, and
+  // lies wide for Home and Settings (design-system 6.1). It glides there, unless a key changed the
+  // screen or motion is reduced (design-system 5).
+  const tall = screen.name === "recording" || screen.name === "meeting";
+  const reduce = useReducedMotion();
+  useEffect(() => {
+    void setWindowShape(tall, !instant && !reduce);
+  }, [tall]);
   // The meeting's send bar or the settings' save bar goes here, above the dock.
   const [barSlot, setBarSlot] = useState<HTMLElement | null>(null);
 

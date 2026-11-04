@@ -3,6 +3,7 @@ mod commands;
 mod grounding;
 mod queue;
 mod settings;
+mod shape;
 mod sidecar;
 mod slack;
 mod store;
@@ -340,6 +341,7 @@ pub fn run() {
                 std::env::current_exe()?,
             ));
             app.manage(slack::Slack::default());
+            app.manage(shape::Shape::default());
             app.manage(audio::mix::Exports::default());
             // APP-03: a click on a notification shows the app on that meeting. Registered before
             // any is shown: the plugin reports clicks only on ones shown after a handler exists.
@@ -402,6 +404,9 @@ pub fn run() {
                 api.prevent_close();
                 let _ = window.hide();
             }
+            if let WindowEvent::Focused(true) = event {
+                shape::refit(window);
+            }
             #[cfg(target_os = "macos")]
             if clears_notifications(window.label(), event) {
                 clear_notifications();
@@ -452,6 +457,7 @@ pub fn run() {
             commands::slack_sign_out,
             commands::slack_channels,
             commands::open_log_dir,
+            shape::set_window_shape,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

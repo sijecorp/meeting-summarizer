@@ -234,6 +234,30 @@ test("the dock shows the recording time and opens the recording screen, where it
   expect(screen.getAllByRole("button", { name: /녹음 종료/ })).toHaveLength(1);
 });
 
+// Design-system 6.1: tall while recording and for a meeting's document, wide elsewhere; a key
+// changes the shape without the glide (design-system 5).
+test("the window stands tall for the recording screen and lies wide again on Home", async () => {
+  const shapes: unknown[] = [];
+  mock((cmd, args) => {
+    if (cmd === "set_window_shape") shapes.push(args);
+    if (cmd === "list_meetings") return [live("지금 회의")];
+    if (cmd === "recording_state") return { id: "지금 회의", warnings: [] };
+  });
+
+  render(<App />);
+
+  fireEvent.click(await screen.findByRole("button", { name: "녹음 화면으로" }));
+  await screen.findByRole("heading", { level: 1, name: RECORDING_HEADING });
+  fireEvent.click(screen.getByRole("button", { name: "홈" }), { detail: 0 });
+  await screen.findByRole("button", { name: "녹음 화면으로" });
+
+  expect(shapes).toEqual([
+    { tall: false, animate: true },
+    { tall: true, animate: true },
+    { tall: false, animate: false },
+  ]);
+});
+
 test("the dock's 종료 stops the recording where the recorder is, then turns to processing", async () => {
   const calls: string[] = [];
   let list = [live("a"), meeting("지난 회의", "sent")];

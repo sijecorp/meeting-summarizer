@@ -1035,6 +1035,7 @@ type Commands = {
   confirm_quit: typeof ipc.confirmQuit;
   request_quit: typeof ipc.requestQuit;
   open_log_dir: typeof ipc.openLogDir;
+  set_window_shape: typeof ipc.setWindowShape;
   queue_state: typeof ipc.queueState;
   model_status: typeof ipc.modelStatus;
   download_models: typeof ipc.startModelDownload;
@@ -1394,6 +1395,8 @@ const handlers: Handlers = {
   open_log_dir: () => {
     console.info("[미리보기] 로그 폴더 열기: 실제 앱이라면 app.log가 있는 폴더를 엽니다");
   },
+  // A page cannot resize its browser window; the preview's frame stays as it is.
+  set_window_shape: () => {},
 };
 
 function handle(cmd: string, args: Args) {
