@@ -539,7 +539,7 @@ test("the first screen shows only while there are no meetings", () => {
   const { rerender } = render(view([]));
 
   const record = screen.getByRole("button", { name: "첫 회의 녹음하기" });
-  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("회의가 끝나면, 기록은 이미 와 있어요.");
+  expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("간단히 녹음하고, 요약해 보세요.");
   expect(record.getAttribute("aria-keyshortcuts")).toMatch(/^(Meta|Control)\+R$/);
   fireEvent.click(record);
   expect(started).toBe(1);

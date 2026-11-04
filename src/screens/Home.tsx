@@ -502,7 +502,7 @@ export default function Home({
         {errorBanner}
         <div className="space-y-4">
           <h1 tabIndex={-1} className="font-display text-display-l outline-hidden">
-            <span className="block">회의가 끝나면,</span> <span className="block">기록은 이미 와 있어요.</span>
+            <span className="block">간단히 녹음하고,</span> <span className="block">요약해 보세요.</span>
           </h1>
           <p className="text-ink-2">녹음만 하면 이 PC에서 전사하고, 요약을 검토해 Slack으로 보냅니다.</p>
         </div>

@@ -94,7 +94,7 @@ const loaded: LoadedSettings = {
 };
 
 // With no meetings at all, Home is the first screen (design-system 6.5).
-const FIRST = "회의가 끝나면, 기록은 이미 와 있어요.";
+const FIRST = "간단히 녹음하고, 요약해 보세요.";
 const first = () => screen.findByRole("heading", { level: 1, name: FIRST });
 /** Which way the screen holding this heading came in. */
 const cameIn = (heading: HTMLElement) => heading.closest("[data-direction]")?.getAttribute("data-direction");
