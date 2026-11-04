@@ -1,0 +1,61 @@
+# A release's two installers into a Slack channel, since colleagues without access to this private
+# repository cannot download from the release. The build workflow calls this once a tag's release is
+# out. To send a release again: Actions > slack-release > Run workflow, with its tag.
+# Repository secrets: SLACK_BOT_TOKEN, a Slack app's bot token with files:write whose bot is in the
+# channel, and SLACK_CHANNEL_ID. Without them this only warns.
+name: slack-release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, e.g. v1.0.3
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  slack:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the installers
+        id: slack
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+        run: |
+          if [ -z "$SLACK_BOT_TOKEN" ] || [ -z "$SLACK_CHANNEL_ID" ]; then
+            echo "::warning::SLACK_BOT_TOKEN or SLACK_CHANNEL_ID is not set, so Slack was not notified"
+            exit 0
+          fi
+          # The tag goes into the YAML payload below.
+          if ! [[ "$TAG" =~ ^v[0-9A-Za-z.+-]+$ ]]; then echo "::error::Not a release tag: $TAG"; exit 1; fi
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir installers --pattern '*.dmg' --pattern '*-setup.exe'
+          ls -l installers
+          echo "dmg=$(basename installers/*.dmg)" >> "$GITHUB_OUTPUT"
+          echo "exe=$(basename installers/*-setup.exe)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the installers to Slack
+        if: steps.slack.outputs.dmg
+        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
+        with:
+          method: files.uploadV2
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          errors: true
+          payload: |
+            channel_id: ${{ secrets.SLACK_CHANNEL_ID }}
+            initial_comment: "meeting-summarizer ${{ inputs.tag }} 릴리스입니다. Mac은 dmg, Windows는 setup.exe를 받아 설치해 주세요.\n릴리스 노트: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ inputs.tag }}"
+            file_uploads:
+              - file: installers/${{ steps.slack.outputs.dmg }}
+                filename: ${{ steps.slack.outputs.dmg }}
+              - file: installers/${{ steps.slack.outputs.exe }}
+                filename: ${{ steps.slack.outputs.exe }}

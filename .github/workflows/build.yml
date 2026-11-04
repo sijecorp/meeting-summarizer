@@ -314,37 +314,11 @@ jobs:
           if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
           gh release create "$GITHUB_REF_NAME" installers/* --verify-tag --title "$GITHUB_REF_NAME" "$@"
 
-      # Both installers into a Slack channel, since colleagues without access to this private repository
-      # cannot download from the release. Repository secrets: SLACK_BOT_TOKEN, a Slack app's bot token
-      # with files:write whose bot is in the channel, and SLACK_CHANNEL_ID. Without them, or when Slack
-      # fails, this only warns: the release is already out, and a re-run would upload every installer
-      # again.
-      - name: Find the installers for Slack
-        id: slack
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
-        run: |
-          if [ -z "$SLACK_BOT_TOKEN" ] || [ -z "$SLACK_CHANNEL_ID" ]; then
-            echo "::warning::SLACK_BOT_TOKEN or SLACK_CHANNEL_ID is not set, so Slack was not notified"
-            exit 0
-          fi
-          echo "dmg=$(basename installers/*.dmg)" >> "$GITHUB_OUTPUT"
-          echo "exe=$(basename installers/*-setup.exe)" >> "$GITHUB_OUTPUT"
-
-      - name: Upload the installers to Slack
-        if: steps.slack.outputs.dmg
-        continue-on-error: true
-        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
-        with:
-          method: files.uploadV2
-          token: ${{ secrets.SLACK_BOT_TOKEN }}
-          errors: true
-          payload: |
-            channel_id: ${{ secrets.SLACK_CHANNEL_ID }}
-            initial_comment: "meeting-summarizer ${{ github.ref_name }} 릴리스입니다. Mac은 dmg, Windows는 setup.exe를 받아 설치해 주세요.\n릴리스 노트: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}"
-            file_uploads:
-              - file: installers/${{ steps.slack.outputs.dmg }}
-                filename: ${{ steps.slack.outputs.dmg }}
-              - file: installers/${{ steps.slack.outputs.exe }}
-                filename: ${{ steps.slack.outputs.exe }}
+  # The release's installers into a Slack channel. Its own job, so a Slack failure leaves the release
+  # job green, and "Re-run failed jobs" sends again without uploading the release again.
+  slack:
+    needs: release
+    uses: ./.github/workflows/slack-release.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit
