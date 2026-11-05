@@ -25,3 +25,6 @@ dist-ssr
 
 # oh-my-claudecode
 .omc/
+
+# Test Audio
+*-test-audio
